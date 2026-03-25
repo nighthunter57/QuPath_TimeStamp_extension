@@ -1,2 +1,3 @@
 qupath.ext.template.DemoExtension
 qupath.ext.template.DemoGroovyExtension
+qupath.ext.timestamp.TimeStamp

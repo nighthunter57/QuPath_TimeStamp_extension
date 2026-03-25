@@ -9,7 +9,7 @@ plugins {
 
 // TODO: Configure your extension here (please change the defaults!)
 qupathExtension {
-    name = "qupath-extension-template"
+    name = "TimeStamp"
     group = "io.github.qupath"
     version = "0.1.0-SNAPSHOT"
     description = "A simple QuPath extension"
