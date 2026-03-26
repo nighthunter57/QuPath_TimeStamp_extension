@@ -29,9 +29,9 @@ import qupath.lib.gui.extensions.QuPathExtension;
 import qupath.lib.gui.prefs.PathPrefs;
 import qupath.lib.gui.viewer.QuPathViewer;
 import qupath.lib.gui.viewer.overlays.PathOverlay;
+import qupath.lib.gui.viewer.tools.PathTool;
 import qupath.lib.images.ImageData;
 import qupath.lib.objects.PathObject;
-import qupath.lib.objects.hierarchy.PathObjectHierarchy;
 import qupath.lib.objects.hierarchy.events.PathObjectHierarchyEvent;
 import qupath.lib.objects.hierarchy.events.PathObjectHierarchyEvent.HierarchyEventType;
 import qupath.lib.objects.hierarchy.events.PathObjectHierarchyListener;
@@ -114,6 +114,7 @@ public class TimeStamp implements QuPathExtension {
         addPreferences(qupath);
         addMenuItem(qupath);
         installLiveEventTab(qupath);
+        installToolChangeListener(qupath);
         installTimestampOverlay(qupath);
         
         logger.info("{} installed successfully", getName());
@@ -196,6 +197,26 @@ public class TimeStamp implements QuPathExtension {
                 newViewer.getCustomOverlayLayers().add(overlay);
                 installEventListeners(newViewer);
             }
+        });
+    }
+
+    private void installToolChangeListener(QuPathGUI qupath) {
+        qupath.getToolManager().selectedToolProperty().addListener((obs, oldTool, newTool) -> {
+            if (!recordEvents.get() || newTool == null || newTool == oldTool) {
+                return;
+            }
+
+            QuPathViewer viewer = getViewerForLogging(qupath);
+            if (viewer == null) {
+                return;
+            }
+
+            String oldToolName = getToolName(oldTool);
+            String newToolName = getToolName(newTool);
+            logEvent("Tool Changed",
+                    String.format("from=%s, to=%s", oldToolName, newToolName),
+                    viewer);
+            viewer.repaint();
         });
     }
 
@@ -316,30 +337,19 @@ public class TimeStamp implements QuPathExtension {
         PathObjectHierarchyListener hierarchyListener = event -> {
             if (!recordEvents.get()) return;
             if (event.isChanging()) return;
-            if (event.getEventType() != HierarchyEventType.ADDED) return;
+            if (event.getEventType() != HierarchyEventType.ADDED &&
+                    event.getEventType() != HierarchyEventType.REMOVED) return;
 
             for (PathObject pathObject : event.getChangedObjects()) {
                 if (pathObject.isAnnotation() && pathObject.getROI() != null) {
                     ROI roi = pathObject.getROI();
+                    AnnotationGeometry geom = createAnnotationGeometry(roi);
+                    String details = createAnnotationDetails(roi);
+                    String eventType = event.getEventType() == HierarchyEventType.ADDED
+                            ? "Annotate"
+                            : "Annotation Deleted";
 
-                    // Collect polygon vertices
-                    List<double[]> vertexList = new ArrayList<>();
-                    for (var p : roi.getAllPoints()) {
-                        vertexList.add(new double[]{p.getX(), p.getY()});
-                    }
-
-                    AnnotationGeometry geom = new AnnotationGeometry(
-                            roi.getRoiName(),
-                            roi.getBoundsX(), roi.getBoundsY(),
-                            roi.getBoundsWidth(), roi.getBoundsHeight(),
-                            roi.getNumPoints(), vertexList);
-
-                    String details = String.format("type=%s, points=%d, bounds=[%.1f, %.1f, %.1f, %.1f]",
-                            roi.getRoiName(), roi.getNumPoints(),
-                            roi.getBoundsX(), roi.getBoundsY(),
-                            roi.getBoundsWidth(), roi.getBoundsHeight());
-
-                    logEvent("Annotate", details, viewer, geom);
+                    logEvent(eventType, details, viewer, geom);
                     viewer.repaint();
                 }
             }
@@ -367,6 +377,38 @@ public class TimeStamp implements QuPathExtension {
      */
     private static void logEvent(String eventType, String details, QuPathViewer viewer) {
         logEvent(eventType, details, viewer, null);
+    }
+
+    private static String getToolName(PathTool tool) {
+        return tool == null ? "None" : tool.getName();
+    }
+
+    private static QuPathViewer getViewerForLogging(QuPathGUI qupath) {
+        QuPathViewer viewer = qupath.getViewer();
+        if (viewer != null) {
+            return viewer;
+        }
+        return qupath.getAllViewers().isEmpty() ? null : qupath.getAllViewers().get(0);
+    }
+
+    private static AnnotationGeometry createAnnotationGeometry(ROI roi) {
+        List<double[]> vertexList = new ArrayList<>();
+        for (var p : roi.getAllPoints()) {
+            vertexList.add(new double[]{p.getX(), p.getY()});
+        }
+
+        return new AnnotationGeometry(
+                roi.getRoiName(),
+                roi.getBoundsX(), roi.getBoundsY(),
+                roi.getBoundsWidth(), roi.getBoundsHeight(),
+                roi.getNumPoints(), vertexList);
+    }
+
+    private static String createAnnotationDetails(ROI roi) {
+        return String.format("type=%s, points=%d, bounds=[%.1f, %.1f, %.1f, %.1f]",
+                roi.getRoiName(), roi.getNumPoints(),
+                roi.getBoundsX(), roi.getBoundsY(),
+                roi.getBoundsWidth(), roi.getBoundsHeight());
     }
 
     /**
