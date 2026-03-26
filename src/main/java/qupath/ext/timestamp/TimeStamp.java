@@ -1,10 +1,23 @@
 package qupath.ext.timestamp;
 
+import javafx.animation.PauseTransition;
+import javafx.application.Platform;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.DoubleProperty;
+import javafx.geometry.Insets;
+import javafx.scene.control.Button;
+import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
+import javafx.scene.control.Tab;
+import javafx.scene.control.TabPane;
+import javafx.scene.control.TextArea;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.ScrollEvent;
+import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.HBox;
+import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
+import javafx.util.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import qupath.fx.dialogs.Dialogs;
@@ -47,18 +60,29 @@ public class TimeStamp implements QuPathExtension {
     private static final String EXTENSION_NAME = "TimeStamp Extension";
     private static final String EXTENSION_DESCRIPTION = "Record timestamps for image events in QuPath";
     private static final Version EXTENSION_QUPATH_VERSION = Version.parse("v0.5.0");
+    private static final double GESTURE_END_DELAY_MS = 250.0;
+    private static final int MAX_LIVE_MONITOR_EVENTS = 200;
     
     private boolean isInstalled = false;
+    private QuPathGUI qupathGui;
     private static final String TIMESTAMP_CATEGORY = "TimeStamp";
     
     // Event logs to store timestamped events
     private static final List<EventRecord> eventLog = new ArrayList<>();
     private static final List<EventRecord> mouseMoveLog = new ArrayList<>();
     private static final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
+    private static Tab liveEventTab;
+    private static TextArea liveEventTextArea;
+    private static Button startRecordingButton;
+    private static Button pauseRecordingButton;
+    private static Label recordingStatusLabel;
     
     // Persistent preferences
     private static final BooleanProperty enableTimestamp = PathPrefs.createPersistentPreference(
             "timestamp.enable", true);
+
+    private static final BooleanProperty recordEvents = PathPrefs.createPersistentPreference(
+            "timestamp.recordEvents", true);
             
     private static final BooleanProperty enableMouseTracking = PathPrefs.createPersistentPreference(
             "timestamp.trackMouse", false);
@@ -85,9 +109,11 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
         isInstalled = true;
+        qupathGui = qupath;
         
         addPreferences(qupath);
         addMenuItem(qupath);
+        installLiveEventTab(qupath);
         installTimestampOverlay(qupath);
         
         logger.info("{} installed successfully", getName());
@@ -105,6 +131,12 @@ public class TimeStamp implements QuPathExtension {
                 .category(TIMESTAMP_CATEGORY)
                 .description("Record raw mouse movements (exported separately)")
                 .build();
+
+        var recordEventsProperty = new PropertyItemBuilder<>(recordEvents, Boolean.class)
+                .name("Record events")
+                .category(TIMESTAMP_CATEGORY)
+                .description("Start or pause event capture without hiding the overlay")
+                .build();
         
         var fontSizeProperty = new PropertyItemBuilder<>(timestampFontSize, Double.class)
                 .name("Font size")
@@ -115,7 +147,7 @@ public class TimeStamp implements QuPathExtension {
         qupath.getPreferencePane()
                 .getPropertySheet()
                 .getItems()
-                .addAll(enableProperty, enableMouseProperty, fontSizeProperty);
+                .addAll(enableProperty, recordEventsProperty, enableMouseProperty, fontSizeProperty);
     }
     
     private void addMenuItem(QuPathGUI qupath) {
@@ -128,17 +160,12 @@ public class TimeStamp implements QuPathExtension {
         });
         menu.getItems().add(toggleItem);
         
-        MenuItem showLogItem = new MenuItem("Show event log");
+        MenuItem showLogItem = new MenuItem("Open live event monitor");
         showLogItem.setOnAction(e -> showEventLog());
         menu.getItems().add(showLogItem);
         
         MenuItem clearLogItem = new MenuItem("Clear event log");
-        clearLogItem.setOnAction(e -> {
-            eventLog.clear();
-            mouseMoveLog.clear();
-            logger.info("Event logs cleared");
-            Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, "Event and Mouse logs cleared");
-        });
+        clearLogItem.setOnAction(e -> clearLogs());
         menu.getItems().add(clearLogItem);
         
         MenuItem exportLogItem = new MenuItem("Export event log to CSV");
@@ -171,16 +198,42 @@ public class TimeStamp implements QuPathExtension {
             }
         });
     }
+
+    private void installLiveEventTab(QuPathGUI qupath) {
+        Platform.runLater(() -> {
+            if (liveEventTab == null) {
+                liveEventTab = new Tab("TimeStamp Monitor");
+                liveEventTab.setClosable(false);
+                liveEventTab.setContent(createLiveEventMonitorPane());
+            }
+
+            TabPane analysisTabPane = qupath.getAnalysisTabPane();
+            if (analysisTabPane != null && !analysisTabPane.getTabs().contains(liveEventTab)) {
+                analysisTabPane.getTabs().add(liveEventTab);
+            }
+        });
+    }
     
     /**
      * Install event listeners to track user interactions
      */
     private void installEventListeners(QuPathViewer viewer) {
         var view = viewer.getView();
+        var interactionState = new ViewerInteractionState();
+
+        interactionState.zoomEndDelay.setOnFinished(e -> {
+            if (interactionState.zoomInProgress && recordEvents.get()) {
+                logEvent(interactionState.lastZoomEventType + " End",
+                        String.format("downsample=%.2f", viewer.getDownsampleFactor()), viewer);
+                viewer.repaint();
+            }
+            interactionState.zoomInProgress = false;
+            interactionState.lastZoomEventType = null;
+        });
         
         // Track mouse clicks
         view.addEventFilter(MouseEvent.MOUSE_CLICKED, event -> {
-            if (enableTimestamp.get()) {
+            if (recordEvents.get()) {
                 logEvent("Click", String.format("x=%.1f, y=%.1f, button=%s", 
                     event.getX(), event.getY(), event.getButton()), viewer);
                 viewer.repaint();
@@ -189,24 +242,60 @@ public class TimeStamp implements QuPathExtension {
         
         // Track zoom events
         view.addEventFilter(ScrollEvent.SCROLL, event -> {
-            if (enableTimestamp.get() && event.getDeltaY() != 0) {
+            if (recordEvents.get() && event.getDeltaY() != 0) {
                 String direction = event.getDeltaY() > 0 ? "Zoom In" : "Zoom Out";
-                logEvent(direction, String.format("downsample=%.2f", viewer.getDownsampleFactor()), viewer);
+
+                if (interactionState.zoomInProgress &&
+                        !direction.equals(interactionState.lastZoomEventType)) {
+                    logEvent(interactionState.lastZoomEventType + " End",
+                            String.format("downsample=%.2f", viewer.getDownsampleFactor()), viewer);
+                    interactionState.zoomInProgress = false;
+                    interactionState.lastZoomEventType = null;
+                }
+
+                if (!interactionState.zoomInProgress) {
+                    interactionState.zoomInProgress = true;
+                    interactionState.lastZoomEventType = direction;
+                    logEvent(direction + " Start",
+                            String.format("downsample=%.2f", viewer.getDownsampleFactor()), viewer);
+                    viewer.repaint();
+                }
+
+                interactionState.zoomEndDelay.playFromStart();
+            } else if (interactionState.zoomInProgress) {
+                interactionState.zoomEndDelay.playFromStart();
+            }
+        });
+
+        view.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> {
+            if (!event.isPrimaryButtonDown()) {
+                interactionState.panInProgress = false;
+            }
+        });
+
+        // Track panning as a single start/end gesture instead of every drag event.
+        view.addEventFilter(MouseEvent.MOUSE_DRAGGED, event -> {
+            if (recordEvents.get() && event.isPrimaryButtonDown() && !interactionState.panInProgress) {
+                interactionState.panInProgress = true;
+                logEvent("Pan Start", String.format("x=%.1f, y=%.1f", event.getX(), event.getY()), viewer);
                 viewer.repaint();
             }
         });
         
-        // Track panning (mouse drag)
-        view.addEventFilter(MouseEvent.MOUSE_DRAGGED, event -> {
-            if (enableTimestamp.get() && event.isPrimaryButtonDown()) {
-                logEvent("Pan", String.format("x=%.1f, y=%.1f", event.getX(), event.getY()), viewer);
+        view.addEventFilter(MouseEvent.MOUSE_RELEASED, event -> {
+            if (interactionState.panInProgress) {
+                if (recordEvents.get()) {
+                    logEvent("Pan End", String.format("x=%.1f, y=%.1f", event.getX(), event.getY()), viewer);
+                    viewer.repaint();
+                }
+                interactionState.panInProgress = false;
             }
         });
 
         // Track mouse movement (throttled to avoid log spam, e.g., max 10 times per second)
         long[] lastMouseMoveTime = {0};
         view.addEventFilter(MouseEvent.MOUSE_MOVED, event -> {
-            if (enableTimestamp.get()) {
+            if (recordEvents.get() && enableMouseTracking.get()) {
                 long now = System.currentTimeMillis();
                 if (now - lastMouseMoveTime[0] > 100) { // 100ms throttle
                     lastMouseMoveTime[0] = now;
@@ -225,7 +314,7 @@ public class TimeStamp implements QuPathExtension {
      */
     private void installAnnotationListener(QuPathViewer viewer) {
         PathObjectHierarchyListener hierarchyListener = event -> {
-            if (!enableTimestamp.get()) return;
+            if (!recordEvents.get()) return;
             if (event.isChanging()) return;
             if (event.getEventType() != HierarchyEventType.ADDED) return;
 
@@ -305,6 +394,7 @@ public class TimeStamp implements QuPathExtension {
             mouseMoveLog.add(entry);
         } else {
             eventLog.add(entry);
+            refreshLiveEventMonitor();
         }
         
         if (logger.isInfoEnabled()) {
@@ -313,16 +403,79 @@ public class TimeStamp implements QuPathExtension {
         }
     }
     
+    private static BorderPane createLiveEventMonitorPane() {
+        liveEventTextArea = new TextArea();
+        liveEventTextArea.setEditable(false);
+        liveEventTextArea.setWrapText(false);
+        liveEventTextArea.setPrefColumnCount(60);
+        liveEventTextArea.setPrefRowCount(18);
+        liveEventTextArea.setStyle("-fx-font-family: 'Monospaced';");
+
+        startRecordingButton = new Button("Start Recording");
+        startRecordingButton.setOnAction(e -> {
+            recordEvents.set(true);
+            updateLiveEventMonitorControls();
+        });
+
+        pauseRecordingButton = new Button("Pause Recording");
+        pauseRecordingButton.setOnAction(e -> {
+            recordEvents.set(false);
+            updateLiveEventMonitorControls();
+        });
+
+        var clearEventsButton = new Button("Clear Events");
+        clearEventsButton.setOnAction(e -> clearLogsStatic());
+
+        recordingStatusLabel = new Label();
+        var spacer = new Region();
+        HBox.setHgrow(spacer, Priority.ALWAYS);
+
+        var controls = new HBox(8,
+                startRecordingButton,
+                pauseRecordingButton,
+                clearEventsButton,
+                spacer,
+                recordingStatusLabel);
+        controls.setPadding(new Insets(0, 0, 8, 0));
+
+        var root = new BorderPane(liveEventTextArea);
+        root.setTop(controls);
+        root.setPadding(new Insets(8));
+
+        updateLiveEventMonitorControls();
+        refreshLiveEventMonitorContents();
+        return root;
+    }
+
     /**
-     * Show the event log in a dialog
+     * Focus the live event monitor tab in QuPath's analysis pane.
      */
     private void showEventLog() {
+        Platform.runLater(() -> {
+            installLiveEventTab(qupathGui);
+            updateLiveEventMonitorControls();
+            refreshLiveEventMonitorContents();
+            if (qupathGui != null && liveEventTab != null && qupathGui.getAnalysisTabPane() != null) {
+                qupathGui.getAnalysisTabPane().getSelectionModel().select(liveEventTab);
+            }
+        });
+    }
+
+    private static void refreshLiveEventMonitor() {
+        Platform.runLater(TimeStamp::refreshLiveEventMonitorContents);
+    }
+
+    private static void refreshLiveEventMonitorContents() {
+        if (liveEventTextArea == null) {
+            return;
+        }
+
         StringBuilder sb = new StringBuilder();
         sb.append("Event Log (").append(eventLog.size()).append(" events):\n\n");
-        
-        int maxEvents = Math.min(100, eventLog.size()); // Show last 100 events
+
+        int maxEvents = Math.min(MAX_LIVE_MONITOR_EVENTS, eventLog.size());
         int startIndex = Math.max(0, eventLog.size() - maxEvents);
-        
+
         for (int i = startIndex; i < eventLog.size(); i++) {
             EventRecord entry = eventLog.get(i);
             sb.append(String.format("[%s] %s: %s%n", 
@@ -330,8 +483,33 @@ public class TimeStamp implements QuPathExtension {
                 entry.eventType, 
                 entry.details));
         }
-        
-        Dialogs.showMessageDialog("Event Log", sb.toString());
+
+        liveEventTextArea.setText(sb.toString());
+        liveEventTextArea.positionCaret(liveEventTextArea.getLength());
+    }
+
+    private static void updateLiveEventMonitorControls() {
+        if (startRecordingButton != null) {
+            startRecordingButton.setDisable(recordEvents.get());
+        }
+        if (pauseRecordingButton != null) {
+            pauseRecordingButton.setDisable(!recordEvents.get());
+        }
+        if (recordingStatusLabel != null) {
+            recordingStatusLabel.setText(recordEvents.get() ? "Status: Recording" : "Status: Paused");
+        }
+    }
+
+    private static void clearLogsStatic() {
+        eventLog.clear();
+        mouseMoveLog.clear();
+        refreshLiveEventMonitor();
+        logger.info("Event logs cleared");
+        Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, "Event and Mouse logs cleared");
+    }
+
+    private void clearLogs() {
+        clearLogsStatic();
     }
     
     /**
@@ -644,6 +822,17 @@ public class TimeStamp implements QuPathExtension {
             this.annotation = annotation;
         }
     }
+
+    /**
+     * Per-viewer gesture state used to collapse repeated drag/scroll events into
+     * a single start/end record.
+     */
+    private static class ViewerInteractionState {
+        boolean panInProgress = false;
+        boolean zoomInProgress = false;
+        String lastZoomEventType = null;
+        final PauseTransition zoomEndDelay = new PauseTransition(Duration.millis(GESTURE_END_DELAY_MS));
+    }
     
     /**
      * Custom overlay to display timestamp and last event
@@ -713,4 +902,3 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 }
-
