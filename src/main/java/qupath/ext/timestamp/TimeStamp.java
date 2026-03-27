@@ -25,6 +25,7 @@ import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
+import javafx.stage.DirectoryChooser;
 import javafx.stage.FileChooser;
 import javafx.util.Duration;
 import org.slf4j.Logger;
@@ -58,6 +59,7 @@ import java.io.PrintWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -92,6 +94,7 @@ public class TimeStamp implements QuPathExtension {
     private static Button pauseRecordingButton;
     private static Label recordingStatusLabel;
     private static Label transcriptStatusLabel;
+    private static File transcriptSessionDir;
     private static File transcriptFile;
     private static long transcriptLastModified = -1L;
     private static String transcriptLastContents = "";
@@ -192,9 +195,13 @@ public class TimeStamp implements QuPathExtension {
         showLogItem.setOnAction(e -> showEventLog());
         menu.getItems().add(showLogItem);
 
-        MenuItem selectTranscriptItem = new MenuItem("Select live transcript file");
-        selectTranscriptItem.setOnAction(e -> selectTranscriptFile());
+        MenuItem selectTranscriptItem = new MenuItem("Select transcript session folder");
+        selectTranscriptItem.setOnAction(e -> selectTranscriptSessionDirectory());
         menu.getItems().add(selectTranscriptItem);
+
+        MenuItem exportTranscriptItem = new MenuItem("Export transcript");
+        exportTranscriptItem.setOnAction(e -> exportTranscript());
+        menu.getItems().add(exportTranscriptItem);
         
         MenuItem clearLogItem = new MenuItem("Clear event log");
         clearLogItem.setOnAction(e -> clearLogs());
@@ -497,8 +504,11 @@ public class TimeStamp implements QuPathExtension {
         var clearEventsButton = new Button("Clear Events");
         clearEventsButton.setOnAction(e -> clearLogsStatic());
 
-        var selectTranscriptButton = new Button("Select Transcript File");
-        selectTranscriptButton.setOnAction(e -> selectTranscriptFile());
+        var selectTranscriptButton = new Button("Select Session Folder");
+        selectTranscriptButton.setOnAction(e -> selectTranscriptSessionDirectory());
+
+        var exportTranscriptButton = new Button("Export Transcript");
+        exportTranscriptButton.setOnAction(e -> exportTranscript());
 
         var modelLabel = new Label("Model");
         var modelField = new TextField(transcriptModel.get());
@@ -532,6 +542,7 @@ public class TimeStamp implements QuPathExtension {
         var transcriptLabel = new Label("Live Transcript");
         var transcriptControls = new HBox(8,
                 selectTranscriptButton,
+                exportTranscriptButton,
                 modelLabel,
                 modelField,
                 languageLabel,
@@ -623,16 +634,16 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
-        if (transcriptFile == null) {
+        if (transcriptSessionDir == null) {
             if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText("Transcript: select transcript file to start live transcription");
+                transcriptStatusLabel.setText("Transcript: select session folder to start live transcription");
             }
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Event recording started. Select Transcript File to launch live transcription with Start Recording.");
+                    "Event recording started. Select Session Folder to launch live transcription with Start Recording.");
             return;
         }
 
-        File sessionDir = inferSessionDirectory(transcriptFile);
+        File sessionDir = transcriptSessionDir;
         File launcher = findTranscriptLauncherScript();
         if (sessionDir == null || launcher == null) {
             if (transcriptStatusLabel != null) {
@@ -646,6 +657,11 @@ public class TimeStamp implements QuPathExtension {
         try {
             String model = defaultIfBlank(transcriptModel.get(), "small");
             String language = defaultIfBlank(transcriptLanguage.get(), "en");
+            transcriptFile = buildTranscriptFile(sessionDir);
+            resetTranscriptWorkingFile(transcriptFile);
+            transcriptLastModified = -1L;
+            transcriptLastContents = "";
+            refreshTranscriptContents();
             ProcessBuilder processBuilder = new ProcessBuilder(
                     launcher.getAbsolutePath(),
                     sessionDir.getAbsolutePath(),
@@ -678,29 +694,24 @@ public class TimeStamp implements QuPathExtension {
         stopTranscriptProcess();
     }
 
-    private static void selectTranscriptFile() {
-        FileChooser chooser = new FileChooser();
-        chooser.setTitle("Select Live Transcript File");
-        chooser.getExtensionFilters().add(
-                new FileChooser.ExtensionFilter("Text files", "*.txt", "*.log"));
+    private static void selectTranscriptSessionDirectory() {
+        DirectoryChooser chooser = new DirectoryChooser();
+        chooser.setTitle("Select Transcript Session Folder");
 
-        if (transcriptFile != null) {
-            File parent = transcriptFile.getParentFile();
-            if (parent != null && parent.isDirectory()) {
-                chooser.setInitialDirectory(parent);
-            }
-            chooser.setInitialFileName(transcriptFile.getName());
+        if (transcriptSessionDir != null && transcriptSessionDir.isDirectory()) {
+            chooser.setInitialDirectory(transcriptSessionDir);
         }
 
-        File selected = chooser.showOpenDialog(qupathGui == null ? null : qupathGui.getStage());
-        if (selected == null) {
+        File selected = chooser.showDialog(qupathGui == null ? null : qupathGui.getStage());
+        if (selected == null || !selected.isDirectory()) {
             return;
         }
 
-        transcriptFile = selected;
+        transcriptSessionDir = selected;
+        transcriptFile = buildTranscriptFile(selected);
         transcriptLastModified = -1L;
         transcriptLastContents = "";
-        logger.info("Selected transcript file: {}", selected.getAbsolutePath());
+        logger.info("Selected transcript session folder: {}", selected.getAbsolutePath());
         refreshLiveEventMonitor();
         Platform.runLater(() -> {
             if (qupathGui != null && liveEventTab != null && qupathGui.getAnalysisTabPane() != null) {
@@ -728,9 +739,19 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
+        if (transcriptSessionDir == null) {
+            liveTranscriptTextArea.setText("No session folder selected.\nUse 'Select Session Folder' to manage live transcription.");
+            transcriptStatusLabel.setText("Transcript: session folder not selected");
+            return;
+        }
+
         if (transcriptFile == null) {
-            liveTranscriptTextArea.setText("No transcript file selected.\nUse 'Select Transcript File' to follow live transcription.");
-            transcriptStatusLabel.setText("Transcript: not selected");
+            transcriptFile = buildTranscriptFile(transcriptSessionDir);
+        }
+
+        if (transcriptFile == null) {
+            liveTranscriptTextArea.setText("Transcript file is not configured.");
+            transcriptStatusLabel.setText("Transcript: file unavailable");
             return;
         }
 
@@ -775,20 +796,53 @@ public class TimeStamp implements QuPathExtension {
         return value.trim();
     }
 
-    private static File inferSessionDirectory(File transcript) {
-        if (transcript == null) {
+    private static File buildTranscriptFile(File sessionDir) {
+        if (sessionDir == null) {
             return null;
         }
 
-        File parent = transcript.getParentFile();
-        if (parent == null) {
-            return null;
+        File videoDir = new File(sessionDir, "video");
+        String sessionId = sessionDir.getName();
+        return new File(videoDir, sessionId + "_transcript.txt");
+    }
+
+    private static void resetTranscriptWorkingFile(File file) throws IOException {
+        if (file == null) {
+            return;
+        }
+        Path path = file.toPath();
+        Path parent = path.getParent();
+        if (parent != null) {
+            Files.createDirectories(parent);
+        }
+        Files.writeString(path, "", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    private static void exportTranscript() {
+        String transcriptText = liveTranscriptTextArea == null ? "" : liveTranscriptTextArea.getText();
+        if (transcriptText == null || transcriptText.isBlank()) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY, "Transcript is empty. Nothing to export.");
+            return;
         }
 
-        if ("video".equals(parent.getName())) {
-            return parent.getParentFile();
+        File initialFile = transcriptFile;
+        File file = FileChoosers.promptToSaveFile("Export Transcript", initialFile,
+                FileChoosers.createExtensionFilter("Text files", ".txt"));
+        if (file == null) {
+            return;
         }
-        return parent;
+
+        try {
+            Files.writeString(file.toPath(), transcriptText,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            Dialogs.showInfoNotification(TIMESTAMP_CATEGORY,
+                    String.format("Transcript exported to:%n%s", file.getName()));
+            logger.info("Transcript exported to {}", file.getAbsolutePath());
+        } catch (IOException e) {
+            logger.error("Failed to export transcript", e);
+            Dialogs.showErrorMessage("Export Failed",
+                    "Failed to export transcript: " + e.getMessage());
+        }
     }
 
     private static File findTranscriptLauncherScript() {
