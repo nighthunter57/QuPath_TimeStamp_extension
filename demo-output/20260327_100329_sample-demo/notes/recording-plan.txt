@@ -1,0 +1,14 @@
+Demo session: 20260327_100329_sample-demo
+
+During recording (QuPath + screen recorder):
+1) Start recording video/audio.
+2) In QuPath TimeStamp Monitor, click Start Recording.
+3) Perform actions: zoom, pan, annotate.
+4) If take is bad: stop video, click Clear Events, restart both.
+5) End take: stop video and export JSON logs.
+
+Save exports as:
+- Event log JSON: ./demo-output/20260327_100329_sample-demo/events/20260327_100329_sample-demo_event.json
+- Cursor log JSON: ./demo-output/20260327_100329_sample-demo/cursor/20260327_100329_sample-demo_cursor.json
+- Video: ./demo-output/20260327_100329_sample-demo/video/20260327_100329_sample-demo_video.mp4
+- Transcript: ./demo-output/20260327_100329_sample-demo/video/20260327_100329_sample-demo_transcript.txt

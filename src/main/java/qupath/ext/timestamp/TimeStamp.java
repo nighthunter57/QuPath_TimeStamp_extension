@@ -1,22 +1,31 @@
 package qupath.ext.timestamp;
 
+import javafx.animation.Animation;
+import javafx.animation.KeyFrame;
 import javafx.animation.PauseTransition;
+import javafx.animation.Timeline;
 import javafx.application.Platform;
 import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.DoubleProperty;
+import javafx.beans.property.StringProperty;
 import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
 import javafx.scene.control.Button;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
+import javafx.scene.control.SplitPane;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
 import javafx.scene.control.TextArea;
+import javafx.scene.control.TextField;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.layout.VBox;
+import javafx.stage.FileChooser;
 import javafx.util.Duration;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -40,10 +49,15 @@ import qupath.lib.roi.interfaces.ROI;
 
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
@@ -64,7 +78,7 @@ public class TimeStamp implements QuPathExtension {
     private static final int MAX_LIVE_MONITOR_EVENTS = 200;
     
     private boolean isInstalled = false;
-    private QuPathGUI qupathGui;
+    private static QuPathGUI qupathGui;
     private static final String TIMESTAMP_CATEGORY = "TimeStamp";
     
     // Event logs to store timestamped events
@@ -73,22 +87,35 @@ public class TimeStamp implements QuPathExtension {
     private static final DateTimeFormatter formatter = DateTimeFormatter.ofPattern("HH:mm:ss.SSS");
     private static Tab liveEventTab;
     private static TextArea liveEventTextArea;
+    private static TextArea liveTranscriptTextArea;
     private static Button startRecordingButton;
     private static Button pauseRecordingButton;
     private static Label recordingStatusLabel;
+    private static Label transcriptStatusLabel;
+    private static File transcriptFile;
+    private static long transcriptLastModified = -1L;
+    private static String transcriptLastContents = "";
+    private static Timeline transcriptRefreshTimeline;
+    private static Process transcriptProcess;
     
     // Persistent preferences
     private static final BooleanProperty enableTimestamp = PathPrefs.createPersistentPreference(
             "timestamp.enable", true);
 
     private static final BooleanProperty recordEvents = PathPrefs.createPersistentPreference(
-            "timestamp.recordEvents", true);
+            "timestamp.recordEvents", false);
             
     private static final BooleanProperty enableMouseTracking = PathPrefs.createPersistentPreference(
             "timestamp.trackMouse", false);
     
     private static final DoubleProperty timestampFontSize = PathPrefs.createPersistentPreference(
             "timestamp.fontSize", 24.0);
+
+    private static final StringProperty transcriptModel = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptModel", "small");
+
+    private static final StringProperty transcriptLanguage = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptLanguage", "en");
     
     public static BooleanProperty enableTimestampProperty() {
         return enableTimestamp;
@@ -164,6 +191,10 @@ public class TimeStamp implements QuPathExtension {
         MenuItem showLogItem = new MenuItem("Open live event monitor");
         showLogItem.setOnAction(e -> showEventLog());
         menu.getItems().add(showLogItem);
+
+        MenuItem selectTranscriptItem = new MenuItem("Select live transcript file");
+        selectTranscriptItem.setOnAction(e -> selectTranscriptFile());
+        menu.getItems().add(selectTranscriptItem);
         
         MenuItem clearLogItem = new MenuItem("Clear event log");
         clearLogItem.setOnAction(e -> clearLogs());
@@ -450,25 +481,39 @@ public class TimeStamp implements QuPathExtension {
         liveEventTextArea.setEditable(false);
         liveEventTextArea.setWrapText(false);
         liveEventTextArea.setPrefColumnCount(60);
-        liveEventTextArea.setPrefRowCount(18);
         liveEventTextArea.setStyle("-fx-font-family: 'Monospaced';");
 
+        liveTranscriptTextArea = new TextArea();
+        liveTranscriptTextArea.setEditable(false);
+        liveTranscriptTextArea.setWrapText(true);
+        liveTranscriptTextArea.setStyle("-fx-font-family: 'Monospaced';");
+
         startRecordingButton = new Button("Start Recording");
-        startRecordingButton.setOnAction(e -> {
-            recordEvents.set(true);
-            updateLiveEventMonitorControls();
-        });
+        startRecordingButton.setOnAction(e -> startRecordingSession());
 
         pauseRecordingButton = new Button("Pause Recording");
-        pauseRecordingButton.setOnAction(e -> {
-            recordEvents.set(false);
-            updateLiveEventMonitorControls();
-        });
+        pauseRecordingButton.setOnAction(e -> pauseRecordingSession());
 
         var clearEventsButton = new Button("Clear Events");
         clearEventsButton.setOnAction(e -> clearLogsStatic());
 
+        var selectTranscriptButton = new Button("Select Transcript File");
+        selectTranscriptButton.setOnAction(e -> selectTranscriptFile());
+
+        var modelLabel = new Label("Model");
+        var modelField = new TextField(transcriptModel.get());
+        modelField.setPrefColumnCount(8);
+        modelField.textProperty().addListener((obs, oldValue, newValue) ->
+                transcriptModel.set(newValue == null ? "" : newValue.trim()));
+
+        var languageLabel = new Label("Language");
+        var languageField = new TextField(transcriptLanguage.get());
+        languageField.setPrefColumnCount(5);
+        languageField.textProperty().addListener((obs, oldValue, newValue) ->
+                transcriptLanguage.set(newValue == null ? "" : newValue.trim()));
+
         recordingStatusLabel = new Label();
+        transcriptStatusLabel = new Label();
         var spacer = new Region();
         HBox.setHgrow(spacer, Priority.ALWAYS);
 
@@ -480,12 +525,32 @@ public class TimeStamp implements QuPathExtension {
                 recordingStatusLabel);
         controls.setPadding(new Insets(0, 0, 8, 0));
 
-        var root = new BorderPane(liveEventTextArea);
+        var eventLabel = new Label("TimeStamp Events");
+        var eventPane = new VBox(6, eventLabel, liveEventTextArea);
+        VBox.setVgrow(liveEventTextArea, Priority.ALWAYS);
+
+        var transcriptLabel = new Label("Live Transcript");
+        var transcriptControls = new HBox(8,
+                selectTranscriptButton,
+                modelLabel,
+                modelField,
+                languageLabel,
+                languageField,
+                transcriptStatusLabel);
+        var transcriptPane = new VBox(6, transcriptLabel, transcriptControls, liveTranscriptTextArea);
+        VBox.setVgrow(liveTranscriptTextArea, Priority.ALWAYS);
+
+        var splitPane = new SplitPane(eventPane, transcriptPane);
+        splitPane.setOrientation(Orientation.VERTICAL);
+        splitPane.setDividerPositions(0.55);
+
+        var root = new BorderPane(splitPane);
         root.setTop(controls);
         root.setPadding(new Insets(8));
 
         updateLiveEventMonitorControls();
         refreshLiveEventMonitorContents();
+        ensureTranscriptRefreshStarted();
         return root;
     }
 
@@ -508,6 +573,11 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void refreshLiveEventMonitorContents() {
+        refreshEventMonitorContents();
+        refreshTranscriptContents();
+    }
+
+    private static void refreshEventMonitorContents() {
         if (liveEventTextArea == null) {
             return;
         }
@@ -520,9 +590,9 @@ public class TimeStamp implements QuPathExtension {
 
         for (int i = startIndex; i < eventLog.size(); i++) {
             EventRecord entry = eventLog.get(i);
-            sb.append(String.format("[%s] %s: %s%n", 
-                formatter.format(entry.timestamp), 
-                entry.eventType, 
+            sb.append(String.format("[%s] %s: %s%n",
+                formatter.format(entry.timestamp),
+                entry.eventType,
                 entry.details));
         }
 
@@ -539,6 +609,271 @@ public class TimeStamp implements QuPathExtension {
         }
         if (recordingStatusLabel != null) {
             recordingStatusLabel.setText(recordEvents.get() ? "Status: Recording" : "Status: Paused");
+        }
+    }
+
+    private static void startRecordingSession() {
+        recordEvents.set(true);
+        updateLiveEventMonitorControls();
+
+        if (transcriptProcess != null && transcriptProcess.isAlive()) {
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: live transcription running");
+            }
+            return;
+        }
+
+        if (transcriptFile == null) {
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: select transcript file to start live transcription");
+            }
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Event recording started. Select Transcript File to launch live transcription with Start Recording.");
+            return;
+        }
+
+        File sessionDir = inferSessionDirectory(transcriptFile);
+        File launcher = findTranscriptLauncherScript();
+        if (sessionDir == null || launcher == null) {
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: launcher unavailable");
+            }
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Event recording started, but live transcription could not be launched. Check transcript file selection and local scripts/start_live_transcript.sh.");
+            return;
+        }
+
+        try {
+            String model = defaultIfBlank(transcriptModel.get(), "small");
+            String language = defaultIfBlank(transcriptLanguage.get(), "en");
+            ProcessBuilder processBuilder = new ProcessBuilder(
+                    launcher.getAbsolutePath(),
+                    sessionDir.getAbsolutePath(),
+                    model,
+                    language);
+            processBuilder.redirectErrorStream(true);
+            transcriptProcess = processBuilder.start();
+            consumeTranscriptProcessOutput(transcriptProcess);
+
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText(String.format("Transcript: running (%s, %s)", model, language));
+            }
+            logger.info("Started live transcript process for session {} with model={} language={}",
+                    sessionDir.getAbsolutePath(), model, language);
+            refreshLiveEventMonitor();
+        } catch (IOException e) {
+            logger.error("Failed to start live transcript process", e);
+            transcriptProcess = null;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: failed to start");
+            }
+            Dialogs.showErrorMessage("Transcript Launch Failed",
+                    "Could not start live transcription. " + e.getMessage());
+        }
+    }
+
+    private static void pauseRecordingSession() {
+        recordEvents.set(false);
+        updateLiveEventMonitorControls();
+        stopTranscriptProcess();
+    }
+
+    private static void selectTranscriptFile() {
+        FileChooser chooser = new FileChooser();
+        chooser.setTitle("Select Live Transcript File");
+        chooser.getExtensionFilters().add(
+                new FileChooser.ExtensionFilter("Text files", "*.txt", "*.log"));
+
+        if (transcriptFile != null) {
+            File parent = transcriptFile.getParentFile();
+            if (parent != null && parent.isDirectory()) {
+                chooser.setInitialDirectory(parent);
+            }
+            chooser.setInitialFileName(transcriptFile.getName());
+        }
+
+        File selected = chooser.showOpenDialog(qupathGui == null ? null : qupathGui.getStage());
+        if (selected == null) {
+            return;
+        }
+
+        transcriptFile = selected;
+        transcriptLastModified = -1L;
+        transcriptLastContents = "";
+        logger.info("Selected transcript file: {}", selected.getAbsolutePath());
+        refreshLiveEventMonitor();
+        Platform.runLater(() -> {
+            if (qupathGui != null && liveEventTab != null && qupathGui.getAnalysisTabPane() != null) {
+                qupathGui.getAnalysisTabPane().getSelectionModel().select(liveEventTab);
+            }
+        });
+    }
+
+    private static void ensureTranscriptRefreshStarted() {
+        if (transcriptRefreshTimeline != null) {
+            if (transcriptRefreshTimeline.getStatus() != Animation.Status.RUNNING) {
+                transcriptRefreshTimeline.play();
+            }
+            return;
+        }
+
+        transcriptRefreshTimeline = new Timeline(
+                new KeyFrame(Duration.seconds(1), e -> refreshTranscriptContents()));
+        transcriptRefreshTimeline.setCycleCount(Animation.INDEFINITE);
+        transcriptRefreshTimeline.play();
+    }
+
+    private static void refreshTranscriptContents() {
+        if (liveTranscriptTextArea == null || transcriptStatusLabel == null) {
+            return;
+        }
+
+        if (transcriptFile == null) {
+            liveTranscriptTextArea.setText("No transcript file selected.\nUse 'Select Transcript File' to follow live transcription.");
+            transcriptStatusLabel.setText("Transcript: not selected");
+            return;
+        }
+
+        if (!transcriptFile.exists()) {
+            liveTranscriptTextArea.setText("");
+            transcriptStatusLabel.setText("Transcript: waiting for file " + transcriptFile.getName());
+            return;
+        }
+
+        long lastModified = transcriptFile.lastModified();
+        if (lastModified == transcriptLastModified) {
+            if (transcriptProcess != null && transcriptProcess.isAlive()) {
+                transcriptStatusLabel.setText("Transcript: live transcription running");
+            } else {
+                transcriptStatusLabel.setText("Transcript: following " + transcriptFile.getName());
+            }
+            return;
+        }
+
+        try {
+            String contents = Files.readString(transcriptFile.toPath());
+            transcriptLastModified = lastModified;
+            transcriptLastContents = contents;
+            liveTranscriptTextArea.setText(contents.isBlank() ? "Transcript file is empty. Waiting for live text..." : contents);
+            liveTranscriptTextArea.positionCaret(liveTranscriptTextArea.getLength());
+            if (transcriptProcess != null && transcriptProcess.isAlive()) {
+                transcriptStatusLabel.setText("Transcript: live transcription running");
+            } else {
+                transcriptStatusLabel.setText("Transcript: following " + transcriptFile.getName());
+            }
+        } catch (IOException e) {
+            logger.warn("Failed to read transcript file {}", transcriptFile, e);
+            liveTranscriptTextArea.setText(transcriptLastContents);
+            transcriptStatusLabel.setText("Transcript: read failed for " + transcriptFile.getName());
+        }
+    }
+
+    private static String defaultIfBlank(String value, String fallback) {
+        if (value == null || value.isBlank()) {
+            return fallback;
+        }
+        return value.trim();
+    }
+
+    private static File inferSessionDirectory(File transcript) {
+        if (transcript == null) {
+            return null;
+        }
+
+        File parent = transcript.getParentFile();
+        if (parent == null) {
+            return null;
+        }
+
+        if ("video".equals(parent.getName())) {
+            return parent.getParentFile();
+        }
+        return parent;
+    }
+
+    private static File findTranscriptLauncherScript() {
+        for (Path root : getSearchRoots()) {
+            Path current = root;
+            for (int i = 0; current != null && i < 8; i++) {
+                Path candidate = current.resolve("scripts").resolve("start_live_transcript.sh");
+                if (Files.isRegularFile(candidate)) {
+                    return candidate.toFile();
+                }
+                current = current.getParent();
+            }
+        }
+        return null;
+    }
+
+    private static List<Path> getSearchRoots() {
+        List<Path> roots = new ArrayList<>();
+        roots.add(Paths.get("").toAbsolutePath());
+
+        try {
+            Path codeSource = Paths.get(TimeStamp.class.getProtectionDomain().getCodeSource().getLocation().toURI());
+            roots.add(Files.isDirectory(codeSource) ? codeSource : codeSource.getParent());
+        } catch (Exception e) {
+            logger.debug("Unable to resolve code source path for transcript launcher lookup", e);
+        }
+
+        return roots;
+    }
+
+    private static void consumeTranscriptProcessOutput(Process process) {
+        Thread thread = new Thread(() -> {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    logger.info("Transcript process: {}", line);
+                }
+            } catch (IOException e) {
+                logger.debug("Transcript process output reader stopped", e);
+            } finally {
+                Platform.runLater(() -> {
+                    if (transcriptStatusLabel != null) {
+                        if (recordEvents.get()) {
+                            transcriptStatusLabel.setText("Transcript: process stopped");
+                        } else {
+                            transcriptStatusLabel.setText("Transcript: paused");
+                        }
+                    }
+                    refreshTranscriptContents();
+                });
+            }
+        }, "timestamp-transcript-output");
+        thread.setDaemon(true);
+        thread.start();
+    }
+
+    private static void stopTranscriptProcess() {
+        if (transcriptProcess == null) {
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: paused");
+            }
+            return;
+        }
+
+        if (!transcriptProcess.isAlive()) {
+            transcriptProcess = null;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: paused");
+            }
+            return;
+        }
+
+        transcriptProcess.destroy();
+        try {
+            if (!transcriptProcess.waitFor(3, java.util.concurrent.TimeUnit.SECONDS)) {
+                transcriptProcess.destroyForcibly();
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            transcriptProcess.destroyForcibly();
+        } finally {
+            transcriptProcess = null;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: paused");
+            }
         }
     }
 
