@@ -4,23 +4,28 @@ set -euo pipefail
 # Start live Whisper transcription and save transcript inside a demo session folder.
 #
 # Usage:
-#   ./scripts/start_live_transcript.sh <session_dir> [model] [language]
+#   ./scripts/start_live_transcript.sh <session_dir> [model] [language] [options]
 # Example:
-#   ./scripts/start_live_transcript.sh ./demo-output/20260327_101500_caseA small en
+#   ./scripts/start_live_transcript.sh ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 3.5 --beam-size 5 --best-of 5 --previous-text true
 
 usage() {
   cat <<EOF
-Usage: $0 <session_dir> [model] [language]
+Usage: $0 <session_dir> [model] [language] [options]
 
 Starts live microphone transcription for an existing demo session directory.
 
 Arguments:
   session_dir   Existing demo session folder created by prepare_demo.sh
-  model         Optional faster-whisper model (default: small)
+  model         Optional faster-whisper model (default: large-v3)
   language      Optional language code, or auto (default: en)
+  --chunk-seconds N   Optional chunk size in seconds
+  --compute-type T    Optional compute type
+  --beam-size N       Optional beam size
+  --best-of N         Optional best_of value
+  --previous-text V   Optional true/false for previous text context
 
 Example:
-  $0 ./demo-output/20260327_101500_caseA small en
+  $0 ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 3.5 --beam-size 5 --best-of 5 --previous-text true
 EOF
 }
 
@@ -29,7 +34,7 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if [[ $# -lt 1 || $# -gt 3 ]]; then
+if [[ $# -lt 1 ]]; then
   usage >&2
   exit 1
 fi
@@ -40,11 +45,37 @@ VENV_DIR="${REPO_ROOT}/.venv-whisper"
 PYTHON_SCRIPT="${SCRIPT_DIR}/live_whisper_demo.py"
 
 SESSION_DIR="$1"
-MODEL="${2:-small}"
-LANGUAGE="${3:-en}"
+shift || true
+MODEL="${1:-large-v3}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
+LANGUAGE="${1:-en}"
+if [[ $# -gt 0 ]]; then
+  shift
+fi
 SESSION_ID="$(basename "$SESSION_DIR")"
 TRANSCRIPT_PATH="$SESSION_DIR/video/${SESSION_ID}_transcript.txt"
 RUN_COMMAND="./scripts/start_live_transcript.sh \"$SESSION_DIR\" \"$MODEL\" \"$LANGUAGE\""
+EXTRA_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --chunk-seconds|--compute-type|--beam-size|--best-of|--previous-text)
+      if [[ $# -lt 2 ]]; then
+        echo "Error: missing value for $1" >&2
+        exit 1
+      fi
+      EXTRA_ARGS+=("$1" "$2")
+      shift 2
+      ;;
+    *)
+      echo "Error: unknown argument: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+done
 
 if [[ ! -d "$SESSION_DIR" ]]; then
   echo "Error: session directory not found: $SESSION_DIR" >&2
@@ -75,6 +106,9 @@ echo "  Model       : $MODEL"
 echo "  Language    : $LANGUAGE"
 echo "  Output file : $TRANSCRIPT_PATH"
 echo "  Run command : $RUN_COMMAND"
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+  echo "  Extra args  : ${EXTRA_ARGS[*]}"
+fi
 echo
 echo "Transcript is being written to:"
 echo "  $TRANSCRIPT_PATH"
@@ -86,4 +120,5 @@ source "${VENV_DIR}/bin/activate"
 python "$PYTHON_SCRIPT" \
   --output "$TRANSCRIPT_PATH" \
   --model "$MODEL" \
-  --language "$LANGUAGE"
+  --language "$LANGUAGE" \
+  "${EXTRA_ARGS[@]}"

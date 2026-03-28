@@ -19,12 +19,12 @@ def parse_args() -> argparse.Namespace:
         description="Capture live microphone audio and append transcript lines to a text file.",
     )
     parser.add_argument("--output", required=True, help="Transcript output path")
-    parser.add_argument("--model", default="small", help="faster-whisper model name")
+    parser.add_argument("--model", default="large-v3", help="faster-whisper model name")
     parser.add_argument("--language", default="en", help="Language code, or 'auto' for detection")
     parser.add_argument(
         "--chunk-seconds",
         type=float,
-        default=2.0,
+        default=3.5,
         help="Audio chunk size in seconds",
     )
     parser.add_argument(
@@ -36,6 +36,13 @@ def parse_args() -> argparse.Namespace:
         "--compute-type",
         default="int8",
         help="faster-whisper compute type, e.g. int8 or float16",
+    )
+    parser.add_argument("--beam-size", type=int, default=5, help="Beam size for decoding")
+    parser.add_argument("--best-of", type=int, default=5, help="best_of value for decoding")
+    parser.add_argument(
+        "--previous-text",
+        default="true",
+        help="Use previous text context: true or false",
     )
     parser.add_argument(
         "--list-devices",
@@ -68,15 +75,18 @@ def transcribe_audio(
     audio,
     language: Optional[str],
     chunk_start_time: datetime,
+    beam_size: int,
+    best_of: int,
+    previous_text: bool,
 ) -> list[str]:
     segments, _ = model.transcribe(
         audio,
         language=language,
         vad_filter=True,
-        beam_size=1,
-        best_of=1,
+        beam_size=beam_size,
+        best_of=best_of,
         temperature=0.0,
-        condition_on_previous_text=False,
+        condition_on_previous_text=previous_text,
     )
 
     lines: list[str] = []
@@ -100,11 +110,29 @@ def explain_portaudio_error(error: Exception) -> str:
     return f"Audio input error: {message}"
 
 
+def parse_bool(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"1", "true", "yes", "on"}:
+        return True
+    if lowered in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Invalid boolean value: {value}")
+
+
 def main() -> int:
     args = parse_args()
 
     if args.chunk_seconds <= 0:
         print("Error: --chunk-seconds must be greater than 0.", file=sys.stderr)
+        return 2
+    if args.beam_size <= 0 or args.best_of <= 0:
+        print("Error: --beam-size and --best-of must be greater than 0.", file=sys.stderr)
+        return 2
+
+    try:
+        previous_text = parse_bool(args.previous_text)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     try:
@@ -162,6 +190,9 @@ def main() -> int:
     print(f"  Chunk secs  : {args.chunk_seconds}")
     print(f"  Device      : {args.device if args.device is not None else 'default'}")
     print(f"  Compute type: {args.compute_type}")
+    print(f"  Beam size   : {args.beam_size}")
+    print(f"  Best of     : {args.best_of}")
+    print(f"  Prev text   : {previous_text}")
     print(f"  Output file : {out_path}")
     print("Press Ctrl+C to stop.")
 
@@ -197,7 +228,15 @@ def main() -> int:
                     audio = audio_buffer[:samples_per_chunk, 0].copy()
                     audio_buffer = audio_buffer[samples_per_chunk:]
                     chunk_window_start = audio_buffer_start_time
-                    lines = transcribe_audio(model, audio, language, chunk_window_start)
+                    lines = transcribe_audio(
+                        model,
+                        audio,
+                        language,
+                        chunk_window_start,
+                        args.beam_size,
+                        args.best_of,
+                        previous_text,
+                    )
                     append_lines(out_path, lines)
                     for line in lines:
                         print(line)
@@ -223,6 +262,9 @@ def main() -> int:
                 audio_buffer[:, 0].copy(),
                 language,
                 audio_buffer_start_time,
+                args.beam_size,
+                args.best_of,
+                previous_text,
             )
             append_lines(out_path, lines)
             for line in lines:

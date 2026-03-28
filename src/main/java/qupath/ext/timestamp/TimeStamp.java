@@ -11,6 +11,9 @@ import javafx.beans.property.StringProperty;
 import javafx.geometry.Insets;
 import javafx.geometry.Orientation;
 import javafx.scene.control.Button;
+import javafx.scene.control.CheckBox;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Dialog;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.SplitPane;
@@ -21,6 +24,7 @@ import javafx.scene.control.TextField;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.BorderPane;
+import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
@@ -63,6 +67,7 @@ import java.nio.file.StandardOpenOption;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -78,6 +83,36 @@ public class TimeStamp implements QuPathExtension {
     private static final Version EXTENSION_QUPATH_VERSION = Version.parse("v0.5.0");
     private static final double GESTURE_END_DELAY_MS = 250.0;
     private static final int MAX_LIVE_MONITOR_EVENTS = 200;
+    private static final List<String> AVAILABLE_TRANSCRIPT_MODELS = Arrays.asList(
+            "tiny", "tiny.en",
+            "base", "base.en",
+            "small", "small.en",
+            "medium", "medium.en",
+            "large-v1", "large-v2", "large-v3",
+            "distil-small.en", "distil-medium.en", "distil-large-v2");
+    private static final List<String> AVAILABLE_TRANSCRIPT_LANGUAGES = Arrays.asList(
+            "auto - Auto detect",
+            "en - English",
+            "es - Spanish",
+            "fr - French",
+            "de - German",
+            "it - Italian",
+            "pt - Portuguese",
+            "nl - Dutch",
+            "pl - Polish",
+            "tr - Turkish",
+            "ru - Russian",
+            "uk - Ukrainian",
+            "ar - Arabic",
+            "hi - Hindi",
+            "zh - Chinese",
+            "ja - Japanese",
+            "ko - Korean",
+            "vi - Vietnamese",
+            "th - Thai",
+            "id - Indonesian",
+            "ms - Malay",
+            "tl - Tagalog");
     
     private boolean isInstalled = false;
     private static QuPathGUI qupathGui;
@@ -94,6 +129,7 @@ public class TimeStamp implements QuPathExtension {
     private static Button pauseRecordingButton;
     private static Label recordingStatusLabel;
     private static Label transcriptStatusLabel;
+    private static Label transcriptSettingsLabel;
     private static File transcriptSessionDir;
     private static File transcriptFile;
     private static long transcriptLastModified = -1L;
@@ -119,6 +155,21 @@ public class TimeStamp implements QuPathExtension {
 
     private static final StringProperty transcriptLanguage = PathPrefs.createPersistentPreference(
             "timestamp.transcriptLanguage", "en");
+
+    private static final StringProperty transcriptChunkSeconds = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptChunkSeconds", "3.5");
+
+    private static final StringProperty transcriptComputeType = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptComputeType", "int8");
+
+    private static final StringProperty transcriptBeamSize = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptBeamSize", "5");
+
+    private static final StringProperty transcriptBestOf = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptBestOf", "5");
+
+    private static final BooleanProperty transcriptPreviousText = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptPreviousText", true);
     
     public static BooleanProperty enableTimestampProperty() {
         return enableTimestamp;
@@ -202,6 +253,10 @@ public class TimeStamp implements QuPathExtension {
         MenuItem exportTranscriptItem = new MenuItem("Export transcript");
         exportTranscriptItem.setOnAction(e -> exportTranscript());
         menu.getItems().add(exportTranscriptItem);
+
+        MenuItem transcriptSettingsItem = new MenuItem("Transcript settings");
+        transcriptSettingsItem.setOnAction(e -> showTranscriptSettingsDialog());
+        menu.getItems().add(transcriptSettingsItem);
         
         MenuItem clearLogItem = new MenuItem("Clear event log");
         clearLogItem.setOnAction(e -> clearLogs());
@@ -497,57 +552,66 @@ public class TimeStamp implements QuPathExtension {
 
         startRecordingButton = new Button("Start Recording");
         startRecordingButton.setOnAction(e -> startRecordingSession());
+        configureMonitorButton(startRecordingButton);
 
         pauseRecordingButton = new Button("Pause Recording");
         pauseRecordingButton.setOnAction(e -> pauseRecordingSession());
+        configureMonitorButton(pauseRecordingButton);
 
         var clearEventsButton = new Button("Clear Events");
         clearEventsButton.setOnAction(e -> clearLogsStatic());
+        configureMonitorButton(clearEventsButton);
 
         var selectTranscriptButton = new Button("Select Session Folder");
         selectTranscriptButton.setOnAction(e -> selectTranscriptSessionDirectory());
+        configureMonitorButton(selectTranscriptButton);
 
         var exportTranscriptButton = new Button("Export Transcript");
         exportTranscriptButton.setOnAction(e -> exportTranscript());
+        configureMonitorButton(exportTranscriptButton);
 
-        var modelLabel = new Label("Model");
-        var modelField = new TextField(transcriptModel.get());
-        modelField.setPrefColumnCount(8);
-        modelField.textProperty().addListener((obs, oldValue, newValue) ->
-                transcriptModel.set(newValue == null ? "" : newValue.trim()));
-
-        var languageLabel = new Label("Language");
-        var languageField = new TextField(transcriptLanguage.get());
-        languageField.setPrefColumnCount(5);
-        languageField.textProperty().addListener((obs, oldValue, newValue) ->
-                transcriptLanguage.set(newValue == null ? "" : newValue.trim()));
+        var transcriptSettingsButton = new Button("Transcript Settings");
+        transcriptSettingsButton.setOnAction(e -> showTranscriptSettingsDialog());
+        configureMonitorButton(transcriptSettingsButton);
 
         recordingStatusLabel = new Label();
         transcriptStatusLabel = new Label();
-        var spacer = new Region();
-        HBox.setHgrow(spacer, Priority.ALWAYS);
+        transcriptSettingsLabel = new Label();
+        recordingStatusLabel.setWrapText(true);
+        transcriptStatusLabel.setWrapText(true);
+        transcriptSettingsLabel.setWrapText(true);
 
-        var controls = new HBox(8,
-                startRecordingButton,
-                pauseRecordingButton,
-                clearEventsButton,
-                spacer,
-                recordingStatusLabel);
+        GridPane controls = new GridPane();
+        controls.setHgap(8);
+        controls.setVgap(8);
         controls.setPadding(new Insets(0, 0, 8, 0));
+        controls.add(startRecordingButton, 0, 0);
+        controls.add(pauseRecordingButton, 1, 0);
+        controls.add(clearEventsButton, 2, 0);
+        controls.add(recordingStatusLabel, 0, 1, 3, 1);
+        GridPane.setHgrow(startRecordingButton, Priority.ALWAYS);
+        GridPane.setHgrow(pauseRecordingButton, Priority.ALWAYS);
+        GridPane.setHgrow(clearEventsButton, Priority.ALWAYS);
+        GridPane.setHgrow(recordingStatusLabel, Priority.ALWAYS);
 
         var eventLabel = new Label("TimeStamp Events");
         var eventPane = new VBox(6, eventLabel, liveEventTextArea);
         VBox.setVgrow(liveEventTextArea, Priority.ALWAYS);
 
         var transcriptLabel = new Label("Live Transcript");
-        var transcriptControls = new HBox(8,
-                selectTranscriptButton,
-                exportTranscriptButton,
-                modelLabel,
-                modelField,
-                languageLabel,
-                languageField,
-                transcriptStatusLabel);
+        GridPane transcriptControls = new GridPane();
+        transcriptControls.setHgap(8);
+        transcriptControls.setVgap(8);
+        transcriptControls.add(selectTranscriptButton, 0, 0);
+        transcriptControls.add(exportTranscriptButton, 1, 0);
+        transcriptControls.add(transcriptSettingsButton, 0, 1, 2, 1);
+        transcriptControls.add(transcriptSettingsLabel, 0, 2, 2, 1);
+        transcriptControls.add(transcriptStatusLabel, 0, 3, 2, 1);
+        GridPane.setHgrow(selectTranscriptButton, Priority.ALWAYS);
+        GridPane.setHgrow(exportTranscriptButton, Priority.ALWAYS);
+        GridPane.setHgrow(transcriptSettingsButton, Priority.ALWAYS);
+        GridPane.setHgrow(transcriptSettingsLabel, Priority.ALWAYS);
+        GridPane.setHgrow(transcriptStatusLabel, Priority.ALWAYS);
         var transcriptPane = new VBox(6, transcriptLabel, transcriptControls, liveTranscriptTextArea);
         VBox.setVgrow(liveTranscriptTextArea, Priority.ALWAYS);
 
@@ -560,6 +624,7 @@ public class TimeStamp implements QuPathExtension {
         root.setPadding(new Insets(8));
 
         updateLiveEventMonitorControls();
+        updateTranscriptSettingsSummary();
         refreshLiveEventMonitorContents();
         ensureTranscriptRefreshStarted();
         return root;
@@ -655,8 +720,13 @@ public class TimeStamp implements QuPathExtension {
         }
 
         try {
-            String model = defaultIfBlank(transcriptModel.get(), "small");
+            String model = defaultIfBlank(transcriptModel.get(), "large-v3");
             String language = defaultIfBlank(transcriptLanguage.get(), "en");
+            String chunkSeconds = defaultIfBlank(transcriptChunkSeconds.get(), "3.5");
+            String computeType = defaultIfBlank(transcriptComputeType.get(), "int8");
+            String beamSize = defaultIfBlank(transcriptBeamSize.get(), "5");
+            String bestOf = defaultIfBlank(transcriptBestOf.get(), "5");
+            String previousText = Boolean.toString(transcriptPreviousText.get());
             transcriptFile = buildTranscriptFile(sessionDir);
             resetTranscriptWorkingFile(transcriptFile);
             transcriptLastModified = -1L;
@@ -666,16 +736,26 @@ public class TimeStamp implements QuPathExtension {
                     launcher.getAbsolutePath(),
                     sessionDir.getAbsolutePath(),
                     model,
-                    language);
+                    language,
+                    "--chunk-seconds",
+                    chunkSeconds,
+                    "--compute-type",
+                    computeType,
+                    "--beam-size",
+                    beamSize,
+                    "--best-of",
+                    bestOf,
+                    "--previous-text",
+                    previousText);
             processBuilder.redirectErrorStream(true);
             transcriptProcess = processBuilder.start();
             consumeTranscriptProcessOutput(transcriptProcess);
 
             if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText(String.format("Transcript: running (%s, %s)", model, language));
+                transcriptStatusLabel.setText(String.format("Transcript: running (%s, %ss)", model, chunkSeconds));
             }
-            logger.info("Started live transcript process for session {} with model={} language={}",
-                    sessionDir.getAbsolutePath(), model, language);
+            logger.info("Started live transcript process for session {} with model={} language={} chunk={} compute={} beam={} bestOf={} previousText={}",
+                    sessionDir.getAbsolutePath(), model, language, chunkSeconds, computeType, beamSize, bestOf, previousText);
             refreshLiveEventMonitor();
         } catch (IOException e) {
             logger.error("Failed to start live transcript process", e);
@@ -794,6 +874,109 @@ public class TimeStamp implements QuPathExtension {
             return fallback;
         }
         return value.trim();
+    }
+
+    private static void configureMonitorButton(Button button) {
+        button.setMaxWidth(Double.MAX_VALUE);
+        button.setWrapText(true);
+    }
+
+    private static String selectTranscriptModel(String currentModel) {
+        if (AVAILABLE_TRANSCRIPT_MODELS.contains(currentModel)) {
+            return currentModel;
+        }
+        return "large-v3";
+    }
+
+    private static String selectTranscriptLanguage(String languageCode) {
+        String normalized = defaultIfBlank(languageCode, "en");
+        if ("auto".equalsIgnoreCase(normalized)) {
+            return AVAILABLE_TRANSCRIPT_LANGUAGES.get(0);
+        }
+        for (String option : AVAILABLE_TRANSCRIPT_LANGUAGES) {
+            if (option.startsWith(normalized + " ")) {
+                return option;
+            }
+        }
+        return "en - English";
+    }
+
+    private static String languageCodeFromSelection(String selection) {
+        String normalized = defaultIfBlank(selection, "en - English");
+        if (normalized.startsWith("auto")) {
+            return "auto";
+        }
+        int dash = normalized.indexOf(" - ");
+        return dash > 0 ? normalized.substring(0, dash) : normalized;
+    }
+
+    private static void updateTranscriptSettingsSummary() {
+        if (transcriptSettingsLabel == null) {
+            return;
+        }
+
+        String summary = String.format("Model=%s | Lang=%s | Chunk=%ss | Beam=%s | Best=%s",
+                defaultIfBlank(transcriptModel.get(), "large-v3"),
+                defaultIfBlank(transcriptLanguage.get(), "en"),
+                defaultIfBlank(transcriptChunkSeconds.get(), "3.5"),
+                defaultIfBlank(transcriptBeamSize.get(), "5"),
+                defaultIfBlank(transcriptBestOf.get(), "5"));
+        transcriptSettingsLabel.setText(summary);
+    }
+
+    private static void showTranscriptSettingsDialog() {
+        Dialog<javafx.scene.control.ButtonType> dialog = new Dialog<>();
+        dialog.setTitle("Transcript Settings");
+        if (qupathGui != null) {
+            dialog.initOwner(qupathGui.getStage());
+        }
+
+        var modelCombo = new ComboBox<String>();
+        modelCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_MODELS);
+        modelCombo.setMaxWidth(Double.MAX_VALUE);
+        modelCombo.setValue(selectTranscriptModel(defaultIfBlank(transcriptModel.get(), "large-v3")));
+
+        var languageCombo = new ComboBox<String>();
+        languageCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_LANGUAGES);
+        languageCombo.setMaxWidth(Double.MAX_VALUE);
+        languageCombo.setValue(selectTranscriptLanguage(defaultIfBlank(transcriptLanguage.get(), "en")));
+
+        var chunkField = new TextField(defaultIfBlank(transcriptChunkSeconds.get(), "3.5"));
+        var computeField = new TextField(defaultIfBlank(transcriptComputeType.get(), "int8"));
+        var beamField = new TextField(defaultIfBlank(transcriptBeamSize.get(), "5"));
+        var bestOfField = new TextField(defaultIfBlank(transcriptBestOf.get(), "5"));
+        var previousTextBox = new CheckBox("Use previous text context");
+        previousTextBox.setSelected(transcriptPreviousText.get());
+
+        GridPane grid = new GridPane();
+        grid.setHgap(8);
+        grid.setVgap(8);
+        grid.setPadding(new Insets(10));
+        grid.addRow(0, new Label("Model"), modelCombo);
+        grid.addRow(1, new Label("Language"), languageCombo);
+        grid.addRow(2, new Label("Chunk seconds"), chunkField);
+        grid.addRow(3, new Label("Compute type"), computeField);
+        grid.addRow(4, new Label("Beam size"), beamField);
+        grid.addRow(5, new Label("Best of"), bestOfField);
+        grid.add(previousTextBox, 1, 6);
+
+        dialog.getDialogPane().setContent(grid);
+        dialog.getDialogPane().getButtonTypes().addAll(javafx.scene.control.ButtonType.OK,
+                javafx.scene.control.ButtonType.CANCEL);
+
+        var result = dialog.showAndWait();
+        if (result.isEmpty() || result.get() != javafx.scene.control.ButtonType.OK) {
+            return;
+        }
+
+        transcriptModel.set(defaultIfBlank(modelCombo.getValue(), "large-v3"));
+        transcriptLanguage.set(languageCodeFromSelection(languageCombo.getValue()));
+        transcriptChunkSeconds.set(defaultIfBlank(chunkField.getText(), "3.5"));
+        transcriptComputeType.set(defaultIfBlank(computeField.getText(), "int8"));
+        transcriptBeamSize.set(defaultIfBlank(beamField.getText(), "5"));
+        transcriptBestOf.set(defaultIfBlank(bestOfField.getText(), "5"));
+        transcriptPreviousText.set(previousTextBox.isSelected());
+        updateTranscriptSettingsSummary();
     }
 
     private static File buildTranscriptFile(File sessionDir) {
