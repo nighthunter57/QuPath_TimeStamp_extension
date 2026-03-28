@@ -82,6 +82,7 @@ public class TimeStamp implements QuPathExtension {
     private static final String EXTENSION_DESCRIPTION = "Record timestamps for image events in QuPath";
     private static final Version EXTENSION_QUPATH_VERSION = Version.parse("v0.5.0");
     private static final double GESTURE_END_DELAY_MS = 250.0;
+    private static final double TRANSCRIPT_REFRESH_INTERVAL_SECONDS = 0.25;
     private static final int MAX_LIVE_MONITOR_EVENTS = 200;
     private static final List<String> AVAILABLE_TRANSCRIPT_MODELS = Arrays.asList(
             "tiny", "tiny.en",
@@ -169,7 +170,7 @@ public class TimeStamp implements QuPathExtension {
             "timestamp.transcriptBestOf", "5");
 
     private static final BooleanProperty transcriptPreviousText = PathPrefs.createPersistentPreference(
-            "timestamp.transcriptPreviousText", true);
+            "timestamp.transcriptPreviousText", false);
     
     public static BooleanProperty enableTimestampProperty() {
         return enableTimestamp;
@@ -699,6 +700,10 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
+        startTranscriptProcess(true);
+    }
+
+    private static void startTranscriptProcess(boolean resetWorkingFile) {
         if (transcriptSessionDir == null) {
             if (transcriptStatusLabel != null) {
                 transcriptStatusLabel.setText("Transcript: select session folder to start live transcription");
@@ -710,7 +715,7 @@ public class TimeStamp implements QuPathExtension {
 
         File sessionDir = transcriptSessionDir;
         File launcher = findTranscriptLauncherScript();
-        if (sessionDir == null || launcher == null) {
+        if (launcher == null) {
             if (transcriptStatusLabel != null) {
                 transcriptStatusLabel.setText("Transcript: launcher unavailable");
             }
@@ -720,7 +725,7 @@ public class TimeStamp implements QuPathExtension {
         }
 
         try {
-            String model = defaultIfBlank(transcriptModel.get(), "large-v3");
+            String model = defaultIfBlank(transcriptModel.get(), "small");
             String language = defaultIfBlank(transcriptLanguage.get(), "en");
             String chunkSeconds = defaultIfBlank(transcriptChunkSeconds.get(), "3.5");
             String computeType = defaultIfBlank(transcriptComputeType.get(), "int8");
@@ -728,9 +733,13 @@ public class TimeStamp implements QuPathExtension {
             String bestOf = defaultIfBlank(transcriptBestOf.get(), "5");
             String previousText = Boolean.toString(transcriptPreviousText.get());
             transcriptFile = buildTranscriptFile(sessionDir);
-            resetTranscriptWorkingFile(transcriptFile);
+            if (resetWorkingFile) {
+                resetTranscriptWorkingFile(transcriptFile);
+            }
             transcriptLastModified = -1L;
-            transcriptLastContents = "";
+            if (resetWorkingFile) {
+                transcriptLastContents = "";
+            }
             refreshTranscriptContents();
             ProcessBuilder processBuilder = new ProcessBuilder(
                     launcher.getAbsolutePath(),
@@ -766,6 +775,15 @@ public class TimeStamp implements QuPathExtension {
             Dialogs.showErrorMessage("Transcript Launch Failed",
                     "Could not start live transcription. " + e.getMessage());
         }
+    }
+
+    private static void restartTranscriptProcessForUpdatedSettings() {
+        if (!recordEvents.get() || transcriptSessionDir == null) {
+            return;
+        }
+
+        stopTranscriptProcess();
+        startTranscriptProcess(false);
     }
 
     private static void pauseRecordingSession() {
@@ -809,7 +827,7 @@ public class TimeStamp implements QuPathExtension {
         }
 
         transcriptRefreshTimeline = new Timeline(
-                new KeyFrame(Duration.seconds(1), e -> refreshTranscriptContents()));
+                new KeyFrame(Duration.seconds(TRANSCRIPT_REFRESH_INTERVAL_SECONDS), e -> refreshTranscriptContents()));
         transcriptRefreshTimeline.setCycleCount(Animation.INDEFINITE);
         transcriptRefreshTimeline.play();
     }
@@ -885,7 +903,7 @@ public class TimeStamp implements QuPathExtension {
         if (AVAILABLE_TRANSCRIPT_MODELS.contains(currentModel)) {
             return currentModel;
         }
-        return "large-v3";
+        return "small";
     }
 
     private static String selectTranscriptLanguage(String languageCode) {
@@ -916,7 +934,7 @@ public class TimeStamp implements QuPathExtension {
         }
 
         String summary = String.format("Model=%s | Lang=%s | Chunk=%ss | Beam=%s | Best=%s",
-                defaultIfBlank(transcriptModel.get(), "large-v3"),
+                defaultIfBlank(transcriptModel.get(), "small"),
                 defaultIfBlank(transcriptLanguage.get(), "en"),
                 defaultIfBlank(transcriptChunkSeconds.get(), "3.5"),
                 defaultIfBlank(transcriptBeamSize.get(), "5"),
@@ -934,7 +952,7 @@ public class TimeStamp implements QuPathExtension {
         var modelCombo = new ComboBox<String>();
         modelCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_MODELS);
         modelCombo.setMaxWidth(Double.MAX_VALUE);
-        modelCombo.setValue(selectTranscriptModel(defaultIfBlank(transcriptModel.get(), "large-v3")));
+        modelCombo.setValue(selectTranscriptModel(defaultIfBlank(transcriptModel.get(), "small")));
 
         var languageCombo = new ComboBox<String>();
         languageCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_LANGUAGES);
@@ -969,7 +987,15 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
-        transcriptModel.set(defaultIfBlank(modelCombo.getValue(), "large-v3"));
+        String oldModel = defaultIfBlank(transcriptModel.get(), "small");
+        String oldLanguage = defaultIfBlank(transcriptLanguage.get(), "en");
+        String oldChunkSeconds = defaultIfBlank(transcriptChunkSeconds.get(), "3.5");
+        String oldComputeType = defaultIfBlank(transcriptComputeType.get(), "int8");
+        String oldBeamSize = defaultIfBlank(transcriptBeamSize.get(), "5");
+        String oldBestOf = defaultIfBlank(transcriptBestOf.get(), "5");
+        boolean oldPreviousText = transcriptPreviousText.get();
+
+        transcriptModel.set(defaultIfBlank(modelCombo.getValue(), "small"));
         transcriptLanguage.set(languageCodeFromSelection(languageCombo.getValue()));
         transcriptChunkSeconds.set(defaultIfBlank(chunkField.getText(), "3.5"));
         transcriptComputeType.set(defaultIfBlank(computeField.getText(), "int8"));
@@ -977,6 +1003,19 @@ public class TimeStamp implements QuPathExtension {
         transcriptBestOf.set(defaultIfBlank(bestOfField.getText(), "5"));
         transcriptPreviousText.set(previousTextBox.isSelected());
         updateTranscriptSettingsSummary();
+
+        boolean settingsChanged =
+                !oldModel.equals(transcriptModel.get()) ||
+                !oldLanguage.equals(transcriptLanguage.get()) ||
+                !oldChunkSeconds.equals(transcriptChunkSeconds.get()) ||
+                !oldComputeType.equals(transcriptComputeType.get()) ||
+                !oldBeamSize.equals(transcriptBeamSize.get()) ||
+                !oldBestOf.equals(transcriptBestOf.get()) ||
+                oldPreviousText != transcriptPreviousText.get();
+
+        if (settingsChanged && recordEvents.get()) {
+            restartTranscriptProcessForUpdatedSettings();
+        }
     }
 
     private static File buildTranscriptFile(File sessionDir) {

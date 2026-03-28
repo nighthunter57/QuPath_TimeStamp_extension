@@ -2,7 +2,10 @@
 """Live microphone transcription with faster-whisper."""
 
 import argparse
+from collections import deque
+from difflib import SequenceMatcher
 import queue
+import re
 import signal
 import sys
 from datetime import datetime, timedelta
@@ -12,6 +15,12 @@ from typing import Optional, Sequence, Union
 SAMPLE_RATE = 16000
 CHANNELS = 1
 MIN_FLUSH_SECONDS = 1.0
+DEDUP_WINDOW_SECONDS = 15.0
+DEDUP_SIMILARITY_THRESHOLD = 0.85
+CHUNK_RMS_SILENCE_THRESHOLD = 0.004
+SEGMENT_AVG_LOGPROB_THRESHOLD = -0.9
+SEGMENT_NO_SPEECH_THRESHOLD = 0.6
+SEGMENT_COMPRESSION_RATIO_THRESHOLD = 2.2
 
 
 def parse_args() -> argparse.Namespace:
@@ -41,7 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--best-of", type=int, default=5, help="best_of value for decoding")
     parser.add_argument(
         "--previous-text",
-        default="true",
+        default="false",
         help="Use previous text context: true or false",
     )
     parser.add_argument(
@@ -70,6 +79,63 @@ def append_lines(out_path: Path, lines: Sequence[str]) -> None:
             handle.write(line + "\n")
 
 
+def normalize_transcript_text(text: str) -> str:
+    normalized = text.strip().lower()
+    normalized = re.sub(r"[^\w\s]", "", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized
+
+
+def is_duplicate_text(
+    timestamp: datetime,
+    text: str,
+    recent_emissions: deque[tuple[datetime, str]],
+) -> bool:
+    normalized = normalize_transcript_text(text)
+    if not normalized:
+        return True
+
+    while recent_emissions and (timestamp - recent_emissions[0][0]).total_seconds() > DEDUP_WINDOW_SECONDS:
+        recent_emissions.popleft()
+
+    for _, recent_text in recent_emissions:
+        if normalized == recent_text:
+            return True
+
+        if normalized in recent_text or recent_text in normalized:
+            shorter = min(len(normalized), len(recent_text))
+            longer = max(len(normalized), len(recent_text))
+            if shorter > 0 and shorter / longer >= 0.7:
+                return True
+
+        similarity = SequenceMatcher(None, normalized, recent_text).ratio()
+        if similarity >= DEDUP_SIMILARITY_THRESHOLD:
+            return True
+
+    recent_emissions.append((timestamp, normalized))
+    return False
+
+
+def audio_rms(audio) -> float:
+    return float((audio.astype("float32") ** 2).mean() ** 0.5)
+
+
+def looks_like_low_confidence_segment(segment) -> bool:
+    avg_logprob = getattr(segment, "avg_logprob", None)
+    if avg_logprob is not None and float(avg_logprob) < SEGMENT_AVG_LOGPROB_THRESHOLD:
+        return True
+
+    no_speech_prob = getattr(segment, "no_speech_prob", None)
+    if no_speech_prob is not None and float(no_speech_prob) > SEGMENT_NO_SPEECH_THRESHOLD:
+        return True
+
+    compression_ratio = getattr(segment, "compression_ratio", None)
+    if compression_ratio is not None and float(compression_ratio) > SEGMENT_COMPRESSION_RATIO_THRESHOLD:
+        return True
+
+    return False
+
+
 def transcribe_audio(
     model,
     audio,
@@ -78,7 +144,11 @@ def transcribe_audio(
     beam_size: int,
     best_of: int,
     previous_text: bool,
+    recent_emissions: deque[tuple[datetime, str]],
 ) -> list[str]:
+    if audio_rms(audio) < CHUNK_RMS_SILENCE_THRESHOLD:
+        return []
+
     segments, _ = model.transcribe(
         audio,
         language=language,
@@ -91,11 +161,15 @@ def transcribe_audio(
 
     lines: list[str] = []
     for segment in segments:
+        if looks_like_low_confidence_segment(segment):
+            continue
         text = segment.text.strip()
         if not text:
             continue
         segment_offset = max(0.0, float(segment.start))
         segment_time = chunk_start_time + timedelta(seconds=segment_offset)
+        if is_duplicate_text(segment_time, text, recent_emissions):
+            continue
         lines.append(f"[{format_timestamp(segment_time)}] {text}")
     return lines
 
@@ -160,6 +234,7 @@ def main() -> int:
     min_flush_samples = int(SAMPLE_RATE * MIN_FLUSH_SECONDS)
     audio_queue: queue.Queue[tuple[np.ndarray, datetime]] = queue.Queue()
     stop_requested = False
+    recent_emissions: deque[tuple[datetime, str]] = deque()
 
     def request_stop(signum, frame) -> None:
         del signum, frame
@@ -236,6 +311,7 @@ def main() -> int:
                         args.beam_size,
                         args.best_of,
                         previous_text,
+                        recent_emissions,
                     )
                     append_lines(out_path, lines)
                     for line in lines:
@@ -265,6 +341,7 @@ def main() -> int:
                 args.beam_size,
                 args.best_of,
                 previous_text,
+                recent_emissions,
             )
             append_lines(out_path, lines)
             for line in lines:
