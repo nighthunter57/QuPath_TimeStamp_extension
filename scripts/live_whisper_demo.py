@@ -17,10 +17,12 @@ CHANNELS = 1
 MIN_FLUSH_SECONDS = 1.0
 DEDUP_WINDOW_SECONDS = 15.0
 DEDUP_SIMILARITY_THRESHOLD = 0.85
-CHUNK_RMS_SILENCE_THRESHOLD = 0.004
-SEGMENT_AVG_LOGPROB_THRESHOLD = -0.9
-SEGMENT_NO_SPEECH_THRESHOLD = 0.6
-SEGMENT_COMPRESSION_RATIO_THRESHOLD = 2.2
+CHUNK_RMS_SILENCE_THRESHOLD = 0.008
+CHUNK_RMS_LOW_ENERGY_THRESHOLD = 0.012
+SEGMENT_AVG_LOGPROB_THRESHOLD = -0.6
+SEGMENT_NO_SPEECH_THRESHOLD = 0.3
+SEGMENT_COMPRESSION_RATIO_THRESHOLD = 2.0
+LOW_ENERGY_SHORT_SEGMENT_MAX_WORDS = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -136,6 +138,14 @@ def looks_like_low_confidence_segment(segment) -> bool:
     return False
 
 
+def should_drop_low_energy_short_segment(text: str, chunk_rms: float) -> bool:
+    if chunk_rms >= CHUNK_RMS_LOW_ENERGY_THRESHOLD:
+        return False
+
+    word_count = len(normalize_transcript_text(text).split())
+    return 0 < word_count <= LOW_ENERGY_SHORT_SEGMENT_MAX_WORDS
+
+
 def transcribe_audio(
     model,
     audio,
@@ -146,7 +156,8 @@ def transcribe_audio(
     previous_text: bool,
     recent_emissions: deque[tuple[datetime, str]],
 ) -> list[str]:
-    if audio_rms(audio) < CHUNK_RMS_SILENCE_THRESHOLD:
+    chunk_rms = audio_rms(audio)
+    if chunk_rms < CHUNK_RMS_SILENCE_THRESHOLD:
         return []
 
     segments, _ = model.transcribe(
@@ -165,6 +176,8 @@ def transcribe_audio(
             continue
         text = segment.text.strip()
         if not text:
+            continue
+        if should_drop_low_energy_short_segment(text, chunk_rms):
             continue
         segment_offset = max(0.0, float(segment.start))
         segment_time = chunk_start_time + timedelta(seconds=segment_offset)

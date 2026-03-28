@@ -128,6 +128,7 @@ public class TimeStamp implements QuPathExtension {
     private static TextArea liveTranscriptTextArea;
     private static Button startRecordingButton;
     private static Button pauseRecordingButton;
+    private static Button saveTranscriptEditsButton;
     private static Label recordingStatusLabel;
     private static Label transcriptStatusLabel;
     private static Label transcriptSettingsLabel;
@@ -547,7 +548,7 @@ public class TimeStamp implements QuPathExtension {
         liveEventTextArea.setStyle("-fx-font-family: 'Monospaced';");
 
         liveTranscriptTextArea = new TextArea();
-        liveTranscriptTextArea.setEditable(false);
+        liveTranscriptTextArea.setEditable(true);
         liveTranscriptTextArea.setWrapText(true);
         liveTranscriptTextArea.setStyle("-fx-font-family: 'Monospaced';");
 
@@ -570,6 +571,10 @@ public class TimeStamp implements QuPathExtension {
         var exportTranscriptButton = new Button("Export Transcript");
         exportTranscriptButton.setOnAction(e -> exportTranscript());
         configureMonitorButton(exportTranscriptButton);
+
+        saveTranscriptEditsButton = new Button("Save Edited Transcript");
+        saveTranscriptEditsButton.setOnAction(e -> saveTranscriptEdits());
+        configureMonitorButton(saveTranscriptEditsButton);
 
         var transcriptSettingsButton = new Button("Transcript Settings");
         transcriptSettingsButton.setOnAction(e -> showTranscriptSettingsDialog());
@@ -605,11 +610,13 @@ public class TimeStamp implements QuPathExtension {
         transcriptControls.setVgap(8);
         transcriptControls.add(selectTranscriptButton, 0, 0);
         transcriptControls.add(exportTranscriptButton, 1, 0);
-        transcriptControls.add(transcriptSettingsButton, 0, 1, 2, 1);
-        transcriptControls.add(transcriptSettingsLabel, 0, 2, 2, 1);
-        transcriptControls.add(transcriptStatusLabel, 0, 3, 2, 1);
+        transcriptControls.add(saveTranscriptEditsButton, 0, 1, 2, 1);
+        transcriptControls.add(transcriptSettingsButton, 0, 2, 2, 1);
+        transcriptControls.add(transcriptSettingsLabel, 0, 3, 2, 1);
+        transcriptControls.add(transcriptStatusLabel, 0, 4, 2, 1);
         GridPane.setHgrow(selectTranscriptButton, Priority.ALWAYS);
         GridPane.setHgrow(exportTranscriptButton, Priority.ALWAYS);
+        GridPane.setHgrow(saveTranscriptEditsButton, Priority.ALWAYS);
         GridPane.setHgrow(transcriptSettingsButton, Priority.ALWAYS);
         GridPane.setHgrow(transcriptSettingsLabel, Priority.ALWAYS);
         GridPane.setHgrow(transcriptStatusLabel, Priority.ALWAYS);
@@ -678,14 +685,21 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void updateLiveEventMonitorControls() {
+        boolean recording = recordEvents.get();
         if (startRecordingButton != null) {
-            startRecordingButton.setDisable(recordEvents.get());
+            startRecordingButton.setDisable(recording);
         }
         if (pauseRecordingButton != null) {
-            pauseRecordingButton.setDisable(!recordEvents.get());
+            pauseRecordingButton.setDisable(!recording);
         }
         if (recordingStatusLabel != null) {
-            recordingStatusLabel.setText(recordEvents.get() ? "Status: Recording" : "Status: Paused");
+            recordingStatusLabel.setText(recording ? "Status: Recording" : "Status: Paused");
+        }
+        if (liveTranscriptTextArea != null) {
+            liveTranscriptTextArea.setEditable(!recording);
+        }
+        if (saveTranscriptEditsButton != null) {
+            saveTranscriptEditsButton.setDisable(recording || transcriptSessionDir == null);
         }
     }
 
@@ -810,6 +824,7 @@ public class TimeStamp implements QuPathExtension {
         transcriptLastModified = -1L;
         transcriptLastContents = "";
         logger.info("Selected transcript session folder: {}", selected.getAbsolutePath());
+        updateLiveEventMonitorControls();
         refreshLiveEventMonitor();
         Platform.runLater(() -> {
             if (qupathGui != null && liveEventTab != null && qupathGui.getAnalysisTabPane() != null) {
@@ -1028,6 +1043,16 @@ public class TimeStamp implements QuPathExtension {
         return new File(videoDir, sessionId + "_transcript.txt");
     }
 
+    private static File buildEditedTranscriptFile(File sessionDir) {
+        if (sessionDir == null) {
+            return null;
+        }
+
+        File videoDir = new File(sessionDir, "video");
+        String sessionId = sessionDir.getName();
+        return new File(videoDir, sessionId + "_transcript_edited.txt");
+    }
+
     private static void resetTranscriptWorkingFile(File file) throws IOException {
         if (file == null) {
             return;
@@ -1064,6 +1089,57 @@ public class TimeStamp implements QuPathExtension {
             logger.error("Failed to export transcript", e);
             Dialogs.showErrorMessage("Export Failed",
                     "Failed to export transcript: " + e.getMessage());
+        }
+    }
+
+    private static void saveTranscriptEdits() {
+        if (recordEvents.get()) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Pause recording before editing the transcript.");
+            return;
+        }
+
+        if (transcriptSessionDir == null) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Select a session folder before saving transcript edits.");
+            return;
+        }
+
+        if (liveTranscriptTextArea == null) {
+            return;
+        }
+
+        File editedTranscriptFile = buildEditedTranscriptFile(transcriptSessionDir);
+        if (editedTranscriptFile == null) {
+            Dialogs.showErrorMessage("Transcript Save Failed",
+                    "Edited transcript file could not be determined for the selected session.");
+            return;
+        }
+
+        String transcriptText = liveTranscriptTextArea.getText();
+        if (transcriptText == null) {
+            transcriptText = "";
+        }
+
+        try {
+            Path path = editedTranscriptFile.toPath();
+            Path parent = path.getParent();
+            if (parent != null) {
+                Files.createDirectories(parent);
+            }
+            Files.writeString(path, transcriptText,
+                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            transcriptLastContents = transcriptText;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: edited copy saved");
+            }
+            Dialogs.showInfoNotification(TIMESTAMP_CATEGORY,
+                    String.format("Edited transcript saved to:%n%s", editedTranscriptFile.getName()));
+            logger.info("Transcript edits saved to {}", editedTranscriptFile.getAbsolutePath());
+        } catch (IOException e) {
+            logger.error("Failed to save transcript edits", e);
+            Dialogs.showErrorMessage("Transcript Save Failed",
+                    "Could not save transcript edits: " + e.getMessage());
         }
     }
 
