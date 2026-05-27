@@ -1,0 +1,52 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 18 40% 98%;
+    --foreground: 192 10% 19%;
+    --card: 0 0% 100%;
+    --card-foreground: 192 10% 19%;
+    --primary: 184 100% 23%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 174 34% 64%;
+    --secondary-foreground: 184 100% 16%;
+    --muted: 190 23% 94%;
+    --muted-foreground: 195 8% 39%;
+    --accent: 47 100% 50%;
+    --accent-foreground: 43 100% 16%;
+    --border: 0 6% 86%;
+    --input: 0 6% 86%;
+    --ring: 184 100% 23%;
+    --radius: 0.5rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    @apply bg-background text-foreground antialiased;
+  }
+}
+
+@layer utilities {
+  .microscopy-field {
+    background:
+      radial-gradient(circle at 26% 34%, rgb(116 81 121 / 28%) 0 8%, transparent 9%),
+      radial-gradient(circle at 62% 52%, rgb(214 130 110 / 24%) 0 10%, transparent 11%),
+      radial-gradient(circle at 46% 68%, rgb(123 154 164 / 28%) 0 12%, transparent 13%),
+      linear-gradient(135deg, #ece9e7, #faf7f5 42%, #e2eef0);
+  }
+
+  .microscopy-field::before {
+    background:
+      repeating-linear-gradient(24deg, rgb(45 52 54 / 4%) 0 2px, transparent 2px 18px),
+      repeating-linear-gradient(108deg, rgb(0 109 119 / 5%) 0 1px, transparent 1px 22px);
+  }
+}

@@ -1,5 +1,10 @@
 # Javadocs
-build/docs/
+docs/
+
+# Website
+site/node_modules/
+site/.next/
+site/out/
 
 # Maven
 deploy/
