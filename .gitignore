@@ -1,5 +1,5 @@
 # Javadocs
-docs/
+build/docs/
 
 # Maven
 deploy/
