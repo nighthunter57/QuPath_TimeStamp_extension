@@ -1,26 +1,28 @@
 "use client";
 
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import { motion } from "framer-motion";
 import {
   Activity,
+  Apple,
   ArrowRight,
+  BadgeCheck,
   Boxes,
-  Braces,
-  CheckCircle2,
-  CircleDotDashed,
+  CircleHelp,
   Clock3,
-  Code2,
   Download,
+  ExternalLink,
+  FileDown,
   FileJson,
-  Gauge,
-  GitBranch,
-  Map,
+  Laptop,
   Mic2,
+  Monitor,
   MousePointer2,
   Play,
+  ShieldCheck,
   SquarePen,
-  Terminal,
+  Stethoscope,
   Video
 } from "lucide-react";
 
@@ -35,134 +37,162 @@ import {
 } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
+const QUPATH_VERSION = "0.7.0";
+const extensionDownloadUrl =
+  "https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases/latest/download/TimeStamp-0.1.0-SNAPSHOT.jar";
+
 const navItems = [
-  ["Overview", "#overview"],
-  ["Features", "#features"],
-  ["Setup", "#setup"],
-  ["Workflow", "#workflow"],
-  ["Outputs", "#outputs"]
+  ["Download", "#downloads"],
+  ["Install", "#install"],
+  ["What it does", "#features"],
+  ["Session", "#session"],
+  ["Help", "#help"]
+];
+
+const qupathDownloads = [
+  {
+    os: "Windows",
+    key: "windows",
+    label: "Download QuPath for Windows",
+    detail: "Windows installer (.msi)",
+    size: "271 MB",
+    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Windows.msi`,
+    icon: Monitor
+  },
+  {
+    os: "Windows",
+    key: "windows-portable",
+    label: "Windows portable",
+    detail: "No installer (.zip)",
+    size: "270 MB",
+    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Windows.zip`,
+    icon: Monitor
+  },
+  {
+    os: "macOS",
+    key: "mac-intel",
+    label: "Download QuPath for macOS Intel",
+    detail: "Older Intel Macs (.pkg)",
+    size: "241 MB",
+    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Mac-x64.pkg`,
+    icon: Apple
+  },
+  {
+    os: "macOS",
+    key: "mac-apple-silicon",
+    label: "Download QuPath for macOS Apple silicon",
+    detail: "M1, M2, M3, or newer Macs (.pkg)",
+    size: "230 MB",
+    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Mac-arm64.pkg`,
+    icon: Apple
+  },
+  {
+    os: "Linux",
+    key: "linux",
+    label: "Download QuPath for Linux",
+    detail: "Linux archive (.tar.xz)",
+    size: "244 MB",
+    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Linux.tar.xz`,
+    icon: Laptop
+  }
+];
+
+const installSteps = [
+  {
+    title: "Download QuPath",
+    text: "Choose the button that matches the computer. If QuPath is already installed, skip this step.",
+    icon: Download
+  },
+  {
+    title: "Download TimeStamp Extension",
+    text: "The extension is a small .jar file. Keep it somewhere easy to find, like Downloads.",
+    icon: FileDown
+  },
+  {
+    title: "Open QuPath",
+    text: "Start QuPath like any other application. No coding or terminal window is needed.",
+    icon: Play
+  },
+  {
+    title: "Drag the extension into QuPath",
+    text: "Drag the downloaded .jar file onto the QuPath window. QuPath will ask to install it.",
+    icon: MousePointer2
+  },
+  {
+    title: "Restart and confirm",
+    text: "Restart QuPath, then check Extensions > TimeStamp Extension or open the TimeStamp Monitor.",
+    icon: BadgeCheck
+  }
 ];
 
 const features = [
   {
     icon: Clock3,
-    title: "Event timeline",
-    text: "Click, zoom, pan, tool, and annotation events are captured with millisecond timestamps."
-  },
-  {
-    icon: Map,
-    title: "View-state capture",
-    text: "Each event carries x, y, width, height, z, t, and downsample so the slide view remains reproducible."
+    title: "Records what happened",
+    text: "Clicks, zooms, pans, tool changes, and annotation changes are saved in order."
   },
   {
     icon: SquarePen,
-    title: "Annotation geometry",
-    text: "Annotation events include ROI type, bounds, point count, and exported vertices."
+    title: "Tracks annotation moments",
+    text: "When a region is drawn or removed, the extension records the shape and timing."
   },
   {
     icon: Activity,
-    title: "Live monitor",
-    text: "A QuPath analysis tab gives start, pause, clear, transcript, status, and export controls."
+    title: "Shows a live monitor",
+    text: "Doctors can see recording status, recent events, and transcript status while reviewing slides."
   },
   {
     icon: Mic2,
-    title: "Transcript sync",
-    text: "Optional faster-whisper transcription follows microphone audio with live level feedback."
-  },
-  {
-    icon: Download,
-    title: "Export package",
-    text: "Save event CSV, event JSON, mouse movement JSON, transcript text, and edited transcript copies."
-  }
-];
-
-const setupSteps = [
-  {
-    title: "Install Java 21 and QuPath",
-    text: "Use a Java 21 JDK and a compatible QuPath installation before building the extension.",
-    command: null
-  },
-  {
-    title: "Build the extension jar",
-    text: "Run the Gradle wrapper from the repository root.",
-    command: "./gradlew build"
-  },
-  {
-    title: "Drag the jar into QuPath",
-    text: "Install the generated artifact directly into an open QuPath window.",
-    command: "build/libs/TimeStamp-0.1.0-SNAPSHOT.jar"
-  },
-  {
-    title: "Verify the extension",
-    text: "Confirm both the extension menu and the analysis monitor are available.",
-    command: "Extensions > TimeStamp Extension\nAnalysis tab > TimeStamp Monitor"
-  }
-];
-
-const workflow = [
-  {
-    title: "Prepare session",
-    text: "Create folders and expected output names.",
-    code: "./scripts/prepare_demo.sh <demo_name>"
-  },
-  {
-    title: "Select folder",
-    text: "Point TimeStamp at the session folder.",
-    code: "Select transcript session folder"
-  },
-  {
-    title: "Start recording",
-    text: "Begin event capture and optional transcription.",
-    code: "TimeStamp Monitor > Start Recording"
-  },
-  {
-    title: "Review slide",
-    text: "Zoom, pan, change tools, and annotate regions.",
-    code: "Zoom / Pan / Annotate"
-  },
-  {
-    title: "Pause",
-    text: "Stop capture while keeping logs available.",
-    code: "Pause Recording"
-  },
-  {
-    title: "Export",
-    text: "Write structured logs and transcript files.",
-    code: "JSON / CSV / TXT"
-  }
-];
-
-const outputs = [
-  {
-    icon: FileJson,
-    name: "*_event.json",
-    title: "Semantic events",
-    text: "Interaction events, details, view bounds, and annotation geometry."
-  },
-  {
-    icon: MousePointer2,
-    name: "*_cursor.json",
-    title: "Mouse path",
-    text: "Optional throttled cursor movement for high-fidelity review."
+    title: "Supports live notes",
+    text: "Optional transcript capture makes spoken review comments searchable later."
   },
   {
     icon: Video,
-    name: "*_video.mp4",
-    title: "Screen recording",
-    text: "Reference video that preserves visual context and narration."
+    title: "Pairs with screen video",
+    text: "Use a normal screen recorder while TimeStamp captures the structured event timeline."
   },
   {
-    icon: Braces,
-    name: "*_transcript.txt",
-    title: "Narration text",
-    text: "Searchable live, final, or edited transcript output."
+    icon: FileJson,
+    title: "Exports review files",
+    text: "Export event logs, cursor movement, video, and transcript files for follow-up analysis."
   }
+];
+
+const sessionSteps = [
+  "Start screen recording if you want video.",
+  "Click Start Recording in the TimeStamp Monitor.",
+  "Review the slide naturally: zoom, pan, discuss, and annotate.",
+  "Click Pause Recording when finished.",
+  "Export the event log, mouse log, and transcript for the research team."
 ];
 
 const fadeUp = {
   hidden: { opacity: 0, y: 22 },
   visible: { opacity: 1, y: 0 }
 };
+
+type OsGroup = "windows" | "mac" | "linux" | "unknown";
+
+function detectOs(): OsGroup {
+  if (typeof navigator === "undefined") {
+    return "unknown";
+  }
+
+  const platform = navigator.platform.toLowerCase();
+  const userAgent = navigator.userAgent.toLowerCase();
+  const source = `${platform} ${userAgent}`;
+
+  if (source.includes("win")) {
+    return "windows";
+  }
+  if (source.includes("mac")) {
+    return "mac";
+  }
+  if (source.includes("linux")) {
+    return "linux";
+  }
+  return "unknown";
+}
 
 function SectionIntro({
   eyebrow,
@@ -182,7 +212,7 @@ function SectionIntro({
       variants={fadeUp}
       transition={{ duration: 0.5 }}
     >
-      <div className="max-w-2xl">
+      <div className="max-w-3xl">
         <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-primary">
           <span className="h-2 w-2 rounded-sm bg-amber" />
           {eyebrow}
@@ -194,19 +224,11 @@ function SectionIntro({
   );
 }
 
-function CodeBlock({ children }: { children: string }) {
-  return (
-    <pre className="mt-4 overflow-x-auto rounded-lg bg-[#1f2a2d] p-4 text-sm leading-6 text-white">
-      <code>{children}</code>
-    </pre>
-  );
-}
-
 function ProductPreview() {
   const eventRows = [
-    ["10:03:12.018", "Zoom In Start", "downsample=4.00"],
-    ["10:03:13.086", "Pan End", "x=821.4, y=402.7"],
-    ["10:03:14.221", "Annotate", "points=9, z=0, t=0"]
+    ["10:03:12", "Zoomed into tissue region"],
+    ["10:03:14", "Annotation added"],
+    ["10:03:22", "Slide moved to next area"]
   ];
 
   return (
@@ -217,12 +239,8 @@ function ProductPreview() {
       transition={{ delay: 0.18, duration: 0.65, ease: "easeOut" }}
     >
       <div className="flex h-11 items-center justify-between border-b px-4 text-xs font-semibold text-muted-foreground">
-        <span>TimeStamp Monitor</span>
-        <div className="flex gap-1.5" aria-hidden="true">
-          <span className="h-2 w-2 rounded-full bg-border" />
-          <span className="h-2 w-2 rounded-full bg-border" />
-          <span className="h-2 w-2 rounded-full bg-border" />
-        </div>
+        <span>Example review session</span>
+        <Badge variant="amber">Recording</Badge>
       </div>
       <div className="grid min-h-[430px] lg:grid-cols-[1fr_290px]">
         <div className="microscopy-field relative min-h-[360px] overflow-hidden">
@@ -232,12 +250,11 @@ function ProductPreview() {
             animate={{ y: [0, -2, 0] }}
             transition={{ duration: 2.4, repeat: Infinity, ease: "easeInOut" }}
           >
-            10:03:14.221
-            <span className="block text-amber">Last: Annotate</span>
+            10:03:14
+            <span className="block text-amber">Last: Annotation added</span>
           </motion.div>
           <motion.div
             className="absolute bottom-24 right-16 z-10 h-32 w-48 rounded-lg border-2 border-dashed border-primary bg-primary/10"
-            initial={{ pathLength: 0 }}
             animate={{ scale: [1, 1.015, 1] }}
             transition={{ duration: 2.8, repeat: Infinity, ease: "easeInOut" }}
           >
@@ -250,7 +267,7 @@ function ProductPreview() {
             animate={{ opacity: 1, x: 0 }}
             transition={{ delay: 0.7, duration: 0.5 }}
           >
-            zoom_view: x=412.6, y=208.4, w=1180.0, h=760.0
+            TimeStamp keeps a record while the doctor reviews the slide.
           </motion.div>
         </div>
         <div className="border-t bg-white lg:border-l lg:border-t-0">
@@ -262,26 +279,25 @@ function ProductPreview() {
           </div>
           <div className="border-b p-4">
             <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
-              Event log
+              Recent events
             </p>
             <div className="space-y-3">
-              {eventRows.map(([time, name, meta]) => (
+              {eventRows.map(([time, name]) => (
                 <div key={time} className="border-t pt-3 text-xs">
                   <Badge variant="amber" className="mb-2 font-mono">
                     {time}
                   </Badge>
                   <p className="font-bold">{name}</p>
-                  <p className="font-mono text-muted-foreground">{meta}</p>
                 </div>
               ))}
             </div>
           </div>
           <div className="p-4">
             <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
-              Live transcript
+              Spoken note
             </p>
             <p className="font-mono text-xs leading-5 text-muted-foreground">
-              [10:03:14.802] Here I mark the region we will review after export.
+              “This region is important for the follow-up review.”
             </p>
           </div>
         </div>
@@ -290,7 +306,63 @@ function ProductPreview() {
   );
 }
 
+function DownloadCard({
+  option,
+  recommended
+}: {
+  option: (typeof qupathDownloads)[number];
+  recommended?: boolean;
+}) {
+  const Icon = option.icon;
+
+  return (
+    <Card className={cn("h-full transition-colors hover:border-primary/40", recommended && "border-primary bg-teal-soft/70")}>
+      <CardHeader>
+        <div className="mb-4 flex items-center justify-between gap-4">
+          <div className="grid h-11 w-11 place-items-center rounded-lg bg-white text-primary shadow-sm">
+            <Icon className="h-5 w-5" />
+          </div>
+          {recommended ? <Badge variant="amber">Recommended</Badge> : <Badge variant="outline">{option.os}</Badge>}
+        </div>
+        <CardTitle>{option.label}</CardTitle>
+        <CardDescription>
+          {option.detail} · {option.size}
+        </CardDescription>
+      </CardHeader>
+      <CardContent>
+        <Button asChild className="w-full">
+          <a href={option.href} aria-label={`${option.label}, ${option.detail}, ${option.size}`}>
+            <Download className="h-4 w-4" />
+            Download
+          </a>
+        </Button>
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function Home() {
+  const [os, setOs] = useState<OsGroup>("unknown");
+
+  useEffect(() => {
+    setOs(detectOs());
+  }, []);
+
+  const recommendedDownloads = useMemo(() => {
+    if (os === "windows") {
+      return qupathDownloads.filter((item) => item.key === "windows");
+    }
+    if (os === "mac") {
+      return qupathDownloads.filter((item) => item.key === "mac-apple-silicon" || item.key === "mac-intel");
+    }
+    if (os === "linux") {
+      return qupathDownloads.filter((item) => item.key === "linux");
+    }
+    return qupathDownloads.filter((item) => item.key === "windows" || item.key === "mac-apple-silicon");
+  }, [os]);
+
+  const recommendedKeys = new Set(recommendedDownloads.map((item) => item.key));
+
   return (
     <main className="min-h-screen overflow-hidden">
       <header className="sticky top-0 z-50 border-b bg-background/90 backdrop-blur-xl">
@@ -309,7 +381,7 @@ export default function Home() {
             ))}
           </nav>
           <Button asChild size="sm">
-            <Link href="#setup">Set up extension</Link>
+            <Link href="#downloads">Download</Link>
           </Button>
         </div>
       </header>
@@ -317,43 +389,151 @@ export default function Home() {
       <section id="overview" className="container grid gap-12 py-16 md:py-24 lg:grid-cols-[0.92fr_1.08fr] lg:items-center">
         <motion.div initial="hidden" animate="visible" variants={fadeUp} transition={{ duration: 0.6 }}>
           <Badge variant="outline" className="mb-5 gap-2">
-            <CircleDotDashed className="h-3.5 w-3.5 text-primary" />
-            QuPath recording toolkit
+            <Stethoscope className="h-3.5 w-3.5 text-primary" />
+            For clinical slide review teams
           </Badge>
           <h1 className="max-w-3xl text-5xl font-semibold leading-[0.98] tracking-tight md:text-7xl">
-            TimeStamp Extension for QuPath
+            Record a QuPath slide review without touching code
           </h1>
           <p className="mt-6 max-w-2xl text-lg leading-8 text-muted-foreground">
-            Capture synchronized QuPath interactions, view bounds, annotation geometry, and live
-            transcripts for reviewable whole-slide image demos.
+            TimeStamp Extension helps doctors review whole-slide images while automatically saving
+            the timing of zooms, pans, annotations, spoken notes, and exported review files.
           </p>
           <div className="mt-8 flex flex-wrap gap-3">
             <Button asChild size="lg">
-              <Link href="#setup">
-                Build and install <ArrowRight className="h-4 w-4" />
+              <Link href="#downloads">
+                Download now <ArrowRight className="h-4 w-4" />
               </Link>
             </Button>
             <Button asChild variant="outline" size="lg">
-              <Link href="#workflow">
-                See workflow <Play className="h-4 w-4" />
+              <Link href="#install">
+                How to install <Play className="h-4 w-4" />
               </Link>
             </Button>
           </div>
           <div className="mt-6 flex flex-wrap gap-2">
-            <Badge>QuPath extension</Badge>
-            <Badge>JSON + CSV exports</Badge>
-            <Badge>Live transcript optional</Badge>
+            <Badge>No coding</Badge>
+            <Badge>Drag-and-drop install</Badge>
+            <Badge>Works inside QuPath</Badge>
           </div>
         </motion.div>
         <ProductPreview />
       </section>
 
+      <section id="downloads" className="border-y bg-muted/70 py-16 md:py-24">
+        <div className="container">
+          <SectionIntro
+            eyebrow="Step 1"
+            title="Download QuPath for your computer"
+            text={`Choose the QuPath ${QUPATH_VERSION} installer that matches the doctor's device. The recommended option is selected from the browser when possible.`}
+          />
+
+          <div className="mb-5 grid gap-4 md:grid-cols-2">
+            {recommendedDownloads.map((option) => (
+              <DownloadCard key={option.key} option={option} recommended />
+            ))}
+          </div>
+
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+            {qupathDownloads.map((option) => (
+              <DownloadCard key={option.key} option={option} recommended={recommendedKeys.has(option.key)} />
+            ))}
+          </div>
+
+          <div className="mt-5 flex flex-wrap gap-3 text-sm text-muted-foreground">
+            <a
+              className="inline-flex items-center gap-2 font-semibold text-primary"
+              href={`https://github.com/qupath/qupath/releases/tag/v${QUPATH_VERSION}`}
+            >
+              Release notes v{QUPATH_VERSION} <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+            <a
+              className="inline-flex items-center gap-2 font-semibold text-primary"
+              href="https://qupath.readthedocs.io/en/stable/docs/intro/installation.html"
+            >
+              QuPath installation notes <ExternalLink className="h-3.5 w-3.5" />
+            </a>
+            <a
+              className="inline-flex items-center gap-2 font-semibold text-primary"
+              href="https://qupath.readthedocs.io/en/latest/docs/intro/installation.html#qupath-for-mac"
+            >
+              Not sure which Mac? <CircleHelp className="h-3.5 w-3.5" />
+            </a>
+          </div>
+
+          <Card className="mt-10 border-primary bg-white">
+            <CardHeader className="grid gap-6 lg:grid-cols-[1fr_auto] lg:items-center">
+              <div>
+                <Badge variant="amber" className="mb-4">Step 2</Badge>
+                <CardTitle className="text-3xl">Download the TimeStamp Extension</CardTitle>
+                <CardDescription className="mt-3 max-w-2xl text-base">
+                  After QuPath is installed, download the extension file. This is the file you will
+                  drag into QuPath.
+                </CardDescription>
+              </div>
+              <div className="flex flex-col gap-3">
+                <Button asChild size="lg">
+                  <a href={extensionDownloadUrl} aria-label="Download TimeStamp Extension jar file">
+                    <FileDown className="h-4 w-4" />
+                    Download TimeStamp Extension
+                  </a>
+                </Button>
+                <Button asChild variant="outline">
+                  <a href="https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases">
+                    Backup download page
+                  </a>
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent>
+              <div className="rounded-lg border bg-muted/60 p-4 text-sm text-muted-foreground">
+                If the extension download does not start, use the backup download page or ask the
+                study coordinator for the TimeStamp extension file.
+              </div>
+            </CardContent>
+          </Card>
+        </div>
+      </section>
+
+      <section id="install" className="container py-16 md:py-24">
+        <SectionIntro
+          eyebrow="Install"
+          title="Plug the extension into QuPath"
+          text="This is written for doctors and clinical staff: no command line, no code, and no build step."
+        />
+        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
+          {installSteps.map((step, index) => (
+            <motion.div
+              key={step.title}
+              initial="hidden"
+              whileInView="visible"
+              viewport={{ once: true, margin: "-80px" }}
+              variants={fadeUp}
+              transition={{ delay: index * 0.04, duration: 0.45 }}
+            >
+              <Card className="h-full">
+                <CardHeader>
+                  <div className="mb-5 flex items-center justify-between">
+                    <span className="font-mono text-sm font-bold text-primary">
+                      {String(index + 1).padStart(2, "0")}
+                    </span>
+                    <step.icon className="h-5 w-5 text-primary" />
+                  </div>
+                  <CardTitle className="text-base">{step.title}</CardTitle>
+                  <CardDescription>{step.text}</CardDescription>
+                </CardHeader>
+              </Card>
+            </motion.div>
+          ))}
+        </div>
+      </section>
+
       <section id="features" className="border-y bg-muted/70 py-16 md:py-24">
         <div className="container">
           <SectionIntro
-            eyebrow="Core capabilities"
-            title="Purpose-built for reproducible review sessions"
-            text="The extension records what happened in the viewer, where it happened on the slide, and what was said while it happened."
+            eyebrow="What it does"
+            title="A simple recorder for slide review behavior"
+            text="Doctors can review normally while TimeStamp quietly records the moments that matter for the research team."
           />
           <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
             {features.map((feature, index) => (
@@ -380,141 +560,84 @@ export default function Home() {
         </div>
       </section>
 
-      <section id="setup" className="container py-16 md:py-24">
+      <section id="session" className="container py-16 md:py-24">
         <SectionIntro
-          eyebrow="Installation pipeline"
-          title="Build the jar, install in QuPath, then turn on optional transcription"
-          text="The Java extension remains the source of truth. The website documents the build output and the exact local setup path."
+          eyebrow="During a session"
+          title="Review slides the normal way"
+          text="The extension is designed to stay out of the way while preserving a record for later review."
         />
-        <div className="grid gap-5 lg:grid-cols-[0.95fr_1.05fr]">
-          <div className="grid gap-4">
-            {setupSteps.map((step, index) => (
-              <Card key={step.title}>
-                <CardHeader className="grid grid-cols-[2.5rem_1fr] gap-4 space-y-0">
-                  <div className="grid h-9 w-9 place-items-center rounded-lg bg-primary font-bold text-primary-foreground">
-                    {index + 1}
-                  </div>
-                  <div>
-                    <CardTitle>{step.title}</CardTitle>
-                    <CardDescription>{step.text}</CardDescription>
-                    {step.command ? <CodeBlock>{step.command}</CodeBlock> : null}
-                  </div>
-                </CardHeader>
-              </Card>
-            ))}
-          </div>
-          <Card className="bg-amber-soft/80">
+        <div className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
+          <Card>
             <CardHeader>
-              <div className="mb-4 grid h-10 w-10 place-items-center rounded-lg bg-white text-amber-foreground">
-                <Terminal className="h-5 w-5" />
-              </div>
-              <CardTitle>Optional transcript environment</CardTitle>
-              <CardDescription className="text-amber-foreground/80">
-                Live transcription uses the repository scripts with faster-whisper, sounddevice, and
-                numpy in a local virtual environment.
+              <CardTitle>Doctor workflow</CardTitle>
+              <CardDescription>
+                These are the only actions a reviewer needs to remember.
               </CardDescription>
             </CardHeader>
             <CardContent>
-              <CodeBlock>{`python3 -m venv .venv-whisper
-source .venv-whisper/bin/activate
-python -m pip install --upgrade pip
-python -m pip install faster-whisper sounddevice numpy`}</CodeBlock>
+              <ol className="space-y-4">
+                {sessionSteps.map((step, index) => (
+                  <li key={step} className="flex gap-3">
+                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-primary text-sm font-bold text-white">
+                      {index + 1}
+                    </span>
+                    <span className="text-sm leading-6 text-muted-foreground">{step}</span>
+                  </li>
+                ))}
+              </ol>
+            </CardContent>
+          </Card>
+          <Card className="bg-amber-soft/80">
+            <CardHeader>
+              <div className="mb-4 grid h-10 w-10 place-items-center rounded-lg bg-white text-amber-foreground">
+                <ShieldCheck className="h-5 w-5" />
+              </div>
+              <CardTitle>What the research team receives</CardTitle>
+              <CardDescription className="text-amber-foreground/80">
+                TimeStamp creates review files that can be matched with the screen recording and
+                transcript.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="grid gap-3 sm:grid-cols-2">
+                {[
+                  ["*_event.json", "Review events and slide position"],
+                  ["*_cursor.json", "Optional cursor movement"],
+                  ["*_video.mp4", "Screen recording"],
+                  ["*_transcript.txt", "Searchable spoken notes"]
+                ].map(([name, text]) => (
+                  <div key={name} className="rounded-lg border bg-white p-4">
+                    <Badge variant="amber" className="mb-3 font-mono">
+                      {name}
+                    </Badge>
+                    <p className="text-sm text-muted-foreground">{text}</p>
+                  </div>
+                ))}
+              </div>
             </CardContent>
           </Card>
         </div>
       </section>
 
-      <section id="workflow" className="border-y bg-muted/70 py-16 md:py-24">
-        <div className="container">
-          <SectionIntro
-            eyebrow="Workflow"
-            title="From prepared session to synchronized review package"
-            text="The workflow mirrors the codebase: prepare output folders, capture viewer interactions, export structured data, and review the files together."
-          />
-          <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-6">
-            {workflow.map((item, index) => (
-              <motion.div
-                key={item.title}
-                initial={{ opacity: 0, y: 18 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true, margin: "-80px" }}
-                transition={{ delay: index * 0.05, duration: 0.45 }}
-              >
-                <Card className="h-full">
-                  <CardHeader>
-                    <div className="mb-5 flex items-center justify-between">
-                      <span className="font-mono text-sm font-bold text-primary">
-                        {String(index + 1).padStart(2, "0")}
-                      </span>
-                      {index < workflow.length - 1 ? (
-                        <ArrowRight className="hidden h-4 w-4 text-border lg:block" />
-                      ) : (
-                        <CheckCircle2 className="h-4 w-4 text-primary" />
-                      )}
-                    </div>
-                    <CardTitle className="text-base">{item.title}</CardTitle>
-                    <CardDescription>{item.text}</CardDescription>
-                    <p className="pt-3 font-mono text-xs leading-5 text-teal-ink">{item.code}</p>
-                  </CardHeader>
-                </Card>
-              </motion.div>
-            ))}
-          </div>
-        </div>
-      </section>
-
-      <section id="outputs" className="container py-16 md:py-24">
-        <SectionIntro
-          eyebrow="Output package"
-          title="Consistent files for downstream analysis"
-          text="Use the exported package to compare semantic events, cursor trails, video context, and searchable narration."
-        />
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {outputs.map((output, index) => (
-            <motion.div
-              key={output.name}
-              initial="hidden"
-              whileInView="visible"
-              viewport={{ once: true, margin: "-80px" }}
-              variants={fadeUp}
-              transition={{ delay: index * 0.05, duration: 0.45 }}
-            >
-              <Card className="h-full">
-                <CardHeader>
-                  <div className="mb-4 flex items-center justify-between">
-                    <Badge variant="amber" className="font-mono">
-                      {output.name}
-                    </Badge>
-                    <output.icon className="h-5 w-5 text-primary" />
-                  </div>
-                  <CardTitle>{output.title}</CardTitle>
-                  <CardDescription>{output.text}</CardDescription>
-                </CardHeader>
-              </Card>
-            </motion.div>
-          ))}
-        </div>
-      </section>
-
-      <section className="border-y bg-[#1f2a2d] py-14 text-white">
+      <section id="help" className="border-y bg-[#1f2a2d] py-14 text-white">
         <div className="container grid gap-8 md:grid-cols-[1fr_auto] md:items-center">
           <div>
-            <p className="mb-2 text-sm font-semibold text-amber">Repository-ready website</p>
+            <p className="mb-2 text-sm font-semibold text-amber">Need help?</p>
             <h2 className="text-3xl font-semibold tracking-tight">
-              Built for lab demos, annotation walkthroughs, and reproducible review sessions.
+              If the download does not start, ask the research coordinator for the TimeStamp .jar file.
             </h2>
           </div>
           <div className="flex flex-wrap gap-3">
             <Button asChild variant="outline" className="border-white/40 text-white hover:bg-white/10">
-              <Link href="https://github.com/nighthunter57/QuPath_TimeStamp_extension">
-                <GitBranch className="h-4 w-4" />
-                Repository
-              </Link>
+              <a href="https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases">
+                <ExternalLink className="h-4 w-4" />
+                Extension releases
+              </a>
             </Button>
             <Button asChild className="bg-white text-[#1f2a2d] hover:bg-white/90">
-              <Link href="#setup">
-                <Code2 className="h-4 w-4" />
-                Install steps
+              <Link href="#downloads">
+                <Download className="h-4 w-4" />
+                Downloads
               </Link>
             </Button>
           </div>
@@ -525,7 +648,7 @@ python -m pip install faster-whisper sounddevice numpy`}</CodeBlock>
         <p>TimeStamp Extension for QuPath</p>
         <div className="flex items-center gap-2">
           <Boxes className="h-4 w-4" />
-          Next.js, Tailwind CSS, shadcn/ui patterns, and Framer Motion
+          Doctor-facing QuPath download and extension install page
         </div>
       </footer>
     </main>

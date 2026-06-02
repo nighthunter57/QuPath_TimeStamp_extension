@@ -2,13 +2,13 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "TimeStamp Extension for QuPath",
+  title: "Download TimeStamp Extension for QuPath",
   description:
-    "A QuPath extension for synchronized viewer events, view bounds, annotation geometry, and optional live transcripts.",
+    "Download QuPath and install the TimeStamp Extension with a doctor-friendly, no-code walkthrough.",
   openGraph: {
-    title: "TimeStamp Extension for QuPath",
+    title: "Download TimeStamp Extension for QuPath",
     description:
-      "Capture synchronized QuPath interactions, annotation geometry, and transcripts for whole-slide image review sessions.",
+      "A no-code download and drag-and-drop install page for doctors using TimeStamp Extension in QuPath.",
     type: "website"
   }
 };
