@@ -38,8 +38,7 @@ import {
 import { cn } from "@/lib/utils";
 
 const QUPATH_VERSION = "0.7.0";
-const extensionDownloadUrl =
-  "https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases/latest/download/TimeStamp-0.1.0-SNAPSHOT.jar";
+const extensionDownloadUrl = "downloads/TimeStamp-0.1.0-SNAPSHOT.jar";
 
 const navItems = [
   ["Download", "#downloads"],
@@ -473,7 +472,7 @@ export default function Home() {
               </div>
               <div className="flex flex-col gap-3">
                 <Button asChild size="lg">
-                  <a href={extensionDownloadUrl} aria-label="Download TimeStamp Extension jar file">
+                  <a href={extensionDownloadUrl} download aria-label="Download TimeStamp Extension jar file">
                     <FileDown className="h-4 w-4" />
                     Download TimeStamp Extension
                   </a>
