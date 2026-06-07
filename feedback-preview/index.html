@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>TimeStamp Extension for QuPath</title>
+    <style>
+      :root {
+        --bg: #fcf9f8;
+        --panel: #ffffff;
+        --soft: #eef5f7;
+        --text: #243033;
+        --muted: #5d686c;
+        --border: #d9dfdf;
+        --teal: #006d77;
+        --teal-dark: #004c54;
+        --teal-soft: #e6f4f3;
+        --amber: #ffbf00;
+        --amber-soft: #fff4c6;
+        --ink: #1f2a2d;
+      }
+
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        line-height: 1.5;
+      }
+      a { color: inherit; text-decoration: none; }
+      .container { width: min(1120px, calc(100% - 36px)); margin: 0 auto; }
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        border-bottom: 1px solid var(--border);
+        background: rgba(252, 249, 248, 0.94);
+        backdrop-filter: blur(14px);
+      }
+      .nav {
+        display: flex;
+        min-height: 68px;
+        align-items: center;
+        justify-content: space-between;
+        gap: 18px;
+      }
+      .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; }
+      .mark {
+        display: grid;
+        width: 36px;
+        height: 36px;
+        place-items: center;
+        border: 1px solid rgba(0, 109, 119, 0.25);
+        border-radius: 8px;
+        background: var(--teal-soft);
+        color: var(--teal);
+      }
+      .links { display: flex; align-items: center; gap: 18px; color: var(--muted); font-size: 14px; }
+      .button {
+        display: inline-flex;
+        min-height: 42px;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 0 16px;
+        border: 1px solid var(--teal);
+        border-radius: 8px;
+        background: var(--teal);
+        color: white;
+        font-size: 14px;
+        font-weight: 800;
+      }
+      .button:hover { background: var(--teal-dark); }
+      .button.secondary { background: transparent; color: var(--teal); }
+      .button.secondary:hover { background: var(--teal-soft); }
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 0.92fr) minmax(430px, 1.08fr);
+        gap: 44px;
+        align-items: center;
+        padding: 76px 0 58px;
+      }
+      .eyebrow {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 16px;
+        color: var(--teal);
+        font-size: 12px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .eyebrow::before {
+        content: "";
+        width: 8px;
+        height: 8px;
+        border-radius: 2px;
+        background: var(--amber);
+      }
+      h1, h2, h3, p { margin-top: 0; }
+      h1 {
+        max-width: 760px;
+        margin-bottom: 22px;
+        font-size: clamp(42px, 5vw, 68px);
+        line-height: 0.98;
+        letter-spacing: -0.02em;
+      }
+      h2 {
+        margin-bottom: 14px;
+        font-size: clamp(30px, 3vw, 44px);
+        line-height: 1.06;
+        letter-spacing: -0.02em;
+      }
+      .lead { max-width: 650px; color: var(--muted); font-size: 19px; line-height: 1.65; }
+      .actions, .chips { display: flex; flex-wrap: wrap; gap: 10px; }
+      .actions { margin: 30px 0 22px; }
+      .chip {
+        display: inline-flex;
+        align-items: center;
+        min-height: 30px;
+        padding: 0 10px;
+        border: 1px solid rgba(0, 109, 119, 0.18);
+        border-radius: 6px;
+        background: rgba(131, 197, 190, 0.18);
+        color: var(--teal-dark);
+        font-size: 13px;
+        font-weight: 800;
+      }
+      .preview {
+        overflow: hidden;
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        box-shadow: 0 24px 70px rgba(22, 29, 31, 0.11);
+      }
+      .preview-head {
+        display: flex;
+        height: 44px;
+        align-items: center;
+        justify-content: space-between;
+        border-bottom: 1px solid var(--border);
+        padding: 0 14px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 900;
+      }
+      .preview-grid { display: grid; grid-template-columns: 1fr 280px; min-height: 410px; }
+      .slide {
+        position: relative;
+        overflow: hidden;
+        min-height: 410px;
+        background:
+          radial-gradient(circle at 26% 34%, rgba(116, 81, 121, 0.28) 0 8%, transparent 9%),
+          radial-gradient(circle at 62% 52%, rgba(214, 130, 110, 0.24) 0 10%, transparent 11%),
+          radial-gradient(circle at 46% 68%, rgba(123, 154, 164, 0.28) 0 12%, transparent 13%),
+          linear-gradient(135deg, #ece9e7, #faf7f5 42%, #e2eef0);
+      }
+      .slide::before {
+        content: "";
+        position: absolute;
+        inset: -80px;
+        background:
+          repeating-linear-gradient(24deg, rgba(45, 52, 54, 0.04) 0 2px, transparent 2px 18px),
+          repeating-linear-gradient(108deg, rgba(0, 109, 119, 0.05) 0 1px, transparent 1px 22px);
+        transform: rotate(2deg);
+      }
+      .overlay {
+        position: absolute;
+        top: 20px;
+        left: 20px;
+        z-index: 2;
+        padding: 10px 12px;
+        border-radius: 6px;
+        background: rgba(31, 42, 45, 0.9);
+        color: white;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      .overlay span { display: block; color: var(--amber); }
+      .annotation {
+        position: absolute;
+        right: 68px;
+        bottom: 98px;
+        z-index: 2;
+        width: 185px;
+        height: 120px;
+        border: 2px dashed var(--teal);
+        border-radius: 8px;
+        background: rgba(0, 109, 119, 0.1);
+      }
+      .monitor { border-left: 1px solid var(--border); background: white; }
+      .monitor-section { padding: 15px; border-bottom: 1px solid var(--border); }
+      .monitor-title {
+        margin-bottom: 10px;
+        color: var(--muted);
+        font-size: 11px;
+        font-weight: 900;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+      .status { display: flex; align-items: center; gap: 8px; color: var(--teal-dark); font-size: 14px; font-weight: 900; }
+      .status::before { content: ""; width: 9px; height: 9px; border-radius: 2px; background: #d13f2f; }
+      .event { padding: 10px 0; border-top: 1px solid #edf0f0; font-size: 13px; }
+      .time {
+        display: inline-flex;
+        margin-bottom: 6px;
+        padding: 3px 6px;
+        border-radius: 5px;
+        background: var(--amber-soft);
+        color: #4f3a00;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-size: 12px;
+        font-weight: 800;
+      }
+      .section { padding: 72px 0; }
+      .band { border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); background: var(--soft); }
+      .section-head {
+        display: grid;
+        grid-template-columns: 1fr minmax(280px, 520px);
+        gap: 24px;
+        align-items: end;
+        margin-bottom: 30px;
+      }
+      .section-head p { color: var(--muted); }
+      .grid { display: grid; gap: 14px; }
+      .downloads-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .steps-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+      .features-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        background: var(--panel);
+        padding: 20px;
+      }
+      .card.recommended { border-color: var(--teal); background: rgba(230, 244, 243, 0.85); }
+      .card h3 { margin-bottom: 8px; font-size: 18px; line-height: 1.25; }
+      .card p { margin-bottom: 0; color: var(--muted); font-size: 14px; }
+      .icon {
+        display: grid;
+        width: 42px;
+        height: 42px;
+        place-items: center;
+        margin-bottom: 16px;
+        border-radius: 8px;
+        background: var(--teal-soft);
+        color: var(--teal);
+        font-weight: 900;
+      }
+      .download-card { display: flex; min-height: 248px; flex-direction: column; justify-content: space-between; }
+      .download-card .button { width: 100%; margin-top: 18px; }
+      .extension-card {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 24px;
+        align-items: center;
+        margin-top: 30px;
+        border-color: var(--teal);
+      }
+      .small-links { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 16px; color: var(--teal); font-size: 14px; font-weight: 800; }
+      .help { border-top: 1px solid var(--border); background: var(--ink); color: white; }
+      .help .container { display: grid; grid-template-columns: 1fr auto; gap: 24px; align-items: center; padding-top: 48px; padding-bottom: 48px; }
+      footer { padding: 28px 0; color: var(--muted); font-size: 14px; }
+      @media (max-width: 1040px) {
+        .hero, .section-head, .extension-card, .help .container { grid-template-columns: 1fr; }
+        .downloads-grid, .steps-grid, .features-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .preview-grid { grid-template-columns: 1fr; }
+        .monitor { border-left: 0; border-top: 1px solid var(--border); }
+      }
+      @media (max-width: 700px) {
+        .container { width: min(100% - 28px, 1120px); }
+        .nav { align-items: flex-start; flex-direction: column; padding: 14px 0; }
+        .links { flex-wrap: wrap; gap: 12px; }
+        .downloads-grid, .steps-grid, .features-grid { grid-template-columns: 1fr; }
+        .hero { padding-top: 48px; }
+      }
+    </style>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="container nav">
+        <a class="brand" href="#overview"><span class="mark">TS</span><span>TimeStamp Extension</span></a>
+        <nav class="links" aria-label="Page sections">
+          <a href="#downloads">Download</a>
+          <a href="#install">Install</a>
+          <a href="#features">What it does</a>
+          <a href="#session">Session</a>
+          <a class="button" href="#downloads">Download</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section id="overview" class="container hero">
+        <div>
+          <div class="eyebrow">For clinical slide review teams</div>
+          <h1>Record a QuPath slide review without touching code</h1>
+          <p class="lead">TimeStamp Extension helps doctors review whole-slide images while automatically saving the timing of zooms, pans, annotations, spoken notes, and exported review files.</p>
+          <div class="actions">
+            <a class="button" href="#downloads">Download now</a>
+            <a class="button secondary" href="#install">How to install</a>
+          </div>
+          <div class="chips">
+            <span class="chip">No coding</span>
+            <span class="chip">Drag-and-drop install</span>
+            <span class="chip">Works inside QuPath</span>
+          </div>
+        </div>
+
+        <div class="preview">
+          <div class="preview-head"><span>Example review session</span><span class="time">Recording</span></div>
+          <div class="preview-grid">
+            <div class="slide">
+              <div class="overlay">10:03:14<span>Last: Annotation added</span></div>
+              <div class="annotation"></div>
+            </div>
+            <aside class="monitor">
+              <div class="monitor-section"><div class="status">Recording active</div></div>
+              <div class="monitor-section">
+                <div class="monitor-title">Recent events</div>
+                <div class="event"><span class="time">10:03:12</span><br>Zoomed into tissue region</div>
+                <div class="event"><span class="time">10:03:14</span><br>Annotation added</div>
+                <div class="event"><span class="time">10:03:22</span><br>Slide moved to next area</div>
+              </div>
+              <div class="monitor-section">
+                <div class="monitor-title">Spoken note</div>
+                <p>“This region is important for the follow-up review.”</p>
+              </div>
+            </aside>
+          </div>
+        </div>
+      </section>
+
+      <section id="downloads" class="band section">
+        <div class="container">
+          <div class="section-head">
+            <div><div class="eyebrow">Step 1</div><h2>Download QuPath for your computer</h2></div>
+            <p>Choose the QuPath 0.7.0 installer that matches the doctor's device. The first buttons cover the most common options.</p>
+          </div>
+
+          <div class="grid downloads-grid">
+            <article class="card download-card recommended"><div><div class="icon">Win</div><h3>Download QuPath for Windows</h3><p>Windows installer (.msi) · 271 MB</p></div><a class="button" href="https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Windows.msi">Download</a></article>
+            <article class="card download-card"><div><div class="icon">Win</div><h3>Windows portable</h3><p>No installer (.zip) · 270 MB</p></div><a class="button" href="https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Windows.zip">Download</a></article>
+            <article class="card download-card"><div><div class="icon">Mac</div><h3>Download QuPath for macOS Intel</h3><p>Older Intel Macs (.pkg) · 241 MB</p></div><a class="button" href="https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Mac-x64.pkg">Download</a></article>
+            <article class="card download-card recommended"><div><div class="icon">Mac</div><h3>Download QuPath for macOS Apple silicon</h3><p>M1, M2, M3, or newer Macs (.pkg) · 230 MB</p></div><a class="button" href="https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Mac-arm64.pkg">Download</a></article>
+            <article class="card download-card"><div><div class="icon">Linux</div><h3>Download QuPath for Linux</h3><p>Linux archive (.tar.xz) · 244 MB</p></div><a class="button" href="https://github.com/qupath/qupath/releases/download/v0.7.0/QuPath-v0.7.0-Linux.tar.xz">Download</a></article>
+          </div>
+
+          <div class="small-links">
+            <a href="https://github.com/qupath/qupath/releases/tag/v0.7.0">Release notes v0.7.0</a>
+            <a href="https://qupath.readthedocs.io/en/stable/docs/intro/installation.html">QuPath installation notes</a>
+            <a href="https://qupath.readthedocs.io/en/latest/docs/intro/installation.html#qupath-for-mac">Not sure which Mac?</a>
+          </div>
+
+          <article class="card extension-card">
+            <div>
+              <div class="eyebrow">Step 2</div>
+              <h2>Download the TimeStamp Extension</h2>
+              <p class="lead">After QuPath is installed, download the extension file. This is the file doctors drag into QuPath.</p>
+            </div>
+            <div>
+              <a class="button" href="downloads/TimeStamp-0.1.0-SNAPSHOT.jar" download>Download TimeStamp Extension</a>
+              <p style="max-width:320px;margin:12px 0 0;color:var(--muted);font-size:14px;">If the download does not start, ask the study coordinator for the TimeStamp extension file.</p>
+            </div>
+          </article>
+        </div>
+      </section>
+
+      <section id="install" class="section">
+        <div class="container">
+          <div class="section-head">
+            <div><div class="eyebrow">Install</div><h2>Plug the extension into QuPath</h2></div>
+            <p>This is written for doctors and clinical staff: no command line, no code, and no build step.</p>
+          </div>
+          <div class="grid steps-grid">
+            <article class="card"><div class="icon">1</div><h3>Download QuPath</h3><p>Choose the button that matches the computer. If QuPath is already installed, skip this step.</p></article>
+            <article class="card"><div class="icon">2</div><h3>Download TimeStamp Extension</h3><p>The extension is a small .jar file. Keep it somewhere easy to find, like Downloads.</p></article>
+            <article class="card"><div class="icon">3</div><h3>Open QuPath</h3><p>Start QuPath like any other application. No coding or terminal window is needed.</p></article>
+            <article class="card"><div class="icon">4</div><h3>Drag into QuPath</h3><p>Drag the downloaded .jar file onto the QuPath window. QuPath will ask to install it.</p></article>
+            <article class="card"><div class="icon">5</div><h3>Restart and confirm</h3><p>Restart QuPath, then check Extensions &gt; TimeStamp Extension or open the TimeStamp Monitor.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section id="features" class="band section">
+        <div class="container">
+          <div class="section-head">
+            <div><div class="eyebrow">What it does</div><h2>A simple recorder for slide review behavior</h2></div>
+            <p>Doctors can review normally while TimeStamp quietly records the moments that matter for the research team.</p>
+          </div>
+          <div class="grid features-grid">
+            <article class="card"><div class="icon">Time</div><h3>Records what happened</h3><p>Clicks, zooms, pans, tool changes, and annotation changes are saved in order.</p></article>
+            <article class="card"><div class="icon">ROI</div><h3>Tracks annotation moments</h3><p>When a region is drawn or removed, the extension records the shape and timing.</p></article>
+            <article class="card"><div class="icon">Live</div><h3>Shows a live monitor</h3><p>Doctors can see recording status, recent events, and transcript status while reviewing slides.</p></article>
+            <article class="card"><div class="icon">Mic</div><h3>Supports live notes</h3><p>Optional transcript capture makes spoken review comments searchable later.</p></article>
+            <article class="card"><div class="icon">Video</div><h3>Pairs with screen video</h3><p>Use a normal screen recorder while TimeStamp captures the structured event timeline.</p></article>
+            <article class="card"><div class="icon">Files</div><h3>Exports review files</h3><p>Export event logs, cursor movement, video, and transcript files for follow-up analysis.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section id="session" class="section">
+        <div class="container">
+          <div class="section-head">
+            <div><div class="eyebrow">During a session</div><h2>Review slides the normal way</h2></div>
+            <p>The extension is designed to stay out of the way while preserving a record for later review.</p>
+          </div>
+          <div class="grid features-grid">
+            <article class="card"><h3>Doctor workflow</h3><p>Start screen recording if you want video. Click Start Recording, review the slide naturally, then click Pause Recording when finished.</p></article>
+            <article class="card"><h3>What the research team receives</h3><p><strong>*_event.json</strong>, <strong>*_cursor.json</strong>, <strong>*_video.mp4</strong>, and <strong>*_transcript.txt</strong>.</p></article>
+            <article class="card"><h3>Feedback preview</h3><p>This page is only for review. After feedback, it can become the final hosted download and documentation page.</p></article>
+          </div>
+        </div>
+      </section>
+
+      <section class="help">
+        <div class="container">
+          <div><div class="eyebrow">Need help?</div><h2>If the download does not start, ask the research coordinator for the TimeStamp .jar file.</h2></div>
+          <a class="button secondary" href="#downloads" style="border-color:white;color:white;">Back to downloads</a>
+        </div>
+      </section>
+    </main>
+
+    <footer><div class="container">TimeStamp Extension for QuPath · Feedback preview only</div></footer>
+  </body>
+</html>
