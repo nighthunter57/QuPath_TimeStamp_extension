@@ -7,11 +7,11 @@ const siteRoot = path.dirname(fileURLToPath(import.meta.url));
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
-  output: "export",
+  ...(isGithubPages ? { output: "export" } : {}),
   outputFileTracingRoot: siteRoot,
   trailingSlash: true,
   basePath: isGithubPages ? `/${repoName}` : "",
-  assetPrefix: isGithubPages ? `/${repoName}/` : "",
+  assetPrefix: isGithubPages ? `/${repoName}` : "",
   images: {
     unoptimized: true
   }

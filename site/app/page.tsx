@@ -1,655 +1,403 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import Image from "next/image";
 import Link from "next/link";
-import { motion } from "framer-motion";
 import {
-  Activity,
-  Apple,
   ArrowRight,
   BadgeCheck,
-  Boxes,
-  CircleHelp,
+  Bell,
+  CheckCircle2,
   Clock3,
   Download,
   ExternalLink,
-  FileDown,
-  FileJson,
-  Laptop,
+  FileText,
+  Github,
+  Headphones,
+  MessageSquareText,
   Mic2,
-  Monitor,
-  MousePointer2,
-  Play,
-  ShieldCheck,
-  SquarePen,
-  Stethoscope,
-  Video
+  RefreshCw,
+  ShieldCheck
 } from "lucide-react";
 
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle
-} from "@/components/ui/card";
-import { cn } from "@/lib/utils";
+import { ReleaseNotes } from "@/components/ReleaseNotes";
+import { SupportTicketForm } from "@/components/SupportTicketForm";
+import { latestRelease } from "@/data/releases";
+import histologySupportBanner from "@/assets/histology-support-banner.jpg";
 
-const QUPATH_VERSION = "0.7.0";
-const extensionDownloadUrl = "downloads/TimeStamp-0.1.0-SNAPSHOT.jar";
+const CATALOG_URL =
+  "https://github.com/nighthunter57/QuPath_TimeStamp_extension";
+const REPOSITORY_URL =
+  "https://github.com/nighthunter57/QuPath_TimeStamp_extension";
+const EXTENSION_DOWNLOAD = "./downloads/TimeStamp-0.1.0-SNAPSHOT.jar";
 
-const navItems = [
-  ["Download", "#downloads"],
-  ["Install", "#install"],
-  ["What it does", "#features"],
-  ["Session", "#session"],
-  ["Help", "#help"]
+const navigation = [
+  { label: "Updates", href: "#updates" },
+  { label: "Support", href: "#support" },
+  { label: "Install", href: "#install" }
 ];
 
-const qupathDownloads = [
+const quickActions = [
   {
-    os: "Windows",
-    key: "windows",
-    label: "Download QuPath for Windows",
-    detail: "Windows installer (.msi)",
-    size: "271 MB",
-    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Windows.msi`,
-    icon: Monitor
+    icon: MessageSquareText,
+    title: "Report a problem",
+    text: "Send a structured support ticket without a GitHub account.",
+    href: "#support"
   },
   {
-    os: "Windows",
-    key: "windows-portable",
-    label: "Windows portable",
-    detail: "No installer (.zip)",
-    size: "270 MB",
-    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Windows.zip`,
-    icon: Monitor
+    icon: Bell,
+    title: "Review updates",
+    text: "See what changed, what was fixed, and the current release status.",
+    href: "#updates"
   },
   {
-    os: "macOS",
-    key: "mac-intel",
-    label: "Download QuPath for macOS Intel",
-    detail: "Older Intel Macs (.pkg)",
-    size: "241 MB",
-    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Mac-x64.pkg`,
-    icon: Apple
-  },
-  {
-    os: "macOS",
-    key: "mac-apple-silicon",
-    label: "Download QuPath for macOS Apple silicon",
-    detail: "M1, M2, M3, or newer Macs (.pkg)",
-    size: "230 MB",
-    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Mac-arm64.pkg`,
-    icon: Apple
-  },
-  {
-    os: "Linux",
-    key: "linux",
-    label: "Download QuPath for Linux",
-    detail: "Linux archive (.tar.xz)",
-    size: "244 MB",
-    href: `https://github.com/qupath/qupath/releases/download/v${QUPATH_VERSION}/QuPath-v${QUPATH_VERSION}-Linux.tar.xz`,
-    icon: Laptop
+    icon: Download,
+    title: "Get the preview",
+    text: `Download TimeStamp ${latestRelease.version} for local evaluation.`,
+    href: EXTENSION_DOWNLOAD,
+    download: true
   }
 ];
-
-const installSteps = [
-  {
-    title: "Download QuPath",
-    text: "Choose the button that matches the computer. If QuPath is already installed, skip this step.",
-    icon: Download
-  },
-  {
-    title: "Download TimeStamp Extension",
-    text: "The extension is a small .jar file. Keep it somewhere easy to find, like Downloads.",
-    icon: FileDown
-  },
-  {
-    title: "Open QuPath",
-    text: "Start QuPath like any other application. No coding or terminal window is needed.",
-    icon: Play
-  },
-  {
-    title: "Drag the extension into QuPath",
-    text: "Drag the downloaded .jar file onto the QuPath window. QuPath will ask to install it.",
-    icon: MousePointer2
-  },
-  {
-    title: "Restart and confirm",
-    text: "Restart QuPath, then check Extensions > TimeStamp Extension or open the TimeStamp Monitor.",
-    icon: BadgeCheck
-  }
-];
-
-const features = [
-  {
-    icon: Clock3,
-    title: "Records what happened",
-    text: "Clicks, zooms, pans, tool changes, and annotation changes are saved in order."
-  },
-  {
-    icon: SquarePen,
-    title: "Tracks annotation moments",
-    text: "When a region is drawn or removed, the extension records the shape and timing."
-  },
-  {
-    icon: Activity,
-    title: "Shows a live monitor",
-    text: "Doctors can see recording status, recent events, and transcript status while reviewing slides."
-  },
-  {
-    icon: Mic2,
-    title: "Supports live notes",
-    text: "Optional transcript capture makes spoken review comments searchable later."
-  },
-  {
-    icon: Video,
-    title: "Pairs with screen video",
-    text: "Use a normal screen recorder while TimeStamp captures the structured event timeline."
-  },
-  {
-    icon: FileJson,
-    title: "Exports review files",
-    text: "Export event logs, cursor movement, video, and transcript files for follow-up analysis."
-  }
-];
-
-const sessionSteps = [
-  "Start screen recording if you want video.",
-  "Click Start Recording in the TimeStamp Monitor.",
-  "Review the slide naturally: zoom, pan, discuss, and annotate.",
-  "Click Pause Recording when finished.",
-  "Export the event log, mouse log, and transcript for the research team."
-];
-
-const fadeUp = {
-  hidden: { opacity: 0, y: 22 },
-  visible: { opacity: 1, y: 0 }
-};
-
-type OsGroup = "windows" | "mac" | "linux" | "unknown";
-
-function detectOs(): OsGroup {
-  if (typeof navigator === "undefined") {
-    return "unknown";
-  }
-
-  const platform = navigator.platform.toLowerCase();
-  const userAgent = navigator.userAgent.toLowerCase();
-  const source = `${platform} ${userAgent}`;
-
-  if (source.includes("win")) {
-    return "windows";
-  }
-  if (source.includes("mac")) {
-    return "mac";
-  }
-  if (source.includes("linux")) {
-    return "linux";
-  }
-  return "unknown";
-}
-
-function SectionIntro({
-  eyebrow,
-  title,
-  text
-}: {
-  eyebrow: string;
-  title: string;
-  text: string;
-}) {
-  return (
-    <motion.div
-      className="mb-8 flex flex-col gap-4 md:flex-row md:items-end md:justify-between"
-      initial="hidden"
-      whileInView="visible"
-      viewport={{ once: true, margin: "-80px" }}
-      variants={fadeUp}
-      transition={{ duration: 0.5 }}
-    >
-      <div className="max-w-3xl">
-        <p className="mb-3 flex items-center gap-2 text-xs font-bold uppercase tracking-[0.14em] text-primary">
-          <span className="h-2 w-2 rounded-sm bg-amber" />
-          {eyebrow}
-        </p>
-        <h2 className="text-3xl font-semibold tracking-tight md:text-5xl">{title}</h2>
-      </div>
-      <p className="max-w-xl text-sm leading-6 text-muted-foreground md:text-base">{text}</p>
-    </motion.div>
-  );
-}
-
-function ProductPreview() {
-  const eventRows = [
-    ["10:03:12", "Zoomed into tissue region"],
-    ["10:03:14", "Annotation added"],
-    ["10:03:22", "Slide moved to next area"]
-  ];
-
-  return (
-    <motion.div
-      className="overflow-hidden rounded-lg border bg-card shadow-instrument"
-      initial={{ opacity: 0, scale: 0.97, y: 18 }}
-      animate={{ opacity: 1, scale: 1, y: 0 }}
-      transition={{ delay: 0.18, duration: 0.65, ease: "easeOut" }}
-    >
-      <div className="flex h-11 items-center justify-between border-b px-4 text-xs font-semibold text-muted-foreground">
-        <span>Example review session</span>
-        <Badge variant="amber">Recording</Badge>
-      </div>
-      <div className="grid min-h-[430px] lg:grid-cols-[1fr_290px]">
-        <div className="microscopy-field relative min-h-[360px] overflow-hidden">
-          <div className="absolute inset-[-80px] rotate-2 opacity-90 before:absolute before:inset-0 before:content-['']" />
-          <motion.div
-            className="absolute left-5 top-5 z-10 rounded-md bg-[#1f2a2d]/90 px-3 py-2 font-mono text-xs text-white shadow-panel"
-            animate={{ y: [0, -2, 0] }}
-            transition={{ duration: 2.4, repeat: Infinity, ease: "easeInOut" }}
-          >
-            10:03:14
-            <span className="block text-amber">Last: Annotation added</span>
-          </motion.div>
-          <motion.div
-            className="absolute bottom-24 right-16 z-10 h-32 w-48 rounded-lg border-2 border-dashed border-primary bg-primary/10"
-            animate={{ scale: [1, 1.015, 1] }}
-            transition={{ duration: 2.8, repeat: Infinity, ease: "easeInOut" }}
-          >
-            <span className="absolute -left-1.5 -top-1.5 h-3 w-3 rounded-sm border-2 border-white bg-amber" />
-            <span className="absolute -bottom-1.5 -right-1.5 h-3 w-3 rounded-sm border-2 border-white bg-amber" />
-          </motion.div>
-          <motion.div
-            className="absolute bottom-12 left-8 z-10 rounded-md border bg-white/90 px-3 py-2 text-xs text-muted-foreground shadow-panel"
-            initial={{ opacity: 0, x: -10 }}
-            animate={{ opacity: 1, x: 0 }}
-            transition={{ delay: 0.7, duration: 0.5 }}
-          >
-            TimeStamp keeps a record while the doctor reviews the slide.
-          </motion.div>
-        </div>
-        <div className="border-t bg-white lg:border-l lg:border-t-0">
-          <div className="border-b p-4">
-            <div className="flex items-center gap-2 text-sm font-bold text-teal-ink">
-              <span className="h-2.5 w-2.5 rounded-sm bg-red-500" />
-              Recording active
-            </div>
-          </div>
-          <div className="border-b p-4">
-            <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
-              Recent events
-            </p>
-            <div className="space-y-3">
-              {eventRows.map(([time, name]) => (
-                <div key={time} className="border-t pt-3 text-xs">
-                  <Badge variant="amber" className="mb-2 font-mono">
-                    {time}
-                  </Badge>
-                  <p className="font-bold">{name}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="p-4">
-            <p className="mb-3 text-[11px] font-bold uppercase tracking-[0.14em] text-muted-foreground">
-              Spoken note
-            </p>
-            <p className="font-mono text-xs leading-5 text-muted-foreground">
-              “This region is important for the follow-up review.”
-            </p>
-          </div>
-        </div>
-      </div>
-    </motion.div>
-  );
-}
-
-function DownloadCard({
-  option,
-  recommended
-}: {
-  option: (typeof qupathDownloads)[number];
-  recommended?: boolean;
-}) {
-  const Icon = option.icon;
-
-  return (
-    <Card className={cn("h-full transition-colors hover:border-primary/40", recommended && "border-primary bg-teal-soft/70")}>
-      <CardHeader>
-        <div className="mb-4 flex items-center justify-between gap-4">
-          <div className="grid h-11 w-11 place-items-center rounded-lg bg-white text-primary shadow-sm">
-            <Icon className="h-5 w-5" />
-          </div>
-          {recommended ? <Badge variant="amber">Recommended</Badge> : <Badge variant="outline">{option.os}</Badge>}
-        </div>
-        <CardTitle>{option.label}</CardTitle>
-        <CardDescription>
-          {option.detail} · {option.size}
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <Button asChild className="w-full">
-          <a href={option.href} aria-label={`${option.label}, ${option.detail}, ${option.size}`}>
-            <Download className="h-4 w-4" />
-            Download
-          </a>
-        </Button>
-      </CardContent>
-    </Card>
-  );
-}
 
 export default function Home() {
-  const [os, setOs] = useState<OsGroup>("unknown");
-
-  useEffect(() => {
-    setOs(detectOs());
-  }, []);
-
-  const recommendedDownloads = useMemo(() => {
-    if (os === "windows") {
-      return qupathDownloads.filter((item) => item.key === "windows");
-    }
-    if (os === "mac") {
-      return qupathDownloads.filter((item) => item.key === "mac-apple-silicon" || item.key === "mac-intel");
-    }
-    if (os === "linux") {
-      return qupathDownloads.filter((item) => item.key === "linux");
-    }
-    return qupathDownloads.filter((item) => item.key === "windows" || item.key === "mac-apple-silicon");
-  }, [os]);
-
-  const recommendedKeys = new Set(recommendedDownloads.map((item) => item.key));
-
   return (
-    <main className="min-h-screen overflow-hidden">
-      <header className="sticky top-0 z-50 border-b bg-background/90 backdrop-blur-xl">
-        <div className="container flex min-h-16 items-center justify-between gap-4 py-3">
-          <Link href="#overview" className="flex items-center gap-3 font-bold">
-            <span className="grid h-9 w-9 place-items-center rounded-lg border border-primary/25 bg-teal-soft text-primary">
+    <div className="min-h-screen bg-background text-foreground">
+      <header className="sticky top-0 z-50 border-b border-border bg-background/95 backdrop-blur">
+        <div className="mx-auto flex h-16 max-w-6xl items-center justify-between px-4 sm:px-6">
+          <Link href="/" className="flex min-w-0 items-center gap-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-primary text-sm font-extrabold text-primary-foreground">
               TS
             </span>
-            <span>TimeStamp Extension</span>
+            <span className="min-w-0">
+              <span className="block truncate text-sm font-bold">TimeStamp Extension</span>
+              <span className="block truncate text-[11px] text-muted-foreground">
+                Support and release center
+              </span>
+            </span>
           </Link>
-          <nav className="hidden items-center gap-5 text-sm text-muted-foreground md:flex">
-            {navItems.map(([label, href]) => (
-              <Link key={href} href={href} className="transition-colors hover:text-primary">
-                {label}
-              </Link>
+
+          <nav className="hidden items-center gap-6 md:flex" aria-label="Main navigation">
+            {navigation.map((item) => (
+              <a
+                key={item.label}
+                href={item.href}
+                className="text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+              >
+                {item.label}
+              </a>
             ))}
           </nav>
-          <Button asChild size="sm">
-            <Link href="#downloads">Download</Link>
+
+          <Button size="sm" asChild className="gap-2">
+            <a href="#support">
+              <Headphones className="h-4 w-4" />
+              <span className="hidden sm:inline">Get support</span>
+              <span className="sm:hidden">Support</span>
+            </a>
           </Button>
         </div>
       </header>
 
-      <section id="overview" className="container grid gap-12 py-16 md:py-24 lg:grid-cols-[0.92fr_1.08fr] lg:items-center">
-        <motion.div initial="hidden" animate="visible" variants={fadeUp} transition={{ duration: 0.6 }}>
-          <Badge variant="outline" className="mb-5 gap-2">
-            <Stethoscope className="h-3.5 w-3.5 text-primary" />
-            For clinical slide review teams
-          </Badge>
-          <h1 className="max-w-3xl text-5xl font-semibold leading-[0.98] tracking-tight md:text-7xl">
-            Record a QuPath slide review without touching code
-          </h1>
-          <p className="mt-6 max-w-2xl text-lg leading-8 text-muted-foreground">
-            TimeStamp Extension helps doctors review whole-slide images while automatically saving
-            the timing of zooms, pans, annotations, spoken notes, and exported review files.
-          </p>
-          <div className="mt-8 flex flex-wrap gap-3">
-            <Button asChild size="lg">
-              <Link href="#downloads">
-                Download now <ArrowRight className="h-4 w-4" />
-              </Link>
-            </Button>
-            <Button asChild variant="outline" size="lg">
-              <Link href="#install">
-                How to install <Play className="h-4 w-4" />
-              </Link>
-            </Button>
-          </div>
-          <div className="mt-6 flex flex-wrap gap-2">
-            <Badge>No coding</Badge>
-            <Badge>Drag-and-drop install</Badge>
-            <Badge>Works inside QuPath</Badge>
-          </div>
-        </motion.div>
-        <ProductPreview />
-      </section>
+      <main>
+        <section className="border-b border-border bg-card">
+          <div className="mx-auto grid max-w-6xl gap-8 px-4 py-10 sm:px-6 md:py-14 lg:grid-cols-[0.9fr_1.1fr] lg:items-center">
+            <div className="max-w-xl">
+              <div className="mb-5 flex flex-wrap items-center gap-2">
+                <Badge variant="outline" className="gap-1.5 border-emerald-300 text-emerald-800">
+                  <span className="h-1.5 w-1.5 rounded-full bg-emerald-600" />
+                  Support available
+                </Badge>
+                <Badge variant="outline">QuPath 0.6.0</Badge>
+              </div>
 
-      <section id="downloads" className="border-y bg-muted/70 py-16 md:py-24">
-        <div className="container">
-          <SectionIntro
-            eyebrow="Step 1"
-            title="Download QuPath for your computer"
-            text={`Choose the QuPath ${QUPATH_VERSION} installer that matches the doctor's device. The recommended option is selected from the browser when possible.`}
-          />
+              <h1 className="text-4xl font-extrabold leading-tight text-foreground sm:text-5xl">
+                TimeStamp Extension
+              </h1>
+              <p className="mt-3 text-lg font-semibold text-primary">
+                Support, updates, and installation in one place.
+              </p>
+              <p className="mt-4 max-w-lg text-sm leading-6 text-muted-foreground sm:text-base">
+                Report transcript or timestamp problems, review each change, and
+                install the latest build without searching through project files.
+              </p>
 
-          <div className="mb-5 grid gap-4 md:grid-cols-2">
-            {recommendedDownloads.map((option) => (
-              <DownloadCard key={option.key} option={option} recommended />
-            ))}
+              <div className="mt-7 flex flex-col gap-3 sm:flex-row">
+                <Button asChild size="lg" className="gap-2">
+                  <a href="#support">
+                    <MessageSquareText className="h-5 w-5" />
+                    Open a support ticket
+                  </a>
+                </Button>
+                <Button asChild size="lg" variant="outline" className="gap-2">
+                  <a href="#updates">
+                    <FileText className="h-5 w-5" />
+                    Read latest update
+                  </a>
+                </Button>
+              </div>
+
+              <div className="mt-7 grid grid-cols-2 gap-4 border-t border-border pt-5 text-sm">
+                <div>
+                  <p className="text-xs font-semibold uppercase text-muted-foreground">
+                    Current build
+                  </p>
+                  <p className="mt-1 font-mono font-bold">v{latestRelease.version}</p>
+                </div>
+                <div>
+                  <p className="text-xs font-semibold uppercase text-muted-foreground">
+                    Updated
+                  </p>
+                  <p className="mt-1 font-bold">{latestRelease.date}</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="relative aspect-[16/10] min-h-72 min-w-0 w-full overflow-hidden rounded-lg border border-border bg-muted">
+              <Image
+                src={histologySupportBanner}
+                alt="Generic H&E-stained tissue field used as a non-diagnostic interface preview"
+                fill
+                priority
+                className="object-cover"
+                sizes="(max-width: 1024px) 100vw, 55vw"
+              />
+              <div className="absolute inset-0 bg-black/10" />
+
+              <div className="absolute left-4 top-4 flex items-center gap-2 rounded-md border border-white/30 bg-black/75 px-3 py-2 text-xs text-white shadow-lg backdrop-blur">
+                <span className="h-2 w-2 rounded-full bg-red-500" />
+                <span className="font-bold">REC</span>
+                <span className="font-mono text-white/80">00:14:28</span>
+              </div>
+
+              <div className="absolute inset-x-4 bottom-4 rounded-md border border-white/30 bg-black/80 p-4 text-white shadow-xl backdrop-blur">
+                <div className="flex items-center justify-between gap-3">
+                  <p className="flex items-center gap-2 text-xs font-bold uppercase text-emerald-300">
+                    <Mic2 className="h-4 w-4" />
+                    Live transcript
+                  </p>
+                  <span className="font-mono text-xs text-white/60">00:14:25</span>
+                </div>
+                <p className="mt-2 text-sm leading-5 text-white/90">
+                  The glands show preserved architecture in this reviewed region.
+                </p>
+              </div>
+            </div>
           </div>
+        </section>
 
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
-            {qupathDownloads.map((option) => (
-              <DownloadCard key={option.key} option={option} recommended={recommendedKeys.has(option.key)} />
-            ))}
+        <section aria-label="Quick actions" className="border-b border-border bg-muted/25">
+          <div className="mx-auto grid max-w-6xl divide-y divide-border px-4 sm:px-6 md:grid-cols-3 md:divide-x md:divide-y-0">
+            {quickActions.map((action) => {
+              const Icon = action.icon;
+              return (
+                <a
+                  key={action.title}
+                  href={action.href}
+                  download={action.download}
+                  className="group flex min-h-32 gap-4 px-1 py-6 md:px-6 first:md:pl-0 last:md:pr-0"
+                >
+                  <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-border bg-card text-primary">
+                    <Icon className="h-5 w-5" />
+                  </span>
+                  <span>
+                    <span className="flex items-center gap-2 text-sm font-bold text-foreground">
+                      {action.title}
+                      <ArrowRight className="h-4 w-4 transition-transform group-hover:translate-x-1" />
+                    </span>
+                    <span className="mt-1 block text-xs leading-5 text-muted-foreground">
+                      {action.text}
+                    </span>
+                  </span>
+                </a>
+              );
+            })}
           </div>
+        </section>
 
-          <div className="mt-5 flex flex-wrap gap-3 text-sm text-muted-foreground">
-            <a
-              className="inline-flex items-center gap-2 font-semibold text-primary"
-              href={`https://github.com/qupath/qupath/releases/tag/v${QUPATH_VERSION}`}
-            >
-              Release notes v{QUPATH_VERSION} <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-            <a
-              className="inline-flex items-center gap-2 font-semibold text-primary"
-              href="https://qupath.readthedocs.io/en/stable/docs/intro/installation.html"
-            >
-              QuPath installation notes <ExternalLink className="h-3.5 w-3.5" />
-            </a>
-            <a
-              className="inline-flex items-center gap-2 font-semibold text-primary"
-              href="https://qupath.readthedocs.io/en/latest/docs/intro/installation.html#qupath-for-mac"
-            >
-              Not sure which Mac? <CircleHelp className="h-3.5 w-3.5" />
-            </a>
-          </div>
-
-          <Card className="mt-10 border-primary bg-white">
-            <CardHeader className="grid gap-6 lg:grid-cols-[1fr_auto] lg:items-center">
+        <section id="updates" className="scroll-mt-20 border-b border-border py-14 md:py-20">
+          <div className="mx-auto max-w-6xl px-4 sm:px-6">
+            <div className="mb-8 grid gap-4 md:grid-cols-[1fr_420px] md:items-end">
               <div>
-                <Badge variant="amber" className="mb-4">Step 2</Badge>
-                <CardTitle className="text-3xl">Download the TimeStamp Extension</CardTitle>
-                <CardDescription className="mt-3 max-w-2xl text-base">
-                  After QuPath is installed, download the extension file. This is the file you will
-                  drag into QuPath.
-                </CardDescription>
+                <p className="mb-2 text-xs font-bold uppercase text-primary">
+                  Product updates
+                </p>
+                <h2 className="text-3xl font-extrabold text-foreground">
+                  What changed and what was fixed
+                </h2>
               </div>
-              <div className="flex flex-col gap-3">
-                <Button asChild size="lg">
-                  <a href={extensionDownloadUrl} download aria-label="Download TimeStamp Extension jar file">
-                    <FileDown className="h-4 w-4" />
-                    Download TimeStamp Extension
-                  </a>
-                </Button>
-                <Button asChild variant="outline">
-                  <a href="https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases">
-                    Backup download page
-                  </a>
-                </Button>
-              </div>
-            </CardHeader>
-            <CardContent>
-              <div className="rounded-lg border bg-muted/60 p-4 text-sm text-muted-foreground">
-                If the extension download does not start, use the backup download page or ask the
-                study coordinator for the TimeStamp extension file.
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </section>
-
-      <section id="install" className="container py-16 md:py-24">
-        <SectionIntro
-          eyebrow="Install"
-          title="Plug the extension into QuPath"
-          text="This is written for doctors and clinical staff: no command line, no code, and no build step."
-        />
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-5">
-          {installSteps.map((step, index) => (
-            <motion.div
-              key={step.title}
-              initial="hidden"
-              whileInView="visible"
-              viewport={{ once: true, margin: "-80px" }}
-              variants={fadeUp}
-              transition={{ delay: index * 0.04, duration: 0.45 }}
-            >
-              <Card className="h-full">
-                <CardHeader>
-                  <div className="mb-5 flex items-center justify-between">
-                    <span className="font-mono text-sm font-bold text-primary">
-                      {String(index + 1).padStart(2, "0")}
-                    </span>
-                    <step.icon className="h-5 w-5 text-primary" />
-                  </div>
-                  <CardTitle className="text-base">{step.title}</CardTitle>
-                  <CardDescription>{step.text}</CardDescription>
-                </CardHeader>
-              </Card>
-            </motion.div>
-          ))}
-        </div>
-      </section>
-
-      <section id="features" className="border-y bg-muted/70 py-16 md:py-24">
-        <div className="container">
-          <SectionIntro
-            eyebrow="What it does"
-            title="A simple recorder for slide review behavior"
-            text="Doctors can review normally while TimeStamp quietly records the moments that matter for the research team."
-          />
-          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-            {features.map((feature, index) => (
-              <motion.div
-                key={feature.title}
-                initial="hidden"
-                whileInView="visible"
-                viewport={{ once: true, margin: "-80px" }}
-                variants={fadeUp}
-                transition={{ delay: index * 0.04, duration: 0.45 }}
-              >
-                <Card className="h-full transition-colors hover:border-primary/35">
-                  <CardHeader>
-                    <div className="mb-4 grid h-10 w-10 place-items-center rounded-lg bg-teal-soft text-primary">
-                      <feature.icon className="h-5 w-5" />
-                    </div>
-                    <CardTitle>{feature.title}</CardTitle>
-                    <CardDescription>{feature.text}</CardDescription>
-                  </CardHeader>
-                </Card>
-              </motion.div>
-            ))}
+              <p className="text-sm leading-6 text-muted-foreground">
+                Each notice separates user-visible improvements from fixes and
+                validation work, so reviewers can decide when to update.
+              </p>
+            </div>
+            <ReleaseNotes />
           </div>
-        </div>
-      </section>
+        </section>
 
-      <section id="session" className="container py-16 md:py-24">
-        <SectionIntro
-          eyebrow="During a session"
-          title="Review slides the normal way"
-          text="The extension is designed to stay out of the way while preserving a record for later review."
-        />
-        <div className="grid gap-4 lg:grid-cols-[0.95fr_1.05fr]">
-          <Card>
-            <CardHeader>
-              <CardTitle>Doctor workflow</CardTitle>
-              <CardDescription>
-                These are the only actions a reviewer needs to remember.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <ol className="space-y-4">
-                {sessionSteps.map((step, index) => (
-                  <li key={step} className="flex gap-3">
-                    <span className="grid h-7 w-7 shrink-0 place-items-center rounded-md bg-primary text-sm font-bold text-white">
-                      {index + 1}
-                    </span>
-                    <span className="text-sm leading-6 text-muted-foreground">{step}</span>
-                  </li>
-                ))}
-              </ol>
-            </CardContent>
-          </Card>
-          <Card className="bg-amber-soft/80">
-            <CardHeader>
-              <div className="mb-4 grid h-10 w-10 place-items-center rounded-lg bg-white text-amber-foreground">
-                <ShieldCheck className="h-5 w-5" />
+        <section id="support" className="scroll-mt-20 border-b border-border bg-muted/25 py-14 md:py-20">
+          <div className="mx-auto max-w-6xl px-4 sm:px-6">
+            <div className="mb-8 max-w-3xl">
+              <p className="mb-2 text-xs font-bold uppercase text-primary">
+                Support
+              </p>
+              <h2 className="text-3xl font-extrabold text-foreground">
+                Send a problem report or short survey
+              </h2>
+              <p className="mt-3 text-sm leading-6 text-muted-foreground">
+                The form gathers the version and environment details needed to
+                investigate transcript, timestamp, installation, and usability issues.
+              </p>
+            </div>
+
+            <div className="grid gap-8 lg:grid-cols-[1fr_310px] lg:items-start">
+              <SupportTicketForm />
+
+              <aside className="space-y-6 lg:sticky lg:top-24">
+                <div className="border-l-2 border-primary pl-4">
+                  <h3 className="text-sm font-bold text-foreground">
+                    Helpful information
+                  </h3>
+                  <ul className="mt-3 space-y-3 text-sm leading-5 text-muted-foreground">
+                    <li className="flex gap-2">
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                      TimeStamp and QuPath version numbers
+                    </li>
+                    <li className="flex gap-2">
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                      Approximate recording duration before the problem
+                    </li>
+                    <li className="flex gap-2">
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                      Whether the live text, final transcript, or both were affected
+                    </li>
+                    <li className="flex gap-2">
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-emerald-600" />
+                      Safe log files with all patient identifiers removed
+                    </li>
+                  </ul>
+                </div>
+
+                <div className="rounded-lg border border-border bg-card p-5">
+                  <ShieldCheck className="h-6 w-6 text-primary" />
+                  <h3 className="mt-3 text-sm font-bold">Clinical privacy</h3>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    Support requests are for software troubleshooting only. Never
+                    include protected health information or diagnostic content.
+                  </p>
+                </div>
+
+                <div className="rounded-lg border border-border bg-card p-5">
+                  <Clock3 className="h-6 w-6 text-primary" />
+                  <h3 className="mt-3 text-sm font-bold">Ticket delivery</h3>
+                  <p className="mt-2 text-xs leading-5 text-muted-foreground">
+                    The completed request opens in the sender&apos;s email application.
+                    No ticket content is stored on this website.
+                  </p>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </section>
+
+        <section id="install" className="scroll-mt-20 py-14 md:py-20">
+          <div className="mx-auto max-w-6xl px-4 sm:px-6">
+            <div className="grid gap-10 lg:grid-cols-2">
+              <div>
+                <p className="mb-2 text-xs font-bold uppercase text-primary">
+                  One-time setup
+                </p>
+                <h2 className="text-3xl font-extrabold">Simple updates for clinical users</h2>
+                <p className="mt-3 max-w-xl text-sm leading-6 text-muted-foreground">
+                  Add the TimeStamp catalog once. Future published releases can then
+                  be installed from QuPath&apos;s Extension Manager without manually
+                  replacing JAR files.
+                </p>
+
+                <ol className="mt-7 space-y-5">
+                  {[
+                    "Open Extensions > Manage extensions > Manage extension catalogs.",
+                    "Add the TimeStamp catalog repository shown here.",
+                    "Install or update TimeStamp, then restart QuPath."
+                  ].map((step, index) => (
+                    <li key={step} className="flex gap-4">
+                      <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-xs font-bold text-primary-foreground">
+                        {index + 1}
+                      </span>
+                      <span className="pt-1 text-sm leading-5 text-foreground">{step}</span>
+                    </li>
+                  ))}
+                </ol>
               </div>
-              <CardTitle>What the research team receives</CardTitle>
-              <CardDescription className="text-amber-foreground/80">
-                TimeStamp creates review files that can be matched with the screen recording and
-                transcript.
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="grid gap-3 sm:grid-cols-2">
-                {[
-                  ["*_event.json", "Review events and slide position"],
-                  ["*_cursor.json", "Optional cursor movement"],
-                  ["*_video.mp4", "Screen recording"],
-                  ["*_transcript.txt", "Searchable spoken notes"]
-                ].map(([name, text]) => (
-                  <div key={name} className="rounded-lg border bg-white p-4">
-                    <Badge variant="amber" className="mb-3 font-mono">
-                      {name}
-                    </Badge>
-                    <p className="text-sm text-muted-foreground">{text}</p>
+
+              <div className="rounded-lg border border-border bg-card p-5 md:p-7">
+                <div className="flex items-center justify-between gap-4">
+                  <div>
+                    <p className="text-xs font-bold uppercase text-muted-foreground">
+                      Extension catalog
+                    </p>
+                    <p className="mt-2 break-all font-mono text-sm text-foreground">
+                      {CATALOG_URL}
+                    </p>
                   </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </section>
+                  <BadgeCheck className="h-6 w-6 shrink-0 text-primary" />
+                </div>
 
-      <section id="help" className="border-y bg-[#1f2a2d] py-14 text-white">
-        <div className="container grid gap-8 md:grid-cols-[1fr_auto] md:items-center">
+                <div className="mt-6 grid gap-3 sm:grid-cols-2">
+                  <Button asChild className="gap-2">
+                    <a href={EXTENSION_DOWNLOAD} download>
+                      <Download className="h-4 w-4" />
+                      Download preview
+                    </a>
+                  </Button>
+                  <Button asChild variant="outline" className="gap-2">
+                    <a href={REPOSITORY_URL} target="_blank" rel="noopener noreferrer">
+                      <Github className="h-4 w-4" />
+                      Repository
+                    </a>
+                  </Button>
+                </div>
+
+                <div className="mt-6 flex items-start gap-3 border-t border-border pt-5">
+                  <RefreshCw className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
+                  <p className="text-xs leading-5 text-muted-foreground">
+                    Extension updates are one-click installs, not silent background
+                    updates. QuPath must be restarted after installing a new version.
+                  </p>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer className="border-t border-border bg-card py-8">
+        <div className="mx-auto flex max-w-6xl flex-col gap-4 px-4 sm:px-6 md:flex-row md:items-center md:justify-between">
           <div>
-            <p className="mb-2 text-sm font-semibold text-amber">Need help?</p>
-            <h2 className="text-3xl font-semibold tracking-tight">
-              If the download does not start, ask the research coordinator for the TimeStamp .jar file.
-            </h2>
+            <p className="text-sm font-bold">TimeStamp Extension for QuPath</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Live transcript and timestamp support for digital pathology workflows.
+            </p>
           </div>
-          <div className="flex flex-wrap gap-3">
-            <Button asChild variant="outline" className="border-white/40 text-white hover:bg-white/10">
-              <a href="https://github.com/nighthunter57/QuPath_TimeStamp_extension/releases">
-                <ExternalLink className="h-4 w-4" />
-                Extension releases
-              </a>
-            </Button>
-            <Button asChild className="bg-white text-[#1f2a2d] hover:bg-white/90">
-              <Link href="#downloads">
-                <Download className="h-4 w-4" />
-                Downloads
-              </Link>
-            </Button>
+          <div className="flex flex-wrap items-center gap-5 text-xs font-semibold">
+            <a href="#support" className="text-muted-foreground hover:text-foreground">
+              Support
+            </a>
+            <a href="#updates" className="text-muted-foreground hover:text-foreground">
+              Updates
+            </a>
+            <a
+              href={REPOSITORY_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="flex items-center gap-1.5 text-muted-foreground hover:text-foreground"
+            >
+              GitHub
+              <ExternalLink className="h-3.5 w-3.5" />
+            </a>
           </div>
-        </div>
-      </section>
-
-      <footer className="container flex flex-col gap-3 py-8 text-sm text-muted-foreground md:flex-row md:items-center md:justify-between">
-        <p>TimeStamp Extension for QuPath</p>
-        <div className="flex items-center gap-2">
-          <Boxes className="h-4 w-4" />
-          Doctor-facing QuPath download and extension install page
         </div>
       </footer>
-    </main>
+    </div>
   );
 }

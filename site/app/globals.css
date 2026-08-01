@@ -4,21 +4,21 @@
 
 @layer base {
   :root {
-    --background: 18 40% 98%;
-    --foreground: 192 10% 19%;
+    --background: 210 20% 98%;
+    --foreground: 210 16% 16%;
     --card: 0 0% 100%;
-    --card-foreground: 192 10% 19%;
-    --primary: 184 100% 23%;
+    --card-foreground: 210 16% 16%;
+    --primary: 184 83% 24%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 174 34% 64%;
-    --secondary-foreground: 184 100% 16%;
-    --muted: 190 23% 94%;
-    --muted-foreground: 195 8% 39%;
+    --secondary: 212 15% 91%;
+    --secondary-foreground: 210 16% 22%;
+    --muted: 210 18% 94%;
+    --muted-foreground: 210 9% 40%;
     --accent: 47 100% 50%;
     --accent-foreground: 43 100% 16%;
-    --border: 0 6% 86%;
-    --input: 0 6% 86%;
-    --ring: 184 100% 23%;
+    --border: 210 14% 84%;
+    --input: 210 14% 78%;
+    --ring: 184 83% 24%;
     --radius: 0.5rem;
   }
 
@@ -33,20 +33,17 @@
   body {
     @apply bg-background text-foreground antialiased;
   }
+
+  button,
+  input,
+  select,
+  textarea {
+    letter-spacing: 0;
+  }
 }
 
-@layer utilities {
-  .microscopy-field {
-    background:
-      radial-gradient(circle at 26% 34%, rgb(116 81 121 / 28%) 0 8%, transparent 9%),
-      radial-gradient(circle at 62% 52%, rgb(214 130 110 / 24%) 0 10%, transparent 11%),
-      radial-gradient(circle at 46% 68%, rgb(123 154 164 / 28%) 0 12%, transparent 13%),
-      linear-gradient(135deg, #ece9e7, #faf7f5 42%, #e2eef0);
-  }
-
-  .microscopy-field::before {
-    background:
-      repeating-linear-gradient(24deg, rgb(45 52 54 / 4%) 0 2px, transparent 2px 18px),
-      repeating-linear-gradient(108deg, rgb(0 109 119 / 5%) 0 1px, transparent 1px 22px);
+@layer components {
+  .form-control {
+    @apply block w-full rounded-md border border-input bg-background px-3 py-2.5 text-sm font-normal text-foreground outline-none transition-colors placeholder:text-muted-foreground/70 focus:border-primary focus:ring-2 focus:ring-primary/15;
   }
 }

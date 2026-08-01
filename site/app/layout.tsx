@@ -2,13 +2,13 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Download TimeStamp Extension for QuPath",
+  title: "TimeStamp Extension | Support and Updates",
   description:
-    "Download QuPath and install the TimeStamp Extension with a doctor-friendly, no-code walkthrough.",
+    "Report TimeStamp Extension problems, review release notes, and install updates for QuPath.",
   openGraph: {
-    title: "Download TimeStamp Extension for QuPath",
+    title: "TimeStamp Extension Support and Updates",
     description:
-      "A no-code download and drag-and-drop install page for doctors using TimeStamp Extension in QuPath.",
+      "Support tickets, release notes, downloads, and update instructions for the TimeStamp QuPath extension.",
     type: "website"
   }
 };
