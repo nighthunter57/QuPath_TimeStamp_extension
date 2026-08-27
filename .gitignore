@@ -1,10 +1,22 @@
-# Javadocs
-docs/
+# Javadocs (keep hand-written transcript documentation in source control)
+docs/*
+!docs/TRANSCRIPT_PROTOCOL.md
+!docs/LIVE_TRANSCRIPT_ACCURACY_PLAN.md
 
 # Website
 site/node_modules/
 site/.next/
 site/out/
+
+# Python
+.venv/
+venv/
+.venv-whisper/
+__pycache__/
+*.py[cod]
+
+# Demo recordings/output
+demo-output/
 
 # Maven
 deploy/
@@ -21,7 +33,6 @@ out/
 gradle.properties
 build/
 .gradle/
-gradle.properties
 
 # Eclipse
 .settings/

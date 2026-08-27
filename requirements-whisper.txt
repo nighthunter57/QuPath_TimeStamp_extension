@@ -1,0 +1,4 @@
+faster-whisper>=1.2
+ctranslate2>=4.8
+numpy
+sounddevice

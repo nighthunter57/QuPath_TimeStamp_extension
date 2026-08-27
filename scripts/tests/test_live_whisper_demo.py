@@ -1,0 +1,593 @@
+import tempfile
+import unittest
+import wave
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+
+from scripts import live_whisper_demo as transcript
+
+
+class TranscriptLogicTest(unittest.TestCase):
+
+    def test_timestamp_round_trip_preserves_date(self):
+        expected = datetime(2026, 7, 30, 23, 59, 59, 123000).astimezone()
+        line = transcript.format_transcript_line(expected, "diagnostic text")
+
+        parsed = transcript.parse_transcript_line(line)
+
+        self.assertEqual((expected.astimezone(timezone.utc), "diagnostic text"), parsed)
+
+    def test_protocol_grammar_covers_every_message(self):
+        examples = {
+            "DEVICE": ("Built-in Microphone", "0 - Built-in Microphone"),
+            "AUDIO_CHECK_READY": (),
+            "AUDIO_CHECK_RESULT": ("0.010", "hearing"),
+            "AUDIO_LEVEL": ("0.010", "hearing"),
+            "AUDIO_CLIPPING": ("0.125",),
+            "AUDIO_SILENT": ("30.0",),
+            "AUDIO_RECOVERED": (),
+            "TRANSCRIPT_READY": (),
+            "RECORDING_ORIGIN": ("2026-08-25T20:00:00.000Z",),
+            "LIVE_MODEL_READY": ("small.en",),
+            "TRANSCRIPT_UPDATED": (),
+            "TRANSCRIPT_PARTIAL": ("provisional words",),
+            "FINALIZE_PROGRESS": ("12.0", "60.0"),
+            "FINALIZATION_RESULT": ("final",),
+        }
+        self.assertEqual(set(transcript.PROTOCOL_FIELDS), set(examples))
+        for kind, fields in examples.items():
+            with self.subTest(kind=kind):
+                message = transcript.format_protocol_message(kind, *fields)
+                self.assertEqual(kind, message.split("\t", 1)[0])
+                self.assertNotIn("\n", message)
+        with self.assertRaises(ValueError):
+            transcript.format_protocol_message("AUDIO_LEVEL", "missing-state")
+        with self.assertRaises(ValueError):
+            transcript.format_protocol_message("NOT_A_MESSAGE")
+
+    def test_utc_timing_export_converts_local_offset(self):
+        local_time = datetime(
+            2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))
+        )
+
+        self.assertEqual(
+            "2026-08-20T17:00:00.000Z",
+            transcript.format_utc_timestamp(local_time),
+        )
+
+    def test_midnight_transcript_entries_sort_chronologically(self):
+        before = transcript.parse_transcript_line(
+            "[2026-07-30T23:59:59.900] before midnight"
+        )
+        after = transcript.parse_transcript_line(
+            "[2026-07-31T00:00:00.100] after midnight"
+        )
+
+        self.assertGreater(after[0], before[0])
+
+    def test_local_agreement_commits_only_shared_prefix(self):
+        start = datetime(2026, 7, 30, 12, 0, 0)
+        state = transcript.LocalAgreementState()
+        first = self._timed_words(start, "negative for possible malignancy")
+        second = self._timed_words(start, "negative for definite malignancy")
+
+        committed, provisional = state.update(first)
+        self.assertEqual([], committed)
+        self.assertEqual("negative for possible malignancy", transcript.join_timed_words(provisional))
+
+        committed, provisional = state.update(second)
+        self.assertEqual("negative for", transcript.join_timed_words(committed))
+        self.assertEqual("definite malignancy", transcript.join_timed_words(provisional))
+
+    def test_local_agreement_correction_remains_provisional_until_repeated(self):
+        start = datetime(2026, 7, 30, 12, 0, 0)
+        state = transcript.LocalAgreementState()
+
+        state.update(self._timed_words(start, "positive for malignancy"))
+        committed, provisional = state.update(
+            self._timed_words(start, "negative for malignancy")
+        )
+        self.assertEqual([], committed)
+        self.assertEqual("negative for malignancy", transcript.join_timed_words(provisional))
+
+        committed, provisional = state.update(
+            self._timed_words(start, "negative for malignancy")
+        )
+        self.assertEqual("negative for malignancy", transcript.join_timed_words(committed))
+        self.assertEqual([], provisional)
+
+    def test_local_agreement_force_commits_latest_hypothesis(self):
+        start = datetime(2026, 7, 30, 12, 0, 0)
+        state = transcript.LocalAgreementState()
+        state.update(self._timed_words(start, "provisional phrase"))
+
+        committed, provisional = state.update([], force=True)
+
+        self.assertEqual("provisional phrase", transcript.join_timed_words(committed))
+        self.assertEqual([], provisional)
+
+    def test_committed_words_group_on_sentence_and_long_gap(self):
+        start = datetime(2026, 7, 30, 12, 0, 0)
+        words = [
+            (start, start + timedelta(seconds=0.2), "First"),
+            (start + timedelta(seconds=0.2), start + timedelta(seconds=0.4), " sentence."),
+            (start + timedelta(seconds=0.5), start + timedelta(seconds=0.7), "Second"),
+            (start + timedelta(seconds=1.5), start + timedelta(seconds=1.7), " line"),
+        ]
+
+        grouped = transcript.group_committed_words(words)
+
+        self.assertEqual(["First sentence.", "Second", "line"], [text for _, text in grouped])
+
+    def test_local_agreement_prompt_is_limited_to_last_32_words(self):
+        start = datetime(2026, 7, 30, 12, 0, 0)
+        entries = [(start, " ".join(f"word{index}" for index in range(40)))]
+
+        prompt = transcript.local_agreement_prompt(entries, [])
+
+        self.assertEqual(32, len(prompt.split()))
+        self.assertTrue(prompt.startswith("word8 "))
+
+    @staticmethod
+    def _timed_words(start, text):
+        words = []
+        for index, piece in enumerate(text.split()):
+            word_start = start + timedelta(seconds=index * 0.2)
+            words.append((word_start, word_start + timedelta(seconds=0.2), piece))
+        return words
+
+    def test_raw_audio_is_streamed_to_valid_wave_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw_path = Path(directory) / "capture.raw"
+            wave_path = Path(directory) / "capture.wav"
+            raw_path.write_bytes(b"\x00\x00" * transcript.SAMPLE_RATE)
+
+            self.assertTrue(transcript.export_raw_audio_to_wave(raw_path, wave_path))
+            with wave.open(str(wave_path), "rb") as handle:
+                self.assertEqual(transcript.SAMPLE_RATE, handle.getframerate())
+                self.assertEqual(1, handle.getnchannels())
+                self.assertEqual(transcript.SAMPLE_RATE, handle.getnframes())
+
+    def test_incremental_wave_is_playable_after_every_append(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wave_path = Path(directory) / "capture.wav"
+            chunk = b"\x00\x00" * (transcript.SAMPLE_RATE // 2)
+            for expected_frames in (transcript.SAMPLE_RATE // 2, transcript.SAMPLE_RATE):
+                transcript.append_wave_bytes(wave_path, chunk)
+                with wave.open(str(wave_path), "rb") as handle:
+                    self.assertEqual(expected_frames, handle.getnframes())
+                    self.assertEqual(transcript.SAMPLE_RATE, handle.getframerate())
+
+    def test_invalid_partial_wave_is_recovered_before_recording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            raw_path = Path(directory) / "capture.raw"
+            wave_path = Path(directory) / "capture.wav"
+            wave_path.write_bytes(b"RIFF-partial-crash")
+
+            transcript.prepare_incremental_wave(raw_path, wave_path)
+            transcript.append_wave_bytes(wave_path, b"\x00\x00" * 100)
+
+            self.assertTrue(transcript.is_valid_capture_wave(wave_path))
+            with wave.open(str(wave_path), "rb") as handle:
+                self.assertEqual(100, handle.getnframes())
+
+    def test_empty_transcript_does_not_delete_resumable_audio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_path = Path(directory) / "case_transcript.txt"
+            raw_path = Path(directory) / "case_transcript_audio.raw"
+            start_path = Path(directory) / "case_transcript_audio.start.txt"
+            recording_start = datetime(2026, 8, 12, 12, 0, 0, tzinfo=timezone.utc)
+            output_path.write_text("", encoding="utf-8")
+            raw_contents = b"\x00\x00" * transcript.SAMPLE_RATE
+            raw_path.write_bytes(raw_contents)
+            transcript.write_recording_start(start_path, recording_start)
+
+            entries, loaded_start, committed_through = (
+                transcript.load_existing_capture_state(
+                    output_path,
+                    raw_path,
+                    start_path,
+                )
+            )
+
+            self.assertEqual([], entries)
+            self.assertEqual(recording_start, loaded_start)
+            self.assertEqual(recording_start + timedelta(seconds=1), committed_through)
+            self.assertEqual(raw_contents, raw_path.read_bytes())
+            self.assertTrue(start_path.exists())
+
+    def test_silence_watchdog_warns_once_and_recovers(self):
+        watchdog = transcript.AudioSilenceWatchdog(threshold=0.01, warning_seconds=30.0)
+        self.assertEqual([], watchdog.update(0.0, 10.0))
+        self.assertEqual([("AUDIO_SILENT", ("30.0",))], watchdog.update(0.0, 40.0))
+        self.assertEqual([], watchdog.update(0.0, 50.0))
+        self.assertEqual([("AUDIO_RECOVERED", ())], watchdog.update(0.02, 51.0))
+        self.assertEqual([], watchdog.update(0.02, 52.0))
+
+    def test_device_selection_resolves_stable_name(self):
+        fake_sounddevice = SimpleNamespace(query_devices=lambda: [
+            {"name": "Speaker", "max_input_channels": 0},
+            {"name": "Clinical USB Mic", "max_input_channels": 1},
+        ])
+        self.assertEqual(1, transcript.resolve_input_device(fake_sounddevice, "Clinical USB Mic"))
+        with self.assertRaises(ValueError):
+            transcript.resolve_input_device(fake_sounddevice, "Disconnected Mic")
+
+    def test_live_context_uses_configured_window_above_ten_seconds(self):
+        self.assertEqual(10.0, transcript.resolve_live_window_seconds(5.0))
+        self.assertEqual(10.0, transcript.resolve_live_window_seconds(10.0))
+        self.assertEqual(30.0, transcript.resolve_live_window_seconds(30.0))
+        self.assertEqual(60.0, transcript.resolve_live_window_seconds(60.0))
+
+    def test_live_context_rejects_unsafe_values(self):
+        for value in (0.0, -1.0, 120.01, float("nan"), float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    transcript.resolve_live_window_seconds(value)
+
+    def test_repeated_silence_hallucinations_are_rejected(self):
+        repeated = [
+            f"[2026-08-12T12:{minute:02d}:00.000] you"
+            for minute in range(10)
+        ]
+        ordinary = [
+            "[2026-08-12T12:00:00.000] This is a live transcript test.",
+            "[2026-08-12T12:00:03.000] Three tissue regions are present.",
+        ]
+
+        self.assertTrue(transcript.has_suspicious_transcript_repetition(repeated))
+        self.assertFalse(transcript.has_suspicious_transcript_repetition(ordinary))
+
+    def test_structural_loop_detector_rejects_repeated_three_grams(self):
+        repeated = " ".join(["and system"] * 40)
+
+        self.assertTrue(transcript.looks_like_structural_repetition_loop(repeated))
+
+    def test_structural_loop_detector_keeps_normal_pathology_sentence(self):
+        ordinary = (
+            "The lymph node shows reactive follicular hyperplasia with polarized "
+            "germinal centers and no evidence of metastatic carcinoma or lymphoma."
+        )
+
+        self.assertFalse(transcript.looks_like_structural_repetition_loop(ordinary))
+
+    def test_structural_loop_detector_ignores_short_repetition(self):
+        self.assertFalse(
+            transcript.looks_like_structural_repetition_loop("yes yes yes")
+        )
+
+    def test_structural_loop_filter_is_wired_to_live_and_final_paths(self):
+        loop_text = " ".join(["and system"] * 40)
+        segment = SimpleNamespace(
+            start=0.0,
+            end=1.0,
+            text=loop_text,
+            avg_logprob=0.0,
+            no_speech_prob=0.0,
+            compression_ratio=1.0,
+            words=[],
+        )
+        model = SimpleNamespace(
+            transcribe=lambda *args, **kwargs: (
+                [segment],
+                SimpleNamespace(duration=1.0),
+            )
+        )
+        recording_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
+
+        live_segments = transcript.transcribe_audio_segments(
+            model,
+            np.full(transcript.SAMPLE_RATE, 0.01, dtype=np.float32),
+            "en",
+            recording_start,
+            beam_size=2,
+            best_of=2,
+            previous_text=False,
+            strict_segment_filtering=False,
+        )
+        final_lines, segment_rows, word_rows = (
+            transcript.transcribe_saved_audio_with_timings(
+                model,
+                Path("capture.wav"),
+                "en",
+                recording_start,
+                beam_size=8,
+                best_of=8,
+                previous_text=True,
+            )
+        )
+
+        self.assertEqual([], live_segments)
+        self.assertEqual(([], [], []), (final_lines, segment_rows, word_rows))
+
+    def test_final_text_refinement_preserves_matching_live_timestamps(self):
+        live = [
+            "[2026-08-12T12:00:01.000] This is a live transcript test.",
+            "[2026-08-12T12:00:04.000] Three tissue regions are present.",
+        ]
+        final = [
+            "[2026-08-12T12:00:31.000] This is a live transcript test.",
+            "[2026-08-12T12:00:34.000] Three tissue regions are present.",
+        ]
+
+        resolved = transcript.preserve_matching_live_timestamps(final, live)
+
+        self.assertEqual(live, resolved)
+
+    def test_final_pass_keeps_voice_activity_filtering_enabled(self):
+        settings = transcript.build_transcribe_kwargs(
+            "en", beam_size=2, best_of=2, previous_text=True, final_pass=True
+        )
+
+        self.assertTrue(settings["vad_filter"])
+        self.assertIn("vad_parameters", settings)
+        self.assertGreaterEqual(settings["beam_size"], transcript.FINAL_PASS_MIN_BEAM_SIZE)
+        self.assertIn("Gleason", settings["hotwords"])
+        self.assertIn(settings["hotwords"], settings["initial_prompt"])
+        self.assertIsInstance(settings["temperature"], list)
+        self.assertEqual(
+            transcript.FINAL_REPETITION_PENALTY,
+            settings["repetition_penalty"],
+        )
+        self.assertEqual(0, settings["no_repeat_ngram_size"])
+
+    def test_live_preview_caps_expensive_decoding_settings(self):
+        settings = transcript.build_transcribe_kwargs(
+            "en", beam_size=8, best_of=8, previous_text=False, final_pass=False
+        )
+
+        self.assertEqual(transcript.LIVE_MAX_BEAM_SIZE, settings["beam_size"])
+        self.assertEqual(transcript.LIVE_MAX_BEST_OF, settings["best_of"])
+        self.assertEqual(2, settings["beam_size"])
+        self.assertEqual(2, settings["best_of"])
+        self.assertEqual(list(transcript.TRANSCRIPTION_TEMPERATURES), settings["temperature"])
+        self.assertNotIn("initial_prompt", settings)
+        self.assertEqual(
+            transcript.LIVE_REPETITION_PENALTY,
+            settings["repetition_penalty"],
+        )
+        self.assertEqual(
+            transcript.LIVE_NO_REPEAT_NGRAM_SIZE,
+            settings["no_repeat_ngram_size"],
+        )
+        self.assertEqual(
+            transcript.SEGMENT_COMPRESSION_RATIO_THRESHOLD,
+            settings["compression_ratio_threshold"],
+        )
+        self.assertEqual(
+            transcript.SEGMENT_AVG_LOGPROB_THRESHOLD,
+            settings["log_prob_threshold"],
+        )
+        self.assertEqual(
+            transcript.SEGMENT_NO_SPEECH_THRESHOLD,
+            settings["no_speech_threshold"],
+        )
+
+    def test_live_context_prompt_is_used_only_when_supplied(self):
+        settings = transcript.build_transcribe_kwargs(
+            "en",
+            beam_size=2,
+            best_of=2,
+            previous_text=False,
+            final_pass=False,
+            context_prompt="last committed words",
+        )
+
+        self.assertEqual("last committed words", settings["initial_prompt"])
+
+    def test_loud_short_window_survives_quiet_buffer_rms_gate(self):
+        audio = np.zeros(transcript.SAMPLE_RATE * 2, dtype=np.float32)
+        audio[:transcript.SAMPLE_RATE // 4] = 0.006
+
+        self.assertLess(transcript.audio_rms(audio), transcript.CHUNK_RMS_SILENCE_THRESHOLD)
+        self.assertGreater(
+            transcript.maximum_audio_window_rms(audio),
+            transcript.CHUNK_RMS_SILENCE_THRESHOLD,
+        )
+
+    def test_high_pass_removes_dc_and_attenuates_30_hz_rumble(self):
+        seconds = 2
+        sample_times = np.arange(transcript.SAMPLE_RATE * seconds) / transcript.SAMPLE_RATE
+        low_frequency = 0.1 * np.sin(2 * np.pi * 30 * sample_times) + 0.2
+        speech_frequency = 0.1 * np.sin(2 * np.pi * 500 * sample_times) + 0.2
+
+        filtered_low = transcript.remove_dc_and_high_pass(low_frequency.astype(np.float32))
+        filtered_speech = transcript.remove_dc_and_high_pass(speech_frequency.astype(np.float32))
+
+        self.assertLess(abs(float(filtered_low.mean())), 0.001)
+        self.assertLess(
+            transcript.audio_rms(filtered_low),
+            transcript.audio_rms(low_frequency) * 0.25,
+        )
+        self.assertGreater(
+            transcript.audio_rms(filtered_speech),
+            transcript.audio_rms(speech_frequency - speech_frequency.mean()) * 0.9,
+        )
+
+    def test_slow_agc_boosts_quiet_speech_without_exceeding_eight_times_gain(self):
+        sample_times = np.arange(transcript.SAMPLE_RATE) / transcript.SAMPLE_RATE
+        quiet_speech = (0.005 * np.sin(2 * np.pi * 500 * sample_times)).astype(np.float32)
+
+        adjusted = transcript.apply_slow_agc(quiet_speech)
+
+        self.assertGreater(transcript.audio_rms(adjusted), transcript.audio_rms(quiet_speech) * 6)
+        self.assertLessEqual(float(np.max(np.abs(adjusted))), float(np.max(np.abs(quiet_speech))) * 8.001)
+        self.assertLessEqual(float(np.max(np.abs(adjusted))), 1.0)
+
+    def test_live_conditioning_does_not_mutate_source_audio(self):
+        sample_times = np.arange(transcript.SAMPLE_RATE) / transcript.SAMPLE_RATE
+        raw_audio = (0.02 * np.sin(2 * np.pi * 500 * sample_times) + 0.1).astype(np.float32)
+        original = raw_audio.copy()
+
+        conditioned = transcript.condition_live_audio(raw_audio)
+
+        np.testing.assert_array_equal(original, raw_audio)
+        self.assertLess(abs(float(conditioned.mean())), 0.001)
+        self.assertFalse(np.array_equal(original, conditioned))
+
+    def test_live_transcribe_passes_conditioned_copy_to_model(self):
+        captured = {}
+
+        class RecordingModel:
+            def transcribe(self, audio, **kwargs):
+                captured["audio"] = audio.copy()
+                return [], None
+
+        sample_times = np.arange(transcript.SAMPLE_RATE) / transcript.SAMPLE_RATE
+        raw_audio = (0.02 * np.sin(2 * np.pi * 500 * sample_times) + 0.1).astype(np.float32)
+        original = raw_audio.copy()
+
+        transcript.transcribe_audio_segments(
+            RecordingModel(),
+            raw_audio,
+            "en",
+            datetime.now(timezone.utc),
+            beam_size=2,
+            best_of=2,
+            previous_text=False,
+        )
+
+        np.testing.assert_array_equal(original, raw_audio)
+        self.assertLess(abs(float(captured["audio"].mean())), 0.001)
+        self.assertFalse(np.array_equal(original, captured["audio"]))
+
+    def test_wave_capture_keeps_unconditioned_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            wave_path = Path(directory) / "raw-capture.wav"
+            raw_audio = np.linspace(-0.25, 0.25, 1000, dtype=np.float32).reshape(-1, 1)
+            expected_bytes = transcript.pcm16_audio_bytes(raw_audio)
+
+            transcript.condition_live_audio(raw_audio[:, 0])
+            transcript.append_wave_audio(wave_path, raw_audio)
+
+            with wave.open(str(wave_path), "rb") as handle:
+                self.assertEqual(expected_bytes, handle.readframes(handle.getnframes()))
+
+    def test_clipping_watchdog_reports_point_one_percent_once(self):
+        watchdog = transcript.AudioClippingWatchdog()
+        audio = np.zeros(10000, dtype=np.float32)
+        audio[:10] = 1.0
+
+        self.assertAlmostEqual(0.1, watchdog.update(audio), places=6)
+        self.assertIsNone(watchdog.update(audio))
+
+    def test_clipping_watchdog_ignores_subthreshold_clipping(self):
+        audio = np.zeros(10000, dtype=np.float32)
+        audio[:9] = -1.0
+
+        self.assertIsNone(transcript.AudioClippingWatchdog().update(audio))
+
+    def test_decode_hotwords_are_capped(self):
+        settings = transcript.build_transcribe_kwargs(
+            "en",
+            beam_size=2,
+            best_of=2,
+            previous_text=False,
+            final_pass=False,
+            hotwords=", ".join(f"term-{index}" for index in range(20)),
+        )
+
+        self.assertEqual(transcript.MAX_HOTWORD_TERMS, len(settings["hotwords"].split(",")))
+
+    def test_clinical_large_v3_uses_fast_english_live_preview(self):
+        candidates = transcript.choose_live_model_candidates("large-v3", "en")
+
+        self.assertEqual("distil-small.en", candidates[0])
+        self.assertIn("large-v3", candidates)
+
+    def test_int8_float32_model_load_falls_back_to_int8(self):
+        attempts = []
+        expected_model = object()
+
+        def model_factory(model_name, *, device, compute_type):
+            attempts.append((model_name, device, compute_type))
+            if compute_type == "int8_float32":
+                raise RuntimeError("unsupported compute type")
+            return expected_model
+
+        model, compute_type = transcript.load_cpu_whisper_model(
+            model_factory,
+            "example-model",
+            "int8_float32",
+        )
+
+        self.assertIs(expected_model, model)
+        self.assertEqual("int8", compute_type)
+        self.assertEqual(
+            [
+                ("example-model", "cpu", "int8_float32"),
+                ("example-model", "cpu", "int8"),
+            ],
+            attempts,
+        )
+
+    def test_final_transcript_exports_segment_and_word_timing_rows(self):
+        recording_start = datetime(
+            2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))
+        )
+        segment = SimpleNamespace(
+            start=1.25,
+            end=2.75,
+            text=" lymph node negative",
+            avg_logprob=0.0,
+            no_speech_prob=0.0,
+            compression_ratio=1.0,
+            words=[
+                SimpleNamespace(start=1.25, end=1.80, word=" lymph"),
+                SimpleNamespace(start=1.85, end=2.75, word=" node negative"),
+            ],
+        )
+        model = SimpleNamespace(transcribe=lambda *args, **kwargs: ([segment], None))
+
+        lines, segment_rows, word_rows = transcript.transcribe_saved_audio_with_timings(
+            model,
+            Path("capture.wav"),
+            "en",
+            recording_start,
+            beam_size=8,
+            best_of=8,
+            previous_text=True,
+        )
+
+        self.assertEqual("[2026-08-20T12:00:01.250] lymph node negative", lines[0])
+        self.assertEqual(1250, segment_rows[0]["start_ms"])
+        self.assertEqual(2750, segment_rows[0]["end_ms"])
+        self.assertTrue(segment_rows[0]["start_utc"].endswith("Z"))
+        self.assertEqual([1250, 1850], [row["start_ms"] for row in word_rows])
+
+    def test_generated_wav_keeps_click_inside_spoken_word_timing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            audio_path = Path(directory) / "alignment.wav"
+            transcript.initialize_incremental_wave(audio_path)
+            transcript.append_wave_bytes(
+                audio_path, b"\x00\x00" * transcript.SAMPLE_RATE * 2
+            )
+            origin = datetime(2026, 8, 25, 20, 0, 0, tzinfo=timezone.utc)
+            word = SimpleNamespace(start=1.0, end=1.2, word=" margin")
+            segment = SimpleNamespace(
+                start=0.8, end=1.4, text=" margin",
+                avg_logprob=0.0, no_speech_prob=0.0, compression_ratio=1.0,
+                words=[word],
+            )
+            model = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+                [segment], SimpleNamespace(duration=2.0)
+            ))
+            progress = []
+
+            _, _, word_rows = transcript.transcribe_saved_audio_with_timings(
+                model, audio_path, "en", origin, 8, 8, True,
+                progress_callback=lambda done, total: progress.append((done, total)),
+            )
+
+            click_elapsed_ms = 1100
+            self.assertLessEqual(word_rows[0]["start_ms"], click_elapsed_ms)
+            self.assertGreaterEqual(word_rows[0]["end_ms"], click_elapsed_ms)
+            self.assertEqual((0.0, 2.0), progress[0])
+            self.assertEqual((2.0, 2.0), progress[-1])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start live Whisper transcription and save transcript inside a demo session folder.
+# Start live Whisper transcription, save raw mic audio, and regenerate a final
+# transcript from the full recording when capture stops.
 #
 # Usage:
 #   ./scripts/start_live_transcript.sh <session_dir> [model] [language] [options]
 # Example:
-#   ./scripts/start_live_transcript.sh ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 3.5 --beam-size 5 --best-of 5 --previous-text true
+#   ./scripts/start_live_transcript.sh ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 10 --beam-size 5 --best-of 5 --previous-text true
 
 usage() {
   cat <<EOF
@@ -16,16 +17,21 @@ Starts live microphone transcription for an existing demo session directory.
 
 Arguments:
   session_dir   Existing demo session folder created by prepare_demo.sh
-  model         Optional faster-whisper model (default: large-v3)
+  model         Optional faster-whisper model (default: large-v3, recommended for accuracy)
   language      Optional language code, or auto (default: en)
-  --chunk-seconds N   Optional chunk size in seconds
+  --device D          Optional microphone input device index or name
+  --chunk-seconds N   Optional rolling live context in seconds (minimum 10)
   --compute-type T    Optional compute type
   --beam-size N       Optional beam size
   --best-of N         Optional best_of value
   --previous-text V   Optional true/false for previous text context
 
+During recording, the transcript file is updated live.
+When recording stops, the script saves a companion WAV file and rewrites the
+transcript from the full captured audio for higher long-form accuracy.
+
 Example:
-  $0 ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 3.5 --beam-size 5 --best-of 5 --previous-text true
+  $0 ./demo-output/20260327_101500_caseA large-v3 en --chunk-seconds 10 --beam-size 5 --best-of 5 --previous-text true
 EOF
 }
 
@@ -61,7 +67,7 @@ EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --chunk-seconds|--compute-type|--beam-size|--best-of|--previous-text)
+    --device|--chunk-seconds|--compute-type|--beam-size|--best-of|--previous-text)
       if [[ $# -lt 2 ]]; then
         echo "Error: missing value for $1" >&2
         exit 1
@@ -95,7 +101,7 @@ if [[ ! -f "${VENV_DIR}/bin/activate" ]]; then
   echo "  python3 -m venv .venv-whisper" >&2
   echo "  source .venv-whisper/bin/activate" >&2
   echo "  python -m pip install --upgrade pip" >&2
-  echo "  python -m pip install faster-whisper sounddevice numpy" >&2
+  echo "  python -m pip install -r requirements-whisper.txt" >&2
   exit 1
 fi
 
@@ -117,7 +123,7 @@ echo
 cd "$REPO_ROOT"
 source "${VENV_DIR}/bin/activate"
 
-python "$PYTHON_SCRIPT" \
+exec python -u "$PYTHON_SCRIPT" \
   --output "$TRANSCRIPT_PATH" \
   --model "$MODEL" \
   --language "$LANGUAGE" \
