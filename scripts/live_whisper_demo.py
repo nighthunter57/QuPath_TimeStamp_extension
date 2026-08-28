@@ -4,7 +4,9 @@
 import argparse
 import csv
 import gc
+import importlib.util
 import math
+import platform
 import queue
 import re
 import signal
@@ -13,6 +15,7 @@ import sys
 import threading
 import time as time_module
 import wave
+from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional, Sequence
@@ -75,7 +78,14 @@ KNOWN_TRAILING_HALLUCINATION_PHRASES = frozenset({
 KNOWN_TRAILING_HALLUCINATION_PREFIXES = (
     "subtitles by ",
 )
-MAX_HOTWORD_TERMS = 15
+MAX_HOTWORD_TERMS = 32
+PARAKEET_MLX_MODEL = "mlx-community/parakeet-tdt-0.6b-v3"
+PARAKEET_STREAM_CONTEXT = (256, 64)
+PARAKEET_SUPPORTED_LANGUAGES = frozenset({
+    "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hr",
+    "hu", "it", "lt", "lv", "mt", "nl", "pl", "pt", "ro", "ru", "sk",
+    "sl", "sv", "uk",
+})
 FAST_INITIAL_LIVE_WINDOW_SECONDS = 0.5
 FAST_LIVE_STEP_SECONDS = 1.0
 LOCAL_AGREEMENT_PROMPT_WORDS = 32
@@ -88,6 +98,12 @@ BACKLOG_WARNING_SECONDS = 6.0
 RESUME_GAP_TOLERANCE_SECONDS = 0.25
 AUDIO_CLOCK_DRIFT_TOLERANCE_SECONDS = 1.0
 SILENCE_WRITE_CHUNK_FRAMES = SAMPLE_RATE * 30
+SNR_MIN_CLASS_SAMPLES = 3
+SNR_MAX_HISTORY_SAMPLES = 120
+SNR_SPEECH_TO_NOISE_RATIO = 2.0
+SNR_RECOMMENDED_DB = 8.0
+SNR_CRITICAL_DB = 3.0
+SNR_ANALYSIS_WINDOW_SECONDS = 0.5
 LIVE_VAD_PARAMETERS = {
     "threshold": 0.5,
     "neg_threshold": 0.35,
@@ -98,7 +114,8 @@ LIVE_VAD_PARAMETERS = {
 DEFAULT_PATHOLOGY_HOTWORDS = (
     "Gleason, mitotic figures, pleomorphism, Ki-67, HER2, "
     "immunohistochemistry, lymphovascular invasion, perineural invasion, "
-    "adenocarcinoma, squamous cell carcinoma, margin, malignancy"
+    "adenocarcinoma, squamous cell carcinoma, ductal carcinoma in situ, "
+    "reflex in situ hybridization, margin, malignancy, HULA Lab, QuPath, TimeStamp"
 )
 PROTOCOL_FIELDS = {
     "DEVICE": 2,
@@ -142,6 +159,17 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output", help="Transcript output path")
     parser.add_argument("--model", default="large-v3", help="faster-whisper model name")
+    parser.add_argument(
+        "--live-engine",
+        choices=("auto", "parakeet-mlx", "whisper"),
+        default="auto",
+        help="Live ASR engine; auto prefers Parakeet MLX on supported Apple Silicon systems",
+    )
+    parser.add_argument(
+        "--parakeet-model",
+        default=PARAKEET_MLX_MODEL,
+        help="Hugging Face Parakeet MLX model used by the Metal live engine",
+    )
     parser.add_argument("--language", default="en", help="Language code, or 'auto' for detection")
     parser.add_argument(
         "--chunk-seconds",
@@ -494,13 +522,18 @@ def choose_live_model_candidates(final_model_name: str, language: Optional[str])
         add_candidate("small")
     elif normalized_model.startswith(("small", "small.en")):
         if normalized_language == "en":
-            add_candidate("distil-small.en")
+            add_candidate("small.en")
         add_candidate(final_model_name)
+        add_candidate("distil-small.en" if normalized_language == "en" else "small")
         add_candidate("distil-large-v2")
         add_candidate("large-v3")
     else:
-        add_candidate("distil-small.en" if normalized_language == "en" else "small")
+        # small.en is the live default for English. Measured on the Phase 0
+        # fixture by scripts/bench_live_models.py: 19.27% WER at 2.37 s per
+        # 20-second window, against distil-small.en's 63.97% at 2.17 s. The
+        # distilled model is kept below it only as a faster degraded fallback.
         add_candidate("small.en" if normalized_language == "en" else "small")
+        add_candidate("distil-small.en" if normalized_language == "en" else "small")
         add_candidate(final_model_name)
         add_candidate("distil-large-v2")
         add_candidate("large-v3")
@@ -514,6 +547,45 @@ def compute_type_candidates(requested_compute_type: str) -> list[str]:
     if requested.lower() == "int8_float32":
         candidates.append(COMPUTE_TYPE_FALLBACK)
     return candidates
+
+
+def parakeet_live_is_supported(
+    language: Optional[str],
+    system_name: Optional[str] = None,
+    machine_name: Optional[str] = None,
+    package_available: Optional[bool] = None,
+) -> bool:
+    """Return whether the native MLX live backend can serve this session."""
+    resolved_system = system_name if system_name is not None else platform.system()
+    resolved_machine = machine_name if machine_name is not None else platform.machine()
+    resolved_language = (language or "").strip().lower()
+    if package_available is None:
+        package_available = importlib.util.find_spec("parakeet_mlx") is not None
+    return (
+        resolved_system == "Darwin"
+        and resolved_machine == "arm64"
+        and resolved_language in PARAKEET_SUPPORTED_LANGUAGES
+        and package_available
+    )
+
+
+def resolve_live_engine(
+    requested_engine: str,
+    language: Optional[str],
+    system_name: Optional[str] = None,
+    machine_name: Optional[str] = None,
+    package_available: Optional[bool] = None,
+) -> str:
+    """Resolve the engine without auto-selecting an unvalidated quality regression."""
+    requested = requested_engine.strip().lower()
+    if requested == "parakeet-mlx" and parakeet_live_is_supported(
+        language,
+        system_name,
+        machine_name,
+        package_available,
+    ):
+        return "parakeet-mlx"
+    return "whisper"
 
 
 def load_cpu_whisper_model(
@@ -533,6 +605,206 @@ def load_cpu_whisper_model(
         except Exception as exc:
             errors.append(f"{candidate_compute_type}: {exc}")
     raise RuntimeError(" | ".join(errors))
+
+
+@dataclass(frozen=True)
+class LiveTranscriptionUpdate:
+    committed_words: tuple[tuple[datetime, datetime, str], ...]
+    provisional_words: tuple[tuple[datetime, datetime, str], ...]
+    committed_through: Optional[datetime]
+
+
+class LiveTranscriber:
+    """Common interface for incremental live ASR engines."""
+
+    engine_name = "unknown"
+    model_name = "unknown"
+
+    def accept_audio(
+        self,
+        audio,
+        chunk_start_time: datetime,
+        force: bool = False,
+        context_prompt: Optional[str] = None,
+    ) -> LiveTranscriptionUpdate:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        return None
+
+
+class WhisperLiveTranscriber(LiveTranscriber):
+    """LocalAgreement-backed live adapter for faster-whisper."""
+
+    engine_name = "whisper"
+
+    def __init__(
+        self,
+        model,
+        model_name: str,
+        language: Optional[str],
+        beam_size: int,
+        best_of: int,
+        hotwords: Optional[str],
+    ) -> None:
+        self.model = model
+        self.model_name = model_name
+        self.language = language
+        self.beam_size = beam_size
+        self.best_of = best_of
+        self.hotwords = hotwords
+        self.agreement = LocalAgreementState()
+        self.has_emission = False
+
+    def accept_audio(
+        self,
+        audio,
+        chunk_start_time: datetime,
+        force: bool = False,
+        context_prompt: Optional[str] = None,
+    ) -> LiveTranscriptionUpdate:
+        segments = transcribe_audio_segments(
+            self.model,
+            audio,
+            self.language,
+            chunk_start_time,
+            self.beam_size,
+            self.best_of,
+            False,
+            allow_low_energy_short_segments=not self.has_emission,
+            strict_segment_filtering=True,
+            hotwords=self.hotwords,
+            context_prompt=context_prompt,
+        )
+        newly_committed, provisional_words = self.agreement.update(
+            decoded_segments_to_timed_words(segments),
+            force=force,
+        )
+        self.has_emission = bool(self.agreement.committed_words or provisional_words)
+        committed_through = newly_committed[-1][1] if newly_committed else None
+        if force and not provisional_words and committed_through is None:
+            committed_through = chunk_start_time + timedelta(seconds=len(audio) / SAMPLE_RATE)
+        return LiveTranscriptionUpdate(
+            tuple(self.agreement.committed_words),
+            tuple(provisional_words),
+            committed_through,
+        )
+
+
+def parakeet_tokens_to_timed_words(
+    tokens: Sequence[object],
+    stream_start_time: datetime,
+) -> list[tuple[datetime, datetime, str]]:
+    """Convert tokenizer pieces to monotonic word timings for transcript display."""
+    resolved: list[tuple[datetime, datetime, str]] = []
+    current_pieces: list[str] = []
+    current_start = 0.0
+    current_end = 0.0
+    timeline_offset = 0.0
+    previous_start = 0.0
+    previous_end = 0.0
+
+    def flush_word() -> None:
+        nonlocal current_pieces
+        text = "".join(current_pieces).strip()
+        if text:
+            resolved.append((
+                stream_start_time + timedelta(seconds=current_start),
+                stream_start_time + timedelta(seconds=max(current_start, current_end)),
+                text,
+            ))
+        current_pieces = []
+
+    for token in tokens:
+        piece = str(getattr(token, "text", ""))
+        if not piece:
+            continue
+        raw_start = max(0.0, float(getattr(token, "start", 0.0)))
+        raw_end = max(raw_start, float(getattr(token, "end", raw_start)))
+        candidate_start = raw_start + timeline_offset
+        if candidate_start + 0.05 < previous_start:
+            timeline_offset = previous_end
+            candidate_start = raw_start + timeline_offset
+        candidate_end = max(candidate_start, raw_end + timeline_offset)
+        previous_start = candidate_start
+        previous_end = max(previous_end, candidate_end)
+
+        if piece[:1].isspace() and current_pieces:
+            flush_word()
+        if not current_pieces:
+            current_start = candidate_start
+        current_end = candidate_end
+        current_pieces.append(piece)
+    flush_word()
+    return resolved
+
+
+class ParakeetMlxLiveTranscriber(LiveTranscriber):
+    """Native Apple-Silicon streaming adapter for parakeet-mlx."""
+
+    engine_name = "parakeet-mlx"
+
+    def __init__(
+        self,
+        model_name: str = PARAKEET_MLX_MODEL,
+        model_loader=None,
+        array_factory=None,
+    ) -> None:
+        if model_loader is None:
+            from parakeet_mlx import from_pretrained
+
+            model_loader = from_pretrained
+        if array_factory is None:
+            import mlx.core as mx
+
+            array_factory = mx.array
+        self.model_name = model_name
+        self.model = model_loader(model_name)
+        self.array_factory = array_factory
+        self.stream_context = self.model.transcribe_stream(
+            context_size=PARAKEET_STREAM_CONTEXT,
+        )
+        self.stream = self.stream_context.__enter__()
+        self.stream_start_time: Optional[datetime] = None
+        self.closed = False
+
+    def accept_audio(
+        self,
+        audio,
+        chunk_start_time: datetime,
+        force: bool = False,
+        context_prompt: Optional[str] = None,
+    ) -> LiveTranscriptionUpdate:
+        del context_prompt
+        if self.stream_start_time is None:
+            self.stream_start_time = chunk_start_time
+        if len(audio):
+            conditioned = condition_live_audio(audio)
+            self.stream.add_audio(self.array_factory(conditioned))
+        finalized_tokens = list(self.stream.finalized_tokens)
+        draft_tokens = list(self.stream.draft_tokens)
+        if force:
+            finalized_tokens.extend(draft_tokens)
+            draft_tokens = []
+        committed_words = parakeet_tokens_to_timed_words(
+            finalized_tokens,
+            self.stream_start_time,
+        )
+        provisional_words = parakeet_tokens_to_timed_words(
+            draft_tokens,
+            self.stream_start_time,
+        )
+        committed_through = committed_words[-1][1] if committed_words else None
+        return LiveTranscriptionUpdate(
+            tuple(committed_words),
+            tuple(provisional_words),
+            committed_through,
+        )
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.stream_context.__exit__(None, None, None)
 
 
 def audio_rms(audio) -> float:
@@ -1222,6 +1494,57 @@ def has_suspicious_transcript_repetition(lines: Sequence[str]) -> bool:
     return most_frequent_count >= 4 and most_frequent_count / len(normalized_lines) >= 0.4
 
 
+def drop_repeated_final_segments(
+    lines: Sequence[str],
+    segment_rows: Sequence[dict],
+    word_rows: Sequence[dict],
+) -> tuple[list[str], list[dict], list[dict], int]:
+    """Keep the first offending segment instead of discarding a whole final pass."""
+    resolved_lines = list(lines)
+    resolved_segment_rows = list(segment_rows)
+    resolved_word_rows = list(word_rows)
+    if not has_suspicious_transcript_repetition(resolved_lines):
+        return resolved_lines, resolved_segment_rows, resolved_word_rows, 0
+
+    normalized = []
+    for line in resolved_lines:
+        parsed = parse_transcript_line(line)
+        text = parsed[1] if parsed is not None else line
+        normalized.append(normalize_transcript_text(text))
+    counts = {text: normalized.count(text) for text in set(normalized) if text}
+    offenders = {
+        text for text, count in counts.items()
+        if count >= 4 and count / max(1, len(normalized)) >= 0.4
+    }
+    seen: set[str] = set()
+    kept_positions = []
+    for position, text in enumerate(normalized):
+        if text in offenders and text in seen:
+            continue
+        kept_positions.append(position)
+        seen.add(text)
+
+    kept_lines = [resolved_lines[position] for position in kept_positions]
+    kept_segment_rows = [
+        resolved_segment_rows[position]
+        for position in kept_positions
+        if position < len(resolved_segment_rows)
+    ]
+    kept_segment_indexes = {
+        row.get("segment_index") for row in kept_segment_rows
+    }
+    kept_word_rows = [
+        row for row in resolved_word_rows
+        if row.get("segment_index") in kept_segment_indexes
+    ]
+    return (
+        kept_lines,
+        kept_segment_rows,
+        kept_word_rows,
+        len(resolved_lines) - len(kept_lines),
+    )
+
+
 def preserve_matching_live_timestamps(
     final_lines: Sequence[str],
     live_lines: Sequence[str],
@@ -1283,6 +1606,109 @@ class AudioSilenceWatchdog:
         return messages
 
 
+class SignalToNoiseEstimator:
+    """Estimate signal-to-noise ratio from VAD-classified speech and silence levels."""
+
+    def __init__(
+        self,
+        min_class_samples: int = SNR_MIN_CLASS_SAMPLES,
+        max_history_samples: int = SNR_MAX_HISTORY_SAMPLES,
+    ) -> None:
+        self.min_class_samples = min_class_samples
+        self.max_history_samples = max_history_samples
+        self.noise_levels: list[float] = []
+        self.speech_levels: list[float] = []
+
+    @staticmethod
+    def _median(values: list[float]) -> float:
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+    def noise_floor(self) -> Optional[float]:
+        if not self.noise_levels:
+            return None
+        return self._median(self.noise_levels)
+
+    def update(self, rms: float, vad_active: Optional[bool] = None) -> tuple[Optional[float], str]:
+        level = max(0.0, float(rms))
+        if vad_active is None:
+            noise_floor = self.noise_floor()
+            speech_gate = CHUNK_RMS_SILENCE_THRESHOLD
+            if noise_floor is not None:
+                speech_gate = max(speech_gate, noise_floor * SNR_SPEECH_TO_NOISE_RATIO)
+            vad_active = level >= speech_gate
+        history = self.speech_levels if vad_active else self.noise_levels
+        history.append(level)
+        del history[:-self.max_history_samples]
+        return self.current()
+
+    def current(self) -> tuple[Optional[float], str]:
+        if (
+            len(self.noise_levels) < self.min_class_samples
+            or len(self.speech_levels) < self.min_class_samples
+        ):
+            return None, "calibrating"
+        noise_floor = max(1e-9, self._median(self.noise_levels))
+        speech_level = max(noise_floor, self._median(self.speech_levels))
+        snr_db = max(0.0, min(60.0, 20.0 * math.log10(speech_level / noise_floor)))
+        if snr_db < SNR_CRITICAL_DB:
+            return snr_db, "critical"
+        if snr_db < SNR_RECOMMENDED_DB:
+            return snr_db, "low"
+        return snr_db, "good"
+
+
+def contains_speech(audio) -> bool:
+    """Return whether Silero VAD finds speech in an analysis window."""
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    return bool(get_speech_timestamps(
+        audio,
+        VadOptions(
+            threshold=LIVE_VAD_PARAMETERS["threshold"],
+            neg_threshold=LIVE_VAD_PARAMETERS["neg_threshold"],
+            min_speech_duration_ms=100,
+            min_silence_duration_ms=100,
+            speech_pad_ms=0,
+        ),
+        sampling_rate=SAMPLE_RATE,
+    ))
+
+
+class SignalQualityAnalyzer:
+    """Buffer audio and update SNR only after real voice-activity classification."""
+
+    def __init__(self, speech_detector=contains_speech) -> None:
+        import numpy as np
+
+        self.estimator = SignalToNoiseEstimator()
+        self.speech_detector = speech_detector
+        self.window_samples = round(SNR_ANALYSIS_WINDOW_SECONDS * SAMPLE_RATE)
+        self.pending_audio = np.empty(0, dtype=np.float32)
+
+    def update(self, audio) -> Optional[tuple[Optional[float], str]]:
+        import numpy as np
+
+        self.pending_audio = np.concatenate((self.pending_audio, audio.astype("float32", copy=False)))
+        result = None
+        while self.pending_audio.shape[0] >= self.window_samples:
+            window = self.pending_audio[:self.window_samples]
+            self.pending_audio = self.pending_audio[self.window_samples:]
+            result = self.estimator.update(
+                audio_rms(window),
+                vad_active=self.speech_detector(window),
+            )
+        return result
+
+
+def emit_signal_quality(result: tuple[Optional[float], str]) -> None:
+    snr_db, state = result
+    emit_protocol_message("AUDIO_LEVEL", f"{snr_db:.2f}" if snr_db is not None else "-1", state)
+
+
 def resolve_or_fallback_input_device(sd, device_arg: Optional[str]) -> Optional[int]:
     try:
         return resolve_input_device(sd, device_arg)
@@ -1296,7 +1722,8 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
     stop_event = threading.Event()
     watchdog = AudioSilenceWatchdog()
     clipping_watchdog = AudioClippingWatchdog()
-    maximum_rms = 0.0
+    signal_analyzer = SignalQualityAnalyzer()
+    signal_queue = queue.Queue()
     last_meter_emit = 0.0
 
     def request_check_stop(signum, frame) -> None:
@@ -1305,21 +1732,16 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
 
     def audio_check_callback(indata, frames, time_info, status) -> None:
         del frames, time_info
-        nonlocal maximum_rms, last_meter_emit
         if status:
             print(f"Audio status: {status}", file=sys.stderr, flush=True)
         rms = audio_rms(indata[:, 0])
         clipped_percent = clipping_watchdog.update(indata[:, 0])
         if clipped_percent is not None:
             emit_protocol_message("AUDIO_CLIPPING", f"{clipped_percent:.3f}")
-        maximum_rms = max(maximum_rms, rms)
         now_monotonic = time_module.monotonic()
-        if now_monotonic - last_meter_emit >= METER_EMIT_INTERVAL_SECONDS:
-            state = "hearing" if rms >= CHUNK_RMS_SILENCE_THRESHOLD else "quiet"
-            emit_protocol_message("AUDIO_LEVEL", f"{rms:.6f}", state)
-            last_meter_emit = now_monotonic
         for kind, fields in watchdog.update(rms, now_monotonic):
             emit_protocol_message(kind, *fields)
+        signal_queue.put(indata[:, 0].copy())
 
     signal.signal(signal.SIGINT, request_check_stop)
     signal.signal(signal.SIGTERM, request_check_stop)
@@ -1334,6 +1756,16 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
         ):
             emit_protocol_message("AUDIO_CHECK_READY")
             while not stop_event.wait(0.05):
+                while True:
+                    try:
+                        signal_audio = signal_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    result = signal_analyzer.update(signal_audio)
+                    now_monotonic = time_module.monotonic()
+                    if result is not None and now_monotonic - last_meter_emit >= METER_EMIT_INTERVAL_SECONDS:
+                        emit_signal_quality(result)
+                        last_meter_emit = now_monotonic
                 if check_seconds > 0 and time_module.monotonic() - started >= check_seconds:
                     break
     except KeyboardInterrupt:
@@ -1342,8 +1774,12 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
         print(f"Error: {explain_portaudio_error(exc)}", file=sys.stderr, flush=True)
         return 1
 
-    result = "hearing" if maximum_rms >= CHUNK_RMS_SILENCE_THRESHOLD else "quiet"
-    emit_protocol_message("AUDIO_CHECK_RESULT", f"{maximum_rms:.6f}", result)
+    snr_db, result = signal_analyzer.estimator.current()
+    emit_protocol_message(
+        "AUDIO_CHECK_RESULT",
+        f"{snr_db:.2f}" if snr_db is not None else "-1",
+        result,
+    )
     return 0
 
 
@@ -1404,7 +1840,20 @@ def finalize_existing_capture(
                     args.hotwords,
                     report_finalization_progress,
                 )
-                if final_lines and not has_suspicious_transcript_repetition(final_lines):
+                (
+                    final_lines,
+                    segment_rows,
+                    word_rows,
+                    dropped_repeated_segments,
+                ) = drop_repeated_final_segments(final_lines, segment_rows, word_rows)
+                if dropped_repeated_segments:
+                    print(
+                        "Warning: dropped "
+                        f"{dropped_repeated_segments} repeated final segment(s); "
+                        "the remaining offline transcript was preserved.",
+                        file=sys.stderr,
+                    )
+                if final_lines:
                     existing_lines = []
                     if out_path.exists():
                         existing_text = out_path.read_text(encoding="utf-8")
@@ -1424,12 +1873,6 @@ def finalize_existing_capture(
                     write_lines(out_path, final_lines)
                     finalization_result = "final"
                     print(f"Final transcript regenerated from full audio: {out_path}")
-                elif final_lines:
-                    finalization_result = "live-fallback-repetition"
-                    print(
-                        "Warning: final offline transcript contained suspicious repetition; keeping live transcript.",
-                        file=sys.stderr,
-                    )
                 else:
                     finalization_result = "live-fallback-empty"
                     print(
@@ -1580,7 +2023,6 @@ def main() -> int:
         raw_audio_wave_path,
     )
     existing_live_transcript_entries = list(live_transcript_entries)
-    local_agreement = LocalAgreementState()
     has_live_emission = bool(live_transcript_entries)
     last_partial_text = ""
     last_meter_emit_time = 0.0
@@ -1591,6 +2033,7 @@ def main() -> int:
     stream_wall_anchor: Optional[datetime] = None
     silence_watchdog = AudioSilenceWatchdog()
     clipping_watchdog = AudioClippingWatchdog()
+    signal_analyzer = SignalQualityAnalyzer()
     recording_origin_emitted = False
 
     def request_stop(signum, frame) -> None:
@@ -1599,7 +2042,7 @@ def main() -> int:
         stop_requested = True
 
     def callback(indata, frames, time_info, status) -> None:
-        nonlocal last_meter_emit_time, stream_time_anchor, stream_wall_anchor
+        nonlocal stream_time_anchor, stream_wall_anchor
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
         chunk_duration = frames / SAMPLE_RATE
@@ -1626,16 +2069,17 @@ def main() -> int:
         if clipped_percent is not None:
             emit_protocol_message("AUDIO_CLIPPING", f"{clipped_percent:.3f}")
         now_monotonic = time_module.monotonic()
-        if now_monotonic - last_meter_emit_time >= METER_EMIT_INTERVAL_SECONDS:
-            meter_state = "hearing" if chunk_rms >= CHUNK_RMS_SILENCE_THRESHOLD else "quiet"
-            emit_protocol_message("AUDIO_LEVEL", f"{chunk_rms:.6f}", meter_state)
-            last_meter_emit_time = now_monotonic
         for kind, fields in silence_watchdog.update(chunk_rms, now_monotonic):
             emit_protocol_message(kind, *fields)
         audio_queue.put((indata.copy(), chunk_start_time))
 
+    preferred_live_engine = resolve_live_engine(
+        args.live_engine,
+        language,
+    )
     print("Live transcription configuration")
-    print(f"  Live model  : {live_model_name}")
+    print(f"  Live engine : {preferred_live_engine}")
+    print(f"  Live model  : {args.parakeet_model if preferred_live_engine == 'parakeet-mlx' else live_model_name}")
     print(f"  Live fallbacks: {', '.join(live_model_candidates)}")
     print(f"  Final model : {args.model}")
     print(f"  Language    : {args.language}")
@@ -1663,7 +2107,8 @@ def main() -> int:
 
     audio_buffer = np.empty((0, CHANNELS), dtype=np.float32)
     audio_buffer_start_time: Optional[datetime] = None
-    live_model = None
+    live_transcriber: Optional[LiveTranscriber] = None
+    reusable_whisper_model = None
     live_compute_type: Optional[str] = None
 
     def trim_live_audio_buffer_through(committed_through: datetime) -> None:
@@ -1699,6 +2144,7 @@ def main() -> int:
 
     def append_captured_chunk(chunk, chunk_start_time: datetime) -> None:
         nonlocal audio_buffer, audio_buffer_start_time, recording_start_time, recording_origin_emitted
+        nonlocal last_meter_emit_time
 
         if recording_start_time is None:
             existing_audio_seconds = wave_audio_duration_seconds(raw_audio_wave_path)
@@ -1712,6 +2158,12 @@ def main() -> int:
             recording_origin_emitted = True
 
         append_wave_audio(raw_audio_wave_path, chunk)
+
+        signal_result = signal_analyzer.update(chunk[:, 0])
+        now_monotonic = time_module.monotonic()
+        if signal_result is not None and now_monotonic - last_meter_emit_time >= METER_EMIT_INTERVAL_SECONDS:
+            emit_signal_quality(signal_result)
+            last_meter_emit_time = now_monotonic
 
         if audio_buffer_start_time is not None and audio_buffer.shape[0] > 0:
             expected_buffer_end = audio_buffer_start_time + timedelta(seconds=audio_buffer.shape[0] / SAMPLE_RATE)
@@ -1758,10 +2210,10 @@ def main() -> int:
 
         return drained_chunks
 
-    def emit_local_agreement(
-        decoded_words: Sequence[tuple[datetime, datetime, str]],
-        force_commit: bool,
+    def emit_live_update(
+        update: LiveTranscriptionUpdate,
         current_audio_end_time: datetime,
+        consume_all_audio: bool,
     ) -> None:
         nonlocal has_live_emission, last_partial_text
         nonlocal committed_live_audio_through, live_transcript_entries
@@ -1769,20 +2221,16 @@ def main() -> int:
             format_transcript_line(timestamp, text)
             for timestamp, text in live_transcript_entries
         ]
-        newly_committed, provisional_words = local_agreement.update(
-            decoded_words,
-            force=force_commit,
-        )
-        if newly_committed:
-            committed_live_audio_through = newly_committed[-1][1]
-            trim_live_audio_buffer_through(committed_live_audio_through)
-        elif force_commit and not provisional_words:
+        if consume_all_audio:
             committed_live_audio_through = current_audio_end_time
             trim_live_audio_buffer_through(current_audio_end_time)
+        elif update.committed_through is not None:
+            committed_live_audio_through = update.committed_through
+            trim_live_audio_buffer_through(update.committed_through)
 
         live_transcript_entries = (
             existing_live_transcript_entries
-            + group_committed_words(local_agreement.committed_words)
+            + group_committed_words(update.committed_words)
         )
         updated_lines = [
             format_transcript_line(timestamp, text)
@@ -1794,7 +2242,7 @@ def main() -> int:
                 updated_lines,
             )
             emit_protocol_message("TRANSCRIPT_UPDATED")
-        partial_text = join_timed_words(provisional_words)
+        partial_text = join_timed_words(update.provisional_words)
         if partial_text != last_partial_text:
             emit_protocol_message("TRANSCRIPT_PARTIAL", partial_text)
             last_partial_text = partial_text
@@ -1803,17 +2251,23 @@ def main() -> int:
 
     def maybe_transcribe_latest_live_audio(force: bool = False) -> None:
         nonlocal last_live_decode_end_time
-        if live_model is None or audio_buffer_start_time is None or audio_buffer.shape[0] == 0:
+        if live_transcriber is None or audio_buffer_start_time is None or audio_buffer.shape[0] == 0:
             return
 
         available_samples = audio_buffer.shape[0]
-        required_samples = min_flush_samples if has_live_emission or force else initial_samples_per_chunk
+        is_streaming = isinstance(live_transcriber, ParakeetMlxLiveTranscriber)
+        required_samples = 1 if force else (
+            min_flush_samples
+            if is_streaming or has_live_emission
+            else initial_samples_per_chunk
+        )
         if available_samples < required_samples:
             return
 
-        decode_samples = min(
-            available_samples,
-            int(SAMPLE_RATE * LOCAL_AGREEMENT_MAX_BUFFER_SECONDS),
+        decode_samples = (
+            available_samples
+            if is_streaming
+            else min(available_samples, int(SAMPLE_RATE * LOCAL_AGREEMENT_MAX_BUFFER_SECONDS))
         )
         current_audio_end_time = audio_buffer_start_time + timedelta(
             seconds=decode_samples / SAMPLE_RATE,
@@ -1841,35 +2295,58 @@ def main() -> int:
             or silence_boundary
             or buffer_seconds >= LOCAL_AGREEMENT_MAX_BUFFER_SECONDS
         )
-        segments = transcribe_audio_segments(
-            live_model,
+        committed_words = ()
+        if isinstance(live_transcriber, WhisperLiveTranscriber):
+            committed_words = live_transcriber.agreement.committed_words
+        update = live_transcriber.accept_audio(
             audio,
-            language,
             chunk_window_start,
-            args.beam_size,
-            args.best_of,
-            False,
-            allow_low_energy_short_segments=not has_live_emission,
-            strict_segment_filtering=True,
-            hotwords=args.hotwords,
+            force=force if is_streaming else force_commit,
             context_prompt=local_agreement_prompt(
                 existing_live_transcript_entries,
-                local_agreement.committed_words,
+                committed_words,
             ),
         )
         last_live_decode_end_time = current_audio_end_time
-        emit_local_agreement(
-            decoded_segments_to_timed_words(segments),
-            force_commit,
+        emit_live_update(
+            update,
             current_audio_end_time,
+            consume_all_audio=is_streaming,
         )
 
     load_errors: list[str] = []
     model_load_complete = threading.Event()
 
     def load_live_model() -> None:
-        nonlocal live_compute_type, live_model, live_model_name
+        nonlocal live_compute_type, live_transcriber, live_model_name
+        nonlocal reusable_whisper_model
         try:
+            try_parakeet = preferred_live_engine == "parakeet-mlx"
+            if try_parakeet:
+                try:
+                    print(f"Loading live Parakeet MLX model: {args.parakeet_model}", flush=True)
+                    live_transcriber = ParakeetMlxLiveTranscriber(args.parakeet_model)
+                    live_model_name = args.parakeet_model
+                    emit_protocol_message(
+                        "LIVE_MODEL_READY",
+                        f"parakeet-mlx:{args.parakeet_model}",
+                    )
+                    return
+                except Exception as exc:
+                    load_errors.append(f"parakeet-mlx:{args.parakeet_model}: {exc}")
+                    print(
+                        "Warning: failed to load Parakeet MLX; falling back to "
+                        f"faster-whisper: {exc}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+            elif args.live_engine == "parakeet-mlx":
+                print(
+                    "Warning: Parakeet MLX is unavailable for this platform, "
+                    "installed runtime, or language; falling back to faster-whisper.",
+                    file=sys.stderr,
+                    flush=True,
+                )
             for candidate_model_name in live_model_candidates:
                 try:
                     print(f"Loading live faster-whisper model: {candidate_model_name}", flush=True)
@@ -1878,7 +2355,15 @@ def main() -> int:
                         candidate_model_name,
                         args.compute_type,
                     )
-                    live_model = loaded_model
+                    reusable_whisper_model = loaded_model
+                    live_transcriber = WhisperLiveTranscriber(
+                        loaded_model,
+                        candidate_model_name,
+                        language,
+                        args.beam_size,
+                        args.best_of,
+                        args.hotwords,
+                    )
                     live_model_name = candidate_model_name
                     live_compute_type = loaded_compute_type
                     if loaded_compute_type != args.compute_type:
@@ -1922,7 +2407,7 @@ def main() -> int:
             if recording_start_time is not None and not recording_origin_emitted:
                 emit_protocol_message("RECORDING_ORIGIN", format_utc_timestamp(recording_start_time))
                 recording_origin_emitted = True
-            model_thread = threading.Thread(target=load_live_model, name="whisper-model-loader")
+            model_thread = threading.Thread(target=load_live_model, name="live-asr-model-loader")
             model_thread.start()
 
             while not stop_requested:
@@ -1940,14 +2425,18 @@ def main() -> int:
     drain_captured_audio()
     if 'model_thread' in locals():
         model_thread.join()
-    if live_model is not None:
+    if live_transcriber is not None:
         maybe_transcribe_latest_live_audio(force=True)
 
     if args.capture_only:
+        if live_transcriber is not None:
+            live_transcriber.close()
         emit_protocol_message("FINALIZATION_RESULT", "paused")
         print(f"Paused. Transcript and audio remain resumable at: {out_path}")
         return 0
 
+    if live_transcriber is not None:
+        live_transcriber.close()
     return finalize_existing_capture(
         WhisperModel,
         args,
@@ -1956,8 +2445,8 @@ def main() -> int:
         recording_start_time,
         language,
         previous_text,
-        reusable_model=live_model,
-        reusable_model_name=live_model_name,
+        reusable_model=reusable_whisper_model,
+        reusable_model_name=live_model_name if reusable_whisper_model is not None else None,
     )
 
 

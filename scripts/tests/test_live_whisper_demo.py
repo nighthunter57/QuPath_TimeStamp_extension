@@ -29,6 +29,14 @@ class TranscriptLogicTest(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 transcript.parse_args()
 
+    def test_live_engine_cli_defaults_to_auto_and_accepts_whisper_override(self):
+        with patch.object(sys, "argv", ["live_whisper_demo.py", "--output", "case.txt"]):
+            self.assertEqual("auto", transcript.parse_args().live_engine)
+        with patch.object(sys, "argv", [
+            "live_whisper_demo.py", "--output", "case.txt", "--live-engine", "whisper",
+        ]):
+            self.assertEqual("whisper", transcript.parse_args().live_engine)
+
     def test_timestamp_round_trip_preserves_date(self):
         expected = datetime(2026, 7, 30, 23, 59, 59, 123000).astimezone()
         line = transcript.format_transcript_line(expected, "diagnostic text")
@@ -41,8 +49,8 @@ class TranscriptLogicTest(unittest.TestCase):
         examples = {
             "DEVICE": ("Built-in Microphone", "0 - Built-in Microphone"),
             "AUDIO_CHECK_READY": (),
-            "AUDIO_CHECK_RESULT": ("0.010", "hearing"),
-            "AUDIO_LEVEL": ("0.010", "hearing"),
+            "AUDIO_CHECK_RESULT": ("14.0", "good"),
+            "AUDIO_LEVEL": ("4.0", "low"),
             "AUDIO_CLIPPING": ("0.125",),
             "AUDIO_SILENT": ("30.0",),
             "AUDIO_RECOVERED": (),
@@ -125,6 +133,84 @@ class TranscriptLogicTest(unittest.TestCase):
 
         self.assertEqual("provisional phrase", transcript.join_timed_words(committed))
         self.assertEqual([], provisional)
+
+    def test_parakeet_backend_requires_apple_silicon_supported_language_and_package(self):
+        self.assertTrue(transcript.parakeet_live_is_supported(
+            "en", "Darwin", "arm64", True,
+        ))
+        self.assertTrue(transcript.parakeet_live_is_supported(
+            "ru", "Darwin", "arm64", True,
+        ))
+        self.assertFalse(transcript.parakeet_live_is_supported(
+            "vi", "Darwin", "arm64", True,
+        ))
+        self.assertFalse(transcript.parakeet_live_is_supported(
+            "en", "Linux", "aarch64", True,
+        ))
+        self.assertFalse(transcript.parakeet_live_is_supported(
+            "en", "Darwin", "arm64", False,
+        ))
+
+    def test_parakeet_is_explicit_opt_in_until_quality_gate_passes(self):
+        self.assertEqual(
+            "whisper",
+            transcript.resolve_live_engine("auto", "en", "Darwin", "arm64", True),
+        )
+        self.assertEqual(
+            "parakeet-mlx",
+            transcript.resolve_live_engine(
+                "parakeet-mlx", "en", "Darwin", "arm64", True,
+            ),
+        )
+
+    def test_parakeet_live_transcriber_exposes_finalized_and_draft_words(self):
+        tokens = lambda values: [
+            SimpleNamespace(text=text, start=start, end=end)
+            for text, start, end in values
+        ]
+
+        class FakeStream:
+            def __init__(self):
+                self.finalized_tokens = tokens([
+                    (" The", 0.0, 0.2), (" margin", 0.2, 0.5),
+                    (" is", 0.5, 0.7), (" negative", 0.7, 1.1),
+                    (".", 1.1, 1.2),
+                ])
+                self.draft_tokens = tokens([(" Pending", 1.3, 1.7)])
+                self.received = []
+
+            def add_audio(self, audio):
+                self.received.append(audio)
+
+        class FakeContext:
+            def __init__(self, stream):
+                self.stream = stream
+                self.closed = False
+
+            def __enter__(self):
+                return self.stream
+
+            def __exit__(self, *args):
+                self.closed = True
+
+        stream = FakeStream()
+        context = FakeContext(stream)
+        model = SimpleNamespace(transcribe_stream=lambda **kwargs: context)
+        live = transcript.ParakeetMlxLiveTranscriber(
+            model_loader=lambda name: model,
+            array_factory=lambda audio: audio,
+        )
+        start = datetime(2026, 8, 28, 12, 0, tzinfo=timezone.utc)
+        audio = np.full(transcript.SAMPLE_RATE, 0.02, dtype=np.float32)
+
+        update = live.accept_audio(audio, start)
+
+        self.assertEqual("The margin is negative.", transcript.join_timed_words(update.committed_words))
+        self.assertEqual("Pending", transcript.join_timed_words(update.provisional_words))
+        self.assertEqual(start, update.committed_words[0][0])
+        self.assertEqual(1, len(stream.received))
+        live.close()
+        self.assertTrue(context.closed)
 
     def test_committed_words_group_on_sentence_and_long_gap(self):
         start = datetime(2026, 7, 30, 12, 0, 0)
@@ -224,6 +310,48 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual([("AUDIO_RECOVERED", ())], watchdog.update(0.02, 51.0))
         self.assertEqual([], watchdog.update(0.02, 52.0))
 
+    def test_signal_to_noise_estimator_classifies_good_signal(self):
+        estimator = transcript.SignalToNoiseEstimator()
+        for _ in range(3):
+            estimator.update(0.001, vad_active=False)
+            snr_db, state = estimator.update(0.01, vad_active=True)
+
+        self.assertAlmostEqual(20.0, snr_db, places=3)
+        self.assertEqual("good", state)
+
+    def test_signal_to_noise_estimator_reports_calibrating_low_and_critical(self):
+        estimator = transcript.SignalToNoiseEstimator()
+        self.assertEqual((None, "calibrating"), estimator.update(0.002, vad_active=False))
+        for _ in range(2):
+            estimator.update(0.002, vad_active=False)
+        for _ in range(3):
+            snr_db, state = estimator.update(0.004, vad_active=True)
+        self.assertAlmostEqual(6.0206, snr_db, places=3)
+        self.assertEqual("low", state)
+
+        critical = transcript.SignalToNoiseEstimator()
+        for _ in range(3):
+            critical.update(0.005, vad_active=False)
+            snr_db, state = critical.update(0.006, vad_active=True)
+        self.assertLess(snr_db, transcript.SNR_CRITICAL_DB)
+        self.assertEqual("critical", state)
+
+    def test_signal_quality_analyzer_does_not_treat_noise_energy_as_speech(self):
+        speech_active = False
+        analyzer = transcript.SignalQualityAnalyzer(
+            speech_detector=lambda audio: speech_active,
+        )
+        window = np.full(analyzer.window_samples, 0.008, dtype=np.float32)
+        for _ in range(3):
+            result = analyzer.update(window)
+        self.assertEqual((None, "calibrating"), result)
+
+        speech_active = True
+        speech = np.full(analyzer.window_samples, 0.04, dtype=np.float32)
+        for _ in range(3):
+            result = analyzer.update(speech)
+        self.assertEqual("good", result[1])
+
     def test_device_selection_resolves_stable_name(self):
         fake_sounddevice = SimpleNamespace(query_devices=lambda: [
             {"name": "Speaker", "max_input_channels": 0},
@@ -275,6 +403,37 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertFalse(
             transcript.looks_like_structural_repetition_loop("yes yes yes")
         )
+
+    def test_final_repetition_filter_drops_only_duplicate_offending_segments(self):
+        repeated = "[2026-08-28T12:00:00.000] repeated decoder fragment"
+        lines = [
+            "[2026-08-28T11:59:59.000] useful opening",
+            repeated,
+            repeated,
+            repeated,
+            repeated,
+            "[2026-08-28T12:00:05.000] useful closing",
+        ]
+        segment_rows = [
+            {"segment_index": index, "text": line}
+            for index, line in enumerate(lines)
+        ]
+        word_rows = [
+            {"segment_index": index, "word": "word"}
+            for index in range(len(lines))
+        ]
+
+        filtered_lines, filtered_segments, filtered_words, dropped = (
+            transcript.drop_repeated_final_segments(lines, segment_rows, word_rows)
+        )
+
+        self.assertEqual(3, dropped)
+        self.assertEqual(
+            [lines[0], repeated, lines[-1]],
+            filtered_lines,
+        )
+        self.assertEqual([0, 1, 5], [row["segment_index"] for row in filtered_segments])
+        self.assertEqual([0, 1, 5], [row["segment_index"] for row in filtered_words])
 
     def test_trailing_hallucination_filter_drops_known_final_phrase_after_silence(self):
         segments = [
@@ -428,7 +587,8 @@ class TranscriptLogicTest(unittest.TestCase):
 
         self.assertTrue(settings["vad_filter"])
         self.assertIn("vad_parameters", settings)
-        self.assertGreaterEqual(settings["beam_size"], transcript.FINAL_PASS_MIN_BEAM_SIZE)
+        self.assertEqual(8, transcript.FINAL_PASS_MIN_BEAM_SIZE)
+        self.assertEqual(transcript.FINAL_PASS_MIN_BEAM_SIZE, settings["beam_size"])
         self.assertIn("Gleason", settings["hotwords"])
         self.assertIn(settings["hotwords"], settings["initial_prompt"])
         self.assertIsInstance(settings["temperature"], list)
@@ -627,16 +787,47 @@ class TranscriptLogicTest(unittest.TestCase):
             best_of=2,
             previous_text=False,
             final_pass=False,
-            hotwords=", ".join(f"term-{index}" for index in range(20)),
+            hotwords=", ".join(
+                f"term-{index}" for index in range(transcript.MAX_HOTWORD_TERMS + 5)
+            ),
         )
 
         self.assertEqual(transcript.MAX_HOTWORD_TERMS, len(settings["hotwords"].split(",")))
 
+    def test_default_hotwords_include_domain_phrases_and_project_names(self):
+        hotwords = transcript.limited_hotwords(transcript.DEFAULT_PATHOLOGY_HOTWORDS)
+
+        self.assertIn("ductal carcinoma in situ", hotwords)
+        self.assertIn("reflex in situ hybridization", hotwords)
+        self.assertIn("HULA Lab", hotwords)
+        self.assertIn("QuPath", hotwords)
+
     def test_clinical_large_v3_uses_fast_english_live_preview(self):
         candidates = transcript.choose_live_model_candidates("large-v3", "en")
 
-        self.assertEqual("distil-small.en", candidates[0])
+        self.assertEqual("small.en", candidates[0])
         self.assertIn("large-v3", candidates)
+
+    def test_english_live_preview_prefers_small_en_over_distil_small(self):
+        """small.en measures 19.27% WER against distil-small.en's 63.97% on the
+        Phase 0 fixture, for 0.2 s more per 20-second window. The distilled model
+        is a degraded speed fallback only, so it must never be selected first."""
+        for final_model in ("large-v3", "small.en", "distil-large-v3"):
+            with self.subTest(final_model=final_model):
+                candidates = transcript.choose_live_model_candidates(final_model, "en")
+
+                self.assertEqual("small.en", candidates[0])
+                if "distil-small.en" in candidates:
+                    self.assertLess(
+                        candidates.index("small.en"),
+                        candidates.index("distil-small.en"),
+                    )
+
+    def test_non_english_live_preview_avoids_english_only_models(self):
+        candidates = transcript.choose_live_model_candidates("large-v3", "vi")
+
+        for english_only in ("small.en", "distil-small.en"):
+            self.assertNotIn(english_only, candidates)
 
     def test_int8_float32_model_load_falls_back_to_int8(self):
         attempts = []

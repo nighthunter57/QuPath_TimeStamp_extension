@@ -1,10 +1,11 @@
 # Live Transcript Accuracy Plan
 
-Six phases to take the live transcript from repetition loops to roughly 95% word
+Eleven phases to take the live transcript from repetition loops to roughly 95% word
 accuracy, in the order that keeps the decoder ahead of the microphone.
 
 - **Target files:** `scripts/live_whisper_demo.py`, `src/main/java/qupath/ext/timestamp/TimeStamp.java`
-- **Stack:** faster-whisper 1.2.1, CTranslate2 4.8.1, macOS arm64 (CPU only — CTranslate2 has no Metal backend)
+- **Stack:** faster-whisper 1.2.1/CTranslate2 4.8.1 on CPU, with optional
+  parakeet-mlx 0.5.2 on Apple-Silicon Metal
 - **Tests:** `scripts/tests/test_live_whisper_demo.py`, run with
   `.venv-whisper/bin/python -m unittest scripts.tests.test_live_whisper_demo -v`
 
@@ -193,6 +194,84 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   fixture scorer). Keep
   `calibrate_asr.py` as a permanent regression gate — above about 5% means a
   change has broken the decoder.
+- **Phase 11 complete — 2026-08-28.** `scripts/bench_live_models.py` measured
+  seven live configurations that had never been compared. **`small.en` at beam 2
+  scores 19.27% WER at 2.37 s per 20-second window, against the shipping
+  `distil-small.en` default's 63.97% at 2.17 s** — 3.3x the accuracy for 9% more
+  decode time, and within 0.3 points of turbo beam 2 at half its cost.
+- `small.en` is now the first English live candidate in
+  `choose_live_model_candidates`; `distil-small.en` is retained below it as a
+  faster degraded fallback. Tests pin the ordering for English and assert that
+  non-English sessions never select an English-only model. All 49 Python helper
+  tests pass.
+- `distil-small.en` scores **identically at beam 2 and beam 5** — raising the
+  beam was never going to fix it. The model itself is the limit, which is why
+  the earlier plan's jump from `distil-small.en` straight to turbo missed the
+  answer sitting between them.
+- A real far-field user recording produced roughly 80% WER on the pre-Phase-11
+  live path, worse than the synthetic fixture's 59.78%. **Live figures in this
+  plan are therefore optimistic**, reinforcing 10C.
+- **Phases 10D and 8D complete — 2026-08-28.** The reusable
+  `scripts/score_transcript.py` scorer now reports raw WER, domain-normalized
+  WER, formatting-equivalent errors, and Medical Concept Error Rate against a
+  tracked 35-concept pathology fixture. It detects missing negations and other
+  safety-critical concepts independently of ordinary word formatting.
+- Classifying the Phase 0 final transcript shows that **52 of its 55 raw errors
+  are formatting-equivalent** (`CD twenty`/`CD20`, `Ki sixty seven`/`Ki-67`,
+  spoken numbers/digits, and similar). Domain normalization reduces WER from
+  **15.36% (55/358) to 0.89% (3/336)**. The three genuine misses are
+  `tingible`→`tangible` and two clinically significant `in situ`→`C2`
+  substitutions; Medical Concept Error Rate is **8.57% (3/35)**.
+- **Phase 8A implementation complete — 2026-08-28.** The Python capture path
+  now estimates SNR from Silero-VAD-classified noise and speech windows. The Java
+  panel and microphone test show `Signal N dB` with calibrating, critical
+  (<3 dB), low (<8 dB), and good states, including red critical and amber low
+  warnings. Raw RMS remains internal to silence and clipping protection.
+- **Phase 8C backend complete but not the automatic default — 2026-08-28.** A
+  `LiveTranscriber` interface now has faster-whisper/LocalAgreement and true
+  streaming `parakeet-mlx` implementations. The doctor runtime installs
+  `parakeet-mlx==0.5.2` on Apple Silicon, and QuPath exposes the Metal backend as
+  an experimental live-engine setting while preserving Whisper for unsupported
+  platforms and languages.
+- Real Metal validation rejected the plan's assumption that Parakeet should
+  immediately become automatic. The low-latency 256/64 context decoded the
+  119-second synthetic fixture in **44.9 seconds** but scored **38.55% raw WER,
+  38.39% domain WER, and 91.43% Medical Concept Error Rate**. The package's
+  default 256/256 context improved those to **28.21%, 19.64%, and 57.14%**, but
+  required **241.6 seconds**. Both are worse than Phase 11's `small.en` result;
+  Auto therefore stays on Whisper until Parakeet passes the human-voice gate.
+- **Phase 9D measured and safely narrowed — 2026-08-28.** Beam 16 exceeded the
+  application's finalization timeout for the 119-second fixture without
+  producing a complete transcript, so the shipping beam floor remains 8. The
+  hotword cap increased from 15 to 32 and now includes the two missed `in situ`
+  phrases plus HULA Lab, QuPath, and TimeStamp. At beam 8, the expanded set
+  improved the fixture from 15.36% to **14.80% raw WER (53/358)**, from 0.89%
+  to **0.30% domain WER (1/336)**, and from 8.57% to **2.86% Medical Concept
+  Error Rate (1/35)** in 194.3 seconds. Only `tingible body macrophages`
+  remained missing. No alternate final model is made automatic without a clean
+  human fixture showing that it preserves clinical concepts.
+- **The final repetition fallback is fixed — 2026-08-28.** Cross-segment
+  repetition now removes only duplicate offending final segments and their
+  timing rows. One bad segment no longer discards an otherwise useful offline
+  transcript in favor of the lower-quality live preview.
+- **Phase 9C is not required.** Phase 9B made WER worse with VAD disabled, and
+  Phase 8A now supplies a real Silero-backed signal measurement. There is no
+  evidence that adaptive gates would improve the calibrated decoder, so this
+  evidence-gated branch remains deliberately unimplemented.
+- **Phases 10C and 8B remain blocked on genuine human input.** The synthetic
+  assets were preserved as `reference_synthetic.aiff` and
+  `regression_fixture_synthetic_audio.wav`, and two attempted physical captures
+  are retained under `demo-output/live-accuracy-human/`. A final 15-second
+  MacBook microphone check detected no VAD-active speech and remained
+  `calibrating`; fabricating a human baseline with TTS would invalidate the
+  phase. Re-recording and the Phase 1–4 re-baseline must be completed when a
+  person can read `reference.txt` into the selected microphone at SNR ≥8 dB.
+- Phase 7B remains an optional performance optimization, and Phase 8E remains a
+  later clinical research feature requiring authoritative vocabulary data and
+  human approval of every correction; neither is silently shipped as part of
+  this accuracy pass.
+- All 62 Python scoring/transcription tests and the complete Java test suite
+  pass after the remaining code work.
 
 ---
 
@@ -742,7 +821,7 @@ neurosurgical dictation** — quiet room, structured dictation, close microphone
 > still valid — a better model is still a better model — but **do not justify
 > Phase 8 by the 15.36 % figure**.
 
-2### 8A — Measure and gate signal-to-noise ratio (first, ~4 h)
+### 8A — Measure and gate signal-to-noise ratio (first, ~4 h)
 
 A study of ASR in noisy emergency-medical settings found accuracy **stable at
 SNR ≥ 8 dB and degrading sharply at −2 dB**, identifying **3 dB as the critical
@@ -831,7 +910,7 @@ forced every live-model compromise so far.
 - United-MedASR — <https://arxiv.org/html/2412.00055v1>
 - Improving Medical Transcription ASR Accuracy with LLMs —
   <https://arxiv.org/pdf/2402.07658>
-- `parakeet-mlx` — <https://github.com/EliFuzz/parakeet-mlx>
+- `parakeet-mlx` — <https://github.com/senstella/parakeet-mlx>
 
 **Touches:** `live_whisper_demo.py` (SNR estimation in the audio callback, new
 `LiveTranscriber` abstraction); `TimeStamp.java` (meter → SNR display and gate);
@@ -943,6 +1022,13 @@ currently under-using that budget.
   `Hal` / `Juan` substitutions for a spoken name are exactly what biasing fixes.
   Note the 15-term cap from Phase 1 may need raising to fit both terminology and
   proper nouns.
+
+> **Measured outcome — 2026-08-28.** Beam 16 exceeded the production
+> finalization timeout and was rejected. The expanded 32-term vocabulary at beam
+> 8 improved raw/domain/Medical Concept error rates to 14.80%/0.30%/2.86%, so
+> that safe subset shipped. Alternate final models remain gated on Phase 10C;
+> the measured Parakeet streaming configurations both lost to `small.en` on this
+> fixture.
 
 ### Order
 
@@ -1066,6 +1152,59 @@ with corrected premises.
 
 ---
 
+## Phase 11 — Live model selection (complete — 2026-08-28)
+
+### The measurement
+
+`scripts/bench_live_models.py` decodes the fixture through the production live
+settings for each candidate, reporting the two numbers that decide viability:
+decode time for one 20-second window (the streaming budget) and WER over the
+whole fixture (the quality the doctor sees).
+
+| Candidate | WER | 20 s window | Verdict |
+| --- | ---: | ---: | --- |
+| **`small.en` beam 2** | **19.27 %** | **2.37 s** | **shipped** |
+| turbo beam 2 | 18.99 % | 5.01 s | too slow |
+| turbo beam 1 | 19.83 % | 4.69 s | too slow |
+| `distil-large-v3` beam 2 | 20.95 % | 4.45 s | too slow |
+| `distil-large-v3` beam 1 | 26.82 % | 3.88 s | slower, worse |
+| `distil-small.en` beam 2 | 63.97 % | 2.17 s | previous default |
+
+### The change
+
+`small.en` is now the first English candidate in
+`choose_live_model_candidates` (`:495-510`); `distil-small.en` sits below it as a
+faster degraded fallback for machines that cannot keep up.
+
+**3.3x the accuracy for 9 % more decode time**, and within 0.3 points of turbo
+beam 2 at half the cost. Tests pin the ordering so it cannot silently regress,
+and assert that non-English sessions never select an English-only model.
+
+### Why it was missed
+
+The earlier plan recommended `distil-small.en` as the English live preference and
+then jumped straight to `large-v3-turbo` when that proved weak. Plain `small.en`
+was already present in the fallback list — **one line too low** — and was never
+measured. The lesson for later phases: benchmark the models between the two you
+are choosing from, not just the endpoints.
+
+Note also that `distil-small.en` scores **identically at beam 2 and beam 5**.
+Decoding parameters cannot rescue a model that is simply too small; only changing
+the model moves that number.
+
+### Caveats
+
+- These are single-pass full-file decodes, not streaming replays.
+  `distil-small.en` measures 63.97 % here against 59.78 % in the Phase 3
+  streaming test. Absolute values shift under streaming; the ordering holds.
+- The budget verdicts assume a 1-second live step. Under LocalAgreement the
+  buffer is usually far shorter than 20 seconds, so the window timings are a
+  worst case rather than the typical decode.
+- Re-run this benchmark before shipping any future live-model change, and re-run
+  `calibrate_asr.py` after it to confirm the final path is unaffected.
+
+---
+
 ## Order and expected payoff
 
 Accuracy figures are for pathology dictation in a normal room, measured against
@@ -1097,6 +1236,7 @@ the Phase 0 fixture.
 | 10B — Trailing hallucination filter | 3 h | removes memorized video boilerplate |
 | 10C — Rebuild fixture with a human voice | 2 h | unblocks every other measurement |
 | 10D — Validate the fixture scorer | 2 h | makes future comparisons trustworthy |
+| 11 — Live model selection | done | **63.97 % → 19.27 % live WER, one line** |
 
 **Do Phase 10 before Phases 8 and 9.** 10A is complete and it disproved the
 premise both of those phases were written on: the final path scores 3.68 % on
@@ -1117,11 +1257,10 @@ resume is currently unreachable even though the machinery for it exists.
 every second is not achievable on CPU. Either land Phase 3 first, or hold
 `LIVE_MAX_BEAM_SIZE` at 2 until it is in.
 
-**The finalize fallback is too blunt.** `has_suspicious_transcript_repetition`
-(`:1097`) discards the *entire* final transcript when it trips (`:1708`), falling
-back to the lower-quality live text. After Phase 1 that should be rare — downgrade
-it to dropping only the offending segments, or good finalize passes will keep
-being lost to one bad segment.
+**Resolved — the finalize fallback was too blunt.** Finalization now drops only
+duplicate offending segments and their timing rows. The remaining offline
+transcript is preserved instead of falling back wholesale to lower-quality live
+text.
 
 ---
 

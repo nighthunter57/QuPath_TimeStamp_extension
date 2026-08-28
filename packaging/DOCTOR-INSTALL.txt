@@ -1,0 +1,45 @@
+TIMESTAMP FOR QUPATH 0.6 — DOCTOR INSTALLATION
+
+Supported systems:
+- Windows 10/11: x64 or ARM64
+- macOS: Apple Silicon or Intel
+- Linux: x64 or ARM64
+
+Before installation:
+1. Connect the computer to the internet for the one-time runtime/model download.
+2. Install QuPath 0.6.
+3. Open QuPath once and complete its first-time user-folder setup, keeping the
+   recommended default QuPath user folder.
+4. Close QuPath completely.
+
+Windows:
+Double-click "Install TimeStamp on Windows.bat".
+
+macOS:
+Double-click "Install TimeStamp.command". If macOS blocks it, Control-click the
+file, choose Open, then choose Open again.
+
+Linux:
+Open a terminal in this folder and run:
+  chmod +x "Install TimeStamp on Linux.sh"
+  ./"Install TimeStamp on Linux.sh"
+The installer may request the administrator password if PortAudio is missing.
+
+Wait for "TimeStamp is ready for the doctor." The high-accuracy model is a
+large download, so installation can take a while. Then open QuPath and allow
+microphone access if the operating system asks.
+
+Use:
+Extensions > TimeStamp Extension > Open Clinical Session Recorder
+
+Click Start Recording. When finished, click Stop & Review, review the text, and
+click Save Session. The folder choice appears only after Save.
+
+Privacy:
+Recording and transcription run locally after installation. Audio is not sent
+to a transcription service. The installer uses the internet only to download
+the private runtime, Python libraries, and speech-to-text models.
+
+Updates:
+Normal TimeStamp JAR updates preserve the private runtime and downloaded models.
+Restart QuPath after updating the extension.

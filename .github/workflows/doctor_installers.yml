@@ -1,0 +1,53 @@
+name: Validate doctor installers
+
+on:
+  push:
+    paths:
+      - "packaging/**"
+      - "requirements-doctor.txt"
+      - "scripts/build_doctor_package.sh"
+      - ".github/workflows/doctor_installers.yml"
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "requirements-doctor.txt"
+      - "scripts/build_doctor_package.sh"
+      - ".github/workflows/doctor_installers.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unix-installers:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate macOS and Linux shell syntax
+        run: |
+          bash -n "packaging/macos/Install TimeStamp.command"
+          bash -n "packaging/linux/Install TimeStamp.sh"
+          bash -n scripts/build_doctor_package.sh
+
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate PowerShell syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "packaging/windows/Install-TimeStamp.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List | Out-String | Write-Error
+            exit 1
+          }

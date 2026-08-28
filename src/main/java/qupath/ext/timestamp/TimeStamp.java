@@ -20,6 +20,7 @@ import javafx.scene.control.Label;
 import javafx.scene.control.MenuButton;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressBar;
+import javafx.scene.control.ProgressIndicator;
 import javafx.scene.control.ScrollBar;
 import javafx.scene.control.SelectionMode;
 import javafx.scene.control.SplitPane;
@@ -123,6 +124,7 @@ public class TimeStamp implements QuPathExtension {
     private static final double RECORDING_PANEL_DIVIDER_POSITION = 0.75;
     private static final String TRANSCRIPT_RUNAWAY_MARKER = "[decode error suppressed]";
     private static final String DEFAULT_TRANSCRIPT_MODEL = "large-v3";
+    private static final String DEFAULT_TRANSCRIPT_LIVE_ENGINE = "auto";
     private static final String DEFAULT_TRANSCRIPT_LANGUAGE = "en";
     private static final String DEFAULT_TRANSCRIPT_CHUNK_SECONDS = "10.0";
     private static final String DEFAULT_TRANSCRIPT_COMPUTE_TYPE = "int8_float32";
@@ -132,7 +134,8 @@ public class TimeStamp implements QuPathExtension {
     private static final String DEFAULT_TRANSCRIPT_HOTWORDS =
             "Gleason, mitotic figures, pleomorphism, Ki-67, HER2, immunohistochemistry, " +
                     "lymphovascular invasion, perineural invasion, adenocarcinoma, " +
-                    "squamous cell carcinoma, margin, malignancy";
+                    "squamous cell carcinoma, ductal carcinoma in situ, " +
+                    "reflex in situ hybridization, margin, malignancy, HULA Lab, QuPath, TimeStamp";
     private static final String TRANSCRIPT_FINALIZATION_PENDING = "pending";
     private static final String TRANSCRIPT_FINALIZATION_FAILED = "failed";
     private static final List<String> AVAILABLE_TRANSCRIPT_LANGUAGES = Arrays.asList(
@@ -158,6 +161,10 @@ public class TimeStamp implements QuPathExtension {
             "id - Indonesian",
             "ms - Malay",
             "tl - Tagalog");
+    private static final List<String> AVAILABLE_TRANSCRIPT_LIVE_ENGINES = Arrays.asList(
+            "auto - Whisper (recommended)",
+            "parakeet-mlx - Metal preview (experimental)",
+            "whisper - CPU preview");
 
     private record TranscriptInputDeviceOption(String value, String label) {
         @Override
@@ -381,6 +388,9 @@ public class TimeStamp implements QuPathExtension {
 
     private static final StringProperty transcriptLanguage = PathPrefs.createPersistentPreference(
             "timestamp.transcriptLanguage", DEFAULT_TRANSCRIPT_LANGUAGE);
+
+    private static final StringProperty transcriptLiveEngine = PathPrefs.createPersistentPreference(
+            "timestamp.transcriptLiveEngine", DEFAULT_TRANSCRIPT_LIVE_ENGINE);
 
     private static final StringProperty transcriptDevice = PathPrefs.createPersistentPreference(
             "timestamp.transcriptDevice", DEFAULT_TRANSCRIPT_DEVICE);
@@ -1119,7 +1129,7 @@ public class TimeStamp implements QuPathExtension {
 
         recordingStateDotLabel = new Label("●");
         recordingStatusLabel = new Label();
-        transcriptAudioLevelLabel = new Label("Mic");
+        transcriptAudioLevelLabel = new Label("Signal");
         transcriptStatusLabel = new Label();
         transcriptStatusLabel.textProperty().addListener((obs, oldText, newText) ->
                 updateRecordingStatusLine());
@@ -2023,6 +2033,8 @@ public class TimeStamp implements QuPathExtension {
         try {
             ClinicalTranscriptSettings clinicalSettings = clinicalTranscriptSettings();
             String model = clinicalSettings.finalModel();
+            String liveEngine = defaultIfBlank(
+                    transcriptLiveEngine.get(), DEFAULT_TRANSCRIPT_LIVE_ENGINE);
             String language = defaultIfBlank(transcriptLanguage.get(), DEFAULT_TRANSCRIPT_LANGUAGE);
             String device = defaultIfBlank(transcriptDevice.get(), DEFAULT_TRANSCRIPT_DEVICE);
             String chunkSeconds = clinicalSettings.liveContextSeconds();
@@ -2056,6 +2068,8 @@ public class TimeStamp implements QuPathExtension {
                     transcriptFile.getAbsolutePath(),
                     "--model",
                     model,
+                    "--live-engine",
+                    liveEngine,
                     "--language",
                     language,
                     "--chunk-seconds",
@@ -2088,8 +2102,8 @@ public class TimeStamp implements QuPathExtension {
                 transcriptStatusLabel.setText(String.format(
                         "Transcript: starting microphone (%s, %ss)", model, chunkSeconds));
             }
-            logger.info("Started live transcript process for session {} with python={} model={} language={} device={} chunk={} compute={} beam={} bestOf={} previousText={}",
-                    sessionDir.getAbsolutePath(), pythonExecutable, model, language,
+            logger.info("Started live transcript process for session {} with python={} liveEngine={} model={} language={} device={} chunk={} compute={} beam={} bestOf={} previousText={}",
+                    sessionDir.getAbsolutePath(), pythonExecutable, liveEngine, model, language,
                     displayTranscriptDevice(device), chunkSeconds, computeType, beamSize, bestOf, previousText);
             refreshLiveEventMonitor();
             return true;
@@ -2238,7 +2252,7 @@ public class TimeStamp implements QuPathExtension {
             transcriptAudioLevelBar.setProgress(0);
         }
         if (transcriptAudioLevelLabel != null) {
-            transcriptAudioLevelLabel.setText("Mic: waiting");
+            transcriptAudioLevelLabel.setText("Signal: waiting");
         }
     }
 
@@ -2319,21 +2333,50 @@ public class TimeStamp implements QuPathExtension {
         if (message == null || message.type() != TranscriptMessageType.AUDIO_LEVEL) {
             return;
         }
-        double rms;
+        double snrDb;
         try {
-            rms = Double.parseDouble(message.fields().get(0));
+            snrDb = Double.parseDouble(message.fields().get(0));
         } catch (NumberFormatException e) {
             logger.debug("Invalid transcript audio level line: {}", message.raw());
             return;
         }
         String state = message.fields().get(1).trim();
-        double scaled = Math.min(1.0, rms / 0.05);
+        double scaled = signalQualityProgress(snrDb, state);
         if (transcriptAudioLevelBar != null) {
             transcriptAudioLevelBar.setProgress(scaled);
+            transcriptAudioLevelBar.setStyle(signalQualityStyle(state));
         }
         if (transcriptAudioLevelLabel != null) {
-            transcriptAudioLevelLabel.setText(String.format("Mic: %s (level %.3f)", state, rms));
+            transcriptAudioLevelLabel.setText(signalQualityLabel(snrDb, state));
+            transcriptAudioLevelLabel.setStyle("critical".equals(state) ? "-fx-text-fill: #dc2626;" : "");
         }
+    }
+
+    static double signalQualityProgress(double snrDb, String state) {
+        if ("calibrating".equals(state) || !Double.isFinite(snrDb) || snrDb < 0) {
+            return ProgressIndicator.INDETERMINATE_PROGRESS;
+        }
+        return Math.max(0.0, Math.min(1.0, snrDb / 30.0));
+    }
+
+    static String signalQualityLabel(double snrDb, String state) {
+        if ("calibrating".equals(state) || !Double.isFinite(snrDb) || snrDb < 0) {
+            return "Signal: calibrating — pause, then speak";
+        }
+        long rounded = Math.round(snrDb);
+        return switch (state) {
+            case "good" -> "Signal " + rounded + " dB — good";
+            case "critical" -> "Signal " + rounded + " dB — too noisy";
+            default -> "Signal " + rounded + " dB — below 8 dB recommended";
+        };
+    }
+
+    private static String signalQualityStyle(String state) {
+        return switch (state) {
+            case "good" -> "-fx-accent: #2fbf71;";
+            case "critical" -> "-fx-accent: #dc2626;";
+            default -> "-fx-accent: #d97706;";
+        };
     }
 
     private static void updateTranscriptTextArea(String contents) {
@@ -2801,7 +2844,7 @@ public class TimeStamp implements QuPathExtension {
         if (qupathGui != null) {
             dialog.initOwner(qupathGui.getStage());
         }
-        Label status = new Label("Opening microphone… Speak normally for a few seconds.");
+        Label status = new Label("Opening microphone… Pause briefly, then speak normally.");
         ProgressBar meter = new ProgressBar(0);
         meter.setMaxWidth(Double.MAX_VALUE);
         VBox content = new VBox(10, status, meter);
@@ -2827,18 +2870,22 @@ public class TimeStamp implements QuPathExtension {
                         TranscriptMessage message = parseTranscriptMessage(line);
                         Platform.runLater(() -> {
                             switch (message.type()) {
-                                case AUDIO_CHECK_READY -> status.setText("Microphone open — speak now.");
+                                case AUDIO_CHECK_READY -> status.setText(
+                                        "Microphone open — stay quiet briefly, then speak.");
                                 case AUDIO_LEVEL -> {
-                                    double rms = Double.parseDouble(message.fields().get(0));
-                                    meter.setProgress(Math.min(1.0, rms / 0.05));
-                                    status.setText("Microphone: " + message.fields().get(1));
+                                    double snrDb = Double.parseDouble(message.fields().get(0));
+                                    String state = message.fields().get(1);
+                                    meter.setProgress(signalQualityProgress(snrDb, state));
+                                    meter.setStyle(signalQualityStyle(state));
+                                    status.setText(signalQualityLabel(snrDb, state));
                                 }
                                 case AUDIO_CLIPPING -> status.setText(
                                         "Microphone clipping detected (" + message.fields().get(0) +
                                                 "% at full scale). Lower the input gain.");
                                 case AUDIO_CHECK_RESULT -> status.setText(
-                                        "Test complete: " + message.fields().get(1) +
-                                                " (peak " + message.fields().get(0) + ")");
+                                        "Test complete: " + signalQualityLabel(
+                                                Double.parseDouble(message.fields().get(0)),
+                                                message.fields().get(1)));
                                 case LOG -> {
                                     if (message.raw().startsWith("Error:")) {
                                         status.setText(message.raw());
@@ -2882,6 +2929,22 @@ public class TimeStamp implements QuPathExtension {
         return dash > 0 ? normalized.substring(0, dash) : normalized;
     }
 
+    private static String selectTranscriptLiveEngine(String engineCode) {
+        String normalized = defaultIfBlank(engineCode, DEFAULT_TRANSCRIPT_LIVE_ENGINE);
+        for (String option : AVAILABLE_TRANSCRIPT_LIVE_ENGINES) {
+            if (option.startsWith(normalized + " ")) {
+                return option;
+            }
+        }
+        return AVAILABLE_TRANSCRIPT_LIVE_ENGINES.get(0);
+    }
+
+    private static String liveEngineCodeFromSelection(String selection) {
+        String normalized = defaultIfBlank(selection, AVAILABLE_TRANSCRIPT_LIVE_ENGINES.get(0));
+        int dash = normalized.indexOf(" - ");
+        return dash > 0 ? normalized.substring(0, dash) : normalized;
+    }
+
     private static void updateTranscriptSettingsSummary() {
         if (transcriptSettingsButton == null) {
             return;
@@ -2895,7 +2958,8 @@ public class TimeStamp implements QuPathExtension {
                 ? languageSelection.substring(separator + 3)
                 : languageSelection;
         String summary = String.format(
-                "Clinical High Accuracy • Microphone: %s • Language: %s",
+                "Clinical High Accuracy • Live: %s • Microphone: %s • Language: %s",
+                liveEngineCodeFromSelection(selectTranscriptLiveEngine(transcriptLiveEngine.get())),
                 device.isBlank() ? "System Default" : device,
                 languageName);
         transcriptSettingsButton.setTooltip(new Tooltip(
@@ -2922,6 +2986,12 @@ public class TimeStamp implements QuPathExtension {
         languageCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_LANGUAGES);
         languageCombo.setMaxWidth(Double.MAX_VALUE);
         languageCombo.setValue(selectTranscriptLanguage(defaultIfBlank(transcriptLanguage.get(), DEFAULT_TRANSCRIPT_LANGUAGE)));
+
+        var liveEngineCombo = new ComboBox<String>();
+        liveEngineCombo.getItems().addAll(AVAILABLE_TRANSCRIPT_LIVE_ENGINES);
+        liveEngineCombo.setMaxWidth(Double.MAX_VALUE);
+        liveEngineCombo.setValue(selectTranscriptLiveEngine(defaultIfBlank(
+                transcriptLiveEngine.get(), DEFAULT_TRANSCRIPT_LIVE_ENGINE)));
 
         List<TranscriptInputDeviceOption> deviceOptions = new ArrayList<>();
         deviceOptions.add(defaultTranscriptInputDeviceOption());
@@ -2958,11 +3028,12 @@ public class TimeStamp implements QuPathExtension {
         hotwordsArea.setPrefRowCount(3);
         hotwordsArea.setWrapText(true);
         var accuracyLabel = new Label(
-                "Automatic Clinical High Accuracy — fast live preview, then large-v3 for the final saved transcript");
+                "Clinical High Accuracy — fast live preview, then large-v3 for the final saved transcript");
         accuracyLabel.setWrapText(true);
         var settingsHint = new Label(
                 "The recognition model and decoding strength are managed automatically. " +
-                        "Choose only the microphone, language, and any case-specific terminology. " +
+                        "Auto uses the measured Whisper small.en preview. Parakeet MLX is an " +
+                        "experimental Apple-Silicon option until it passes the human-voice quality gate. " +
                         "Live context is a maximum uncommitted-audio buffer, not a repeated decode window.");
         settingsHint.setWrapText(true);
 
@@ -2971,10 +3042,11 @@ public class TimeStamp implements QuPathExtension {
         grid.setVgap(8);
         grid.setPadding(new Insets(10));
         grid.addRow(0, new Label("Accuracy"), accuracyLabel);
-        grid.addRow(1, new Label("Language"), languageCombo);
-        grid.addRow(2, new Label("Input device"), deviceBox);
-        grid.addRow(3, new Label("Pathology terms"), hotwordsArea);
-        grid.add(settingsHint, 0, 4, 2, 1);
+        grid.addRow(1, new Label("Live engine"), liveEngineCombo);
+        grid.addRow(2, new Label("Language"), languageCombo);
+        grid.addRow(3, new Label("Input device"), deviceBox);
+        grid.addRow(4, new Label("Pathology terms"), hotwordsArea);
+        grid.add(settingsHint, 0, 5, 2, 1);
 
         dialog.getDialogPane().setContent(grid);
         dialog.getDialogPane().getButtonTypes().addAll(javafx.scene.control.ButtonType.OK,
@@ -2984,6 +3056,7 @@ public class TimeStamp implements QuPathExtension {
         if (result.isEmpty() || result.get() != javafx.scene.control.ButtonType.OK) {
             return;
         }
+        transcriptLiveEngine.set(liveEngineCodeFromSelection(liveEngineCombo.getValue()));
         transcriptLanguage.set(languageCodeFromSelection(languageCombo.getValue()));
         transcriptDevice.set(selectedTranscriptInputDevice(deviceCombo));
         transcriptHotwords.set(defaultIfBlank(hotwordsArea.getText(), DEFAULT_TRANSCRIPT_HOTWORDS));

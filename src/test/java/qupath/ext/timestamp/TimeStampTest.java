@@ -114,8 +114,8 @@ class TimeStampTest {
         List<String> messages = List.of(
                 "DEVICE\tBuilt-in Microphone\t0 - Built-in Microphone",
                 "AUDIO_CHECK_READY",
-                "AUDIO_CHECK_RESULT\t0.012\thearing",
-                "AUDIO_LEVEL\t0.004\thearing",
+                "AUDIO_CHECK_RESULT\t14.0\tgood",
+                "AUDIO_LEVEL\t4.0\tlow",
                 "AUDIO_CLIPPING\t0.125",
                 "AUDIO_SILENT\t30.0",
                 "AUDIO_RECOVERED",
@@ -139,6 +139,18 @@ class TimeStampTest {
                 TimeStamp.parseTranscriptMessage("TRANSCRIPT_READY\textra").type());
         assertEquals(TimeStamp.TranscriptMessageType.LOG,
                 TimeStamp.parseTranscriptMessage("ordinary diagnostic output").type());
+    }
+
+    @Test
+    void formatsSignalQualityAtClinicalThresholds() {
+        assertEquals("Signal: calibrating — pause, then speak",
+                TimeStamp.signalQualityLabel(-1, "calibrating"));
+        assertEquals("Signal 14 dB — good", TimeStamp.signalQualityLabel(14, "good"));
+        assertEquals("Signal 4 dB — below 8 dB recommended",
+                TimeStamp.signalQualityLabel(4, "low"));
+        assertEquals("Signal 2 dB — too noisy", TimeStamp.signalQualityLabel(2, "critical"));
+        assertEquals(-1.0, TimeStamp.signalQualityProgress(-1, "calibrating"));
+        assertEquals(0.5, TimeStamp.signalQualityProgress(15, "good"));
     }
 
     @Test
