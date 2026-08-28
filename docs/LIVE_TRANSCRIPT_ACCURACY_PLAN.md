@@ -121,6 +121,78 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   elapsed-time display, transcript time windows, and nearest-event matching.
   All 25 Java tests, all 39 Python helper tests, and the complete Gradle build
   pass.
+- **Phase 7A complete — 2026-08-27.** `PAUSED` is now a first-class workflow
+  state. The primary action toggles Pause/Resume without ending the take, Done is
+  the only action that starts finalization, and review exposes `Record more` to
+  resume the same session. Save and export remain unavailable while paused so a
+  live preview cannot be mistaken for the final transcript.
+- Live capture launches with `--capture-only` and exits with
+  `FINALIZATION_RESULT paused`; it never loads the offline model during Pause.
+  Done launches a separate `--finalize-existing` process against the preserved
+  WAV without opening the microphone. The original recording origin, resume-gap
+  padding, transcript, and event lists remain continuous across any number of
+  pause/resume cycles.
+- All 27 Java tests and all 41 Python helper tests pass. A no-audio
+  `--finalize-existing` smoke test also completed without opening an input
+  device. Phase 7B remains optional and is deliberately not implemented until
+  real use shows that the roughly one-model-load resume cost or long silence
+  padding is material.
+- **Phase 9A complete — 2026-08-27.** The final pass now decodes the saved WAV to
+  a float array, conditions that in-memory copy with the Phase 4 high-pass and
+  AGC path, and sends the array to faster-whisper. The captured WAV remains raw:
+  its SHA-256 stayed
+  `0c0ea76d90953b7f0deb4db4e5d3cc89bbdbef522b13dc79e6b48293ca8ea186`
+  across finalization, with a regression test enforcing the invariant.
+- Re-scoring the unchanged Phase 0 fixture after 9A produced **336 hypothesis
+  words, 55 errors, and 15.36% WER** with `large-v3`, beam/best-of 8, and final
+  VAD enabled—exactly the Phase 0–7 score. The Phase 4 gain seen with the small
+  live model therefore does not transfer to this final-pass model and fixture.
+- **Phase 9B complete — 2026-08-27.** The identical conditioned final pass was
+  re-run with `vad_filter=False`. It produced **337 hypothesis words, 59 errors,
+  and 16.48% WER** in 446.52 seconds: 1.12 percentage points worse than 9A.
+  VAD is therefore not discarding useful speech on this fixture; final-pass VAD
+  remains enabled, and 9C is not required on the evidence from this experiment.
+- All 42 Python helper tests and the complete Gradle build pass after Phases 9A
+  and 9B.
+- **Phase 10A complete — 2026-08-27.** LibriSpeech `test-clean` was downloaded to
+  the gitignored `demo-output/librispeech-calibration/` and decoded through the
+  production final-pass settings by the new `scripts/calibrate_asr.py`, which
+  imports `build_transcribe_kwargs(final_pass=True)` rather than calling
+  faster-whisper directly. Over 40 utterances and 897 reference words it scored
+  **3.68% WER** (3.57% with numbers normalized) at 0.91x realtime, against a
+  published `large-v3` baseline of ~2.5%.
+- **The decoder is healthy; the 15.36% is the synthetic fixture.** Three
+  independent results now agree: conditioning the final pass (9A) changed the
+  score by exactly nothing, disabling VAD (9B) made it 1.12 points worse, and
+  clean human speech scores 3.68%. Neither signal level nor voice-activity
+  gating explains the fixture score, so the remaining candidates are the
+  synthesized voice being out of distribution and the domain-specific scoring.
+  **9C is therefore not required**, and Phase 8 must not be justified by the
+  15.36% figure.
+- Calibration also exposed a real defect: three of the five worst utterances
+  ended with memorized video boilerplate appended after the real speech —
+  `thank you for watching.`, `we'll be right back.`, `thanks for watching!`.
+  These are Whisper training artifacts on trailing silence. They defeat every
+  Phase 1 defence: too short for the 12-word structural detector, fluent enough
+  to pass the confidence and compression thresholds, and shorter than
+  `hallucination_silence_threshold`. Tracked as Phase 10B.
+- **Phase 10B complete — 2026-08-27.** Live, final, and calibration paths now
+  share a normalized known-phrase filter. It removes only a standalone final
+  boilerplate segment after either a measured 0.5-second timestamp gap or a 50%
+  audio-level drop when faster-whisper collapses the gap to touching segment
+  timestamps. Mid-transcript phrases and final phrases without either signal
+  boundary survive.
+- Re-running `.venv-whisper/bin/python -m scripts.calibrate_asr --count 40`
+  removed all three documented endings and produced **21 errors over 897 words,
+  2.34% WER, and 2.23% numbers-normalized WER**. Decode time was 460.4 seconds
+  for 343.6 seconds of audio (0.75x realtime). This improves the Phase 10A score
+  by 12 errors and 1.34 percentage points, placing it slightly below the
+  published ~2.5% `large-v3` reference.
+- All 47 Python helper tests and the complete Gradle build pass after Phase 10B.
+- **Next:** 10C (rebuild the fixture with a human voice) and 10D (validate the
+  fixture scorer). Keep
+  `calibrate_asr.py` as a permanent regression gate — above about 5% means a
+  change has broken the decoder.
 
 ---
 
@@ -538,6 +610,462 @@ A `TableView` is virtualized, so this also fixes the same `setText()` +
 
 ---
 
+## Phase 7 — Pause and resume (~1 day, low risk)
+
+Most of this already exists. The work is making it reachable and making it cheap.
+
+### The product decision
+
+**A pause/resume cycle is one continuous recording, not two takes.** The session
+stays open across any number of pauses and ends only when the doctor chooses
+**Done** or exports. One transcript, one audio timeline, one set of event
+timestamps. Do not add per-segment takes.
+
+### What already works
+
+- The Python helper is built for resume. `load_existing_capture_state()` reloads
+  prior transcript entries and the recording origin; `align_resumed_wave_audio()`
+  measures the gap since the last capture and pads the WAV so the timeline stays
+  aligned; `RESUME_GAP_TOLERANCE_SECONDS` sets the tolerance.
+- `TranscriptStartMode { NEW_TAKE, RESUME, CANCEL }` exists
+  (`TimeStamp.java:254`), and `resolveTranscriptStartMode()` (`:1773`) already
+  returns `RESUME` when `transcriptCaptureStarted` is set, or offers a
+  resume/new-take/cancel dialog.
+- The stop path is already *named* pause: `pauseRecordingSession()` (`:2009`)
+  logs the event `"Recording Paused"`.
+
+### Two things break it
+
+**1. Phase 6 removed the only route back into a recording.** The previous UI kept
+a separate Start button enabled during review, so pressing it resumed. The single
+primary button now maps `UNSAVED_REVIEW → saveTranscriptAndTimestamps()`
+(`:1217`), and `startRecordingSession()` is reachable only from `READY` and
+`SAVED` — and from `SAVED` it calls `resetWorkingSessionForNewRecording()`, which
+discards the take. This is a regression, not an original limitation.
+
+**2. Pause runs a full finalization.** `pauseRecordingSession()` sets
+`FINALIZING` and kills the helper, which runs its complete offline pass on exit —
+**198 seconds** on the Phase 0 fixture — plus a model reload on resume. That is
+why pause behaves like a hard stop.
+
+### Prior art
+
+Voice Memos, Otter, Rev, Dragon, Zoom, Teams and OBS all use the same shape:
+**three states, two controls.** The primary control toggles Record ⇄ Pause and is
+cheap and reversible; a separate terminal control (Done / Stop / Finish) is the
+only thing that triggers processing. Zoom and OBS both produce a *single
+continuous file* across pauses. Pause never triggers processing anywhere.
+
+### Target workflow
+
+Add `PAUSED` to `RecordingWorkflowState` (`:260`) and split the controls.
+
+```
+● Recording · 02:14
+▌▌▌▌▌▌░░░░  Mic
+┌──────────────────────────┐
+│        ⏸  Pause          │   primary: Record ⇄ Pause, cheap
+└──────────────────────────┘
+  ⏹ Done    ⚙ Settings   ⋯      Done is the only terminal action
+```
+
+| State | Primary button | Also shown |
+| --- | --- | --- |
+| `READY` | ● Start Recording | — |
+| `RECORDING` | ⏸ Pause | ⏹ Done |
+| `PAUSED` | ● Resume | ⏹ Done · *"Paused · 02:14 recorded"* |
+| `FINALIZING` | *(disabled)* Creating final transcript… | — |
+| `UNSAVED_REVIEW` | Save Session | **↺ Record more** |
+| `SAVED` | ● Start New Recording | — |
+
+`Record more` in review is what repairs the lost path: it routes to
+`startRecordingSession()` in `RESUME` mode instead of resetting the session.
+Export and Save require Done first and remain unavailable while the session is
+paused.
+
+### 7A — Make pause cheap (first, ~3 h)
+
+Keep the process-restart mechanism, but **stop finalizing on pause**. Live capture
+runs with `--capture-only`, which exits with `FINALIZATION_RESULT paused` and
+skips the offline pass. A real Done launches `--finalize-existing` against the
+preserved WAV without opening a microphone. No new protocol message type is
+needed, and the existing WAV-resume logic is untouched.
+
+### 7B — Make pause instant (optional, ~1 day)
+
+A true in-process pause: read `PAUSE` / `RESUME` commands on the helper's stdin,
+and on pause stop appending to the WAV and the decode buffer while keeping the
+process and the loaded model alive. Resume becomes instantaneous.
+
+This also removes a wart: `align_resumed_wave_audio()` pads the gap with **real
+silence**, so a ten-minute break writes ten minutes of silence into the WAV that
+the final pass must then decode. With a true pause, stop writing instead and keep
+a list of (audio-offset → wall-time) anchors so event timestamps stay correct.
+
+Do 7A first. Only do 7B if long pauses turn out to be common in practice.
+
+**Touches:** `TimeStamp.java:254-269` (states), `:1213-1220` (primary action),
+`:1674-1727` (start/resume), `:2009-2020` (pause); `live_whisper_demo.py`
+finalization block and argument parsing
+
+---
+
+## Phase 8 — Engine and signal (~1 week)
+
+Phases 0–7 tuned the existing pipeline as far as it goes. This phase replaces two
+of its foundations: the audio going in, and the engine decoding it.
+
+### Why this phase exists
+
+The final pass currently decodes 119 seconds of audio in 198 seconds — **0.6×
+realtime** — at **15.36 % WER**. Published benchmarks put freely available
+alternatives far ahead on both axes:
+
+| Model | English WER | Speed | Notes |
+| --- | --- | --- | --- |
+| Canary-Qwen 2.5B | 5.63 % | slow | tops the Open ASR leaderboard |
+| Parakeet TDT 0.6B v3 | 6.34 % | RTFx 3,332 | English + 25 EU languages only |
+| Whisper large-v3-turbo | ~7–8 % | fast | "best balance" among free models in clinical testing |
+| **This project, final** | **15.36 %** | **RTFx 0.6** | `large-v3`, CPU, `int8_float32` |
+| **This project, live** | **59.78 %** | realtime | `distil-small.en`, beam 2 |
+
+Whisper is no longer the accuracy leader; it is now the *multilingual* choice.
+
+For a target: Whisper with customization has reached **~1.5 % WER on
+neurosurgical dictation** — quiet room, structured dictation, close microphone.
+
+> **Corrected 2026-08-27.** This section previously concluded "the 15.36 % is an
+> audio problem, not a model problem." Phase 10 calibration disproved that. The
+> production final path scores **3.68 % on LibriSpeech test-clean**, close to the
+> published `large-v3` baseline of ~2.5 %. The decoder is healthy; the 15.36 %
+> comes from the synthetic fixture. Treat the model-comparison table above as
+> still valid — a better model is still a better model — but **do not justify
+> Phase 8 by the 15.36 % figure**.
+
+2### 8A — Measure and gate signal-to-noise ratio (first, ~4 h)
+
+A study of ASR in noisy emergency-medical settings found accuracy **stable at
+SNR ≥ 8 dB and degrading sharply at −2 dB**, identifying **3 dB as the critical
+tipping point** for clinical transcription quality. A headset microphone at 5 cm
+typically delivers 20–30 dB; a laptop microphone across a desk delivers 5–15 dB;
+audio reaching the microphone via a loudspeaker is worse than either.
+
+Replace the RMS level bar with a **real SNR estimate**: track the noise floor
+during VAD-silent stretches and the speech level during VAD-active stretches, and
+display the difference in dB.
+
+- Show it as `Signal 14 dB — good` / `Signal 4 dB — below the 8 dB recommended
+  for clinical dictation`.
+- Warn hard below 3 dB, and consider refusing to start there.
+- The meter plumbing already exists (`AUDIO_LEVEL`, `transcriptAudioLevelBar`);
+  this turns it from decoration into a gate.
+
+This is the highest-value change in the plan and the cheapest to build.
+
+### 8B — Re-record the fixture and re-baseline (~2 h)
+
+Every number measured so far — Phase 0 through Phase 7 — is scored against a
+fixture captured on far-field audio. Re-record the standardized pathology
+dictation with a headset or lapel microphone, confirm SNR ≥ 8 dB with the new
+meter, and re-run the Phase 0 through Phase 3 measurements.
+
+**Do this before any engine work.** If the offline pass drops from 15.36 % toward
+single digits on clean audio, the conclusions about model choice change.
+
+### 8C — Replace the live engine (~3 d)
+
+CTranslate2 is CPU-only, so the GPU has been idle for this entire project.
+Parakeet.cpp reports **96× faster than CPU inference** with native Apple Silicon
+Metal support — roughly **27 ms to encode 10 s of audio** on the 110M model — and
+the streaming variant supports **configurable latency from 80 ms to 1,120 ms**.
+That is a different regime from the current one-second rolling window.
+
+- Introduce a `LiveTranscriber` interface with two implementations: `parakeet-mlx`
+  (Metal, default) and the existing faster-whisper path (CPU, fallback).
+- `parakeet-mlx` exposes a real streaming API, so much of the Phase 3
+  LocalAgreement machinery becomes optional rather than load-bearing. Keep it for
+  the Whisper path.
+- **Keep Whisper for multilingual work.** Parakeet v3 covers English plus 25
+  European languages; Whisper covers 99. If Vietnamese or other non-EU dictation
+  is ever in scope, the Whisper path must remain reachable, selected by the
+  existing language setting.
+
+### 8D — Adopt Medical WER as the reported metric (~4 h)
+
+The clinical study's explicit recommendation: **domain-specific metrics capture
+safety-critical errors better than standard WER.** Plain WER charges equally for
+dropping "the" and for turning "negative margin" into "positive margin"; only one
+of those can harm a patient.
+
+Score the fixture on whether clinical concepts survive — margins, grades,
+laterality, measurements, specimen sites — and report that number alongside
+overall WER. It changes what the project optimizes for.
+
+### 8E — Domain vocabulary and constrained correction (later)
+
+- **Vocabulary.** Systematic medical-vocabulary construction from authoritative
+  sources (the United-MedASR approach, built from ICD-10 and similar) plus
+  fine-tuning delivered **37–47 % WER reduction** across Whisper sizes. The
+  current 15-term hotword cap is a thin version of this. Building a real pathology
+  term list is the cheap half; fine-tuning is the expensive half.
+- **LLM post-correction.** GPT-4 paired with Whisper produced the **lowest
+  Medical Concept WER** in published testing. The safe boundary is **correction
+  against context, not completion of missing words**: fixing "adeno carcinoma" to
+  "adenocarcinoma" is legitimate; inventing a clause that was never spoken is not.
+  Final pass only, presented to the doctor as a diff they approve, never applied
+  silently and never to live text.
+
+### Expected outcome
+
+8A and 8B together should move the offline pass substantially toward the ~1.5 %
+demonstrated for close-microphone clinical dictation. 8C is what makes the live
+preview trustworthy, because it removes the CPU throughput ceiling that has
+forced every live-model compromise so far.
+
+### Sources
+
+- Open ASR Leaderboard — <https://huggingface.co/blog/open-asr-leaderboard>
+- `nvidia/parakeet-tdt-0.6b-v3` — <https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3>
+- Speech-to-text robustness in noisy emergency medical dialogues —
+  <https://pmc.ncbi.nlm.nih.gov/articles/PMC12628192/>
+- United-MedASR — <https://arxiv.org/html/2412.00055v1>
+- Improving Medical Transcription ASR Accuracy with LLMs —
+  <https://arxiv.org/pdf/2402.07658>
+- `parakeet-mlx` — <https://github.com/EliFuzz/parakeet-mlx>
+
+**Touches:** `live_whisper_demo.py` (SNR estimation in the audio callback, new
+`LiveTranscriber` abstraction); `TimeStamp.java` (meter → SNR display and gate);
+`requirements-whisper.txt`; the fixture at `demo-output/live-accuracy-phase-0/`
+
+---
+
+## Phase 9 — Signal path corrections (~1 day)
+
+Defects in how audio reaches each decoder. **Every item here is testable against
+the existing fixture and needs no new hardware** — do this phase before spending
+money or time on Phase 8.
+
+> **Scope corrected 2026-08-27.** This phase originally claimed these defects
+> "explain why the final-pass WER stayed at exactly 15.36 %." Phase 10
+> calibration disproved that: the same final path scores **3.68 % on LibriSpeech
+> test-clean**. The 15.36 % is the synthetic fixture, not these defects.
+>
+> The items below remain worth doing — the fixture is genuinely quiet
+> (RMS 0.011630) and real dictation may be too, so gates that discard quiet
+> speech are still a real risk. But they are **corrections, not the explanation**,
+> and their expected gain is smaller than originally stated. Run Phase 10 first.
+
+### 9A — Condition the final pass (first; largest expected gain)
+
+`transcribe_saved_audio_with_timings` (`:1001`) passes a **file path** to the
+model:
+
+```python
+segments, info = model.transcribe(str(audio_path), ...)
+```
+
+faster-whisper therefore loads the raw WAV. `condition_live_audio()` (`:599`) is
+called from exactly one place — `:756`, the live path. **The final pass, which
+produces the saved deliverable, is the only path that never benefits from
+conditioning.**
+
+Phase 4 measured the effect of conditioning on this same saved signal:
+
+| | Words | WER |
+| --- | --- | --- |
+| Unconditioned | 81 | 85.20 % |
+| Conditioned | 189 | **63.97 %** |
+
+**Change:** read the WAV into an array, apply `condition_live_audio()`, and pass
+the array to `model.transcribe` instead of the path.
+
+**This does not violate the Phase 4 invariant.** That rule — "the captured WAV
+must never pass through here" — protects the **file on disk**, which stays
+untouched. Conditioning an in-memory decode copy is exactly what the live path
+already does. Add a test asserting the WAV's SHA-256 is unchanged across a
+finalization run, so the invariant stays enforced rather than assumed.
+
+### 9B — Test the final pass with VAD disabled (cheap; run before 9C)
+
+Phase 1 raised the VAD threshold from 0.35 to 0.5 to stop hallucination on
+near-silence. Correct for the loop bug — but the final pass runs that VAD on
+**raw, quiet, unconditioned** audio. On a low-level far-field recording, Silero
+at 0.5 classifies real speech as non-speech and it never reaches the decoder.
+
+Run the fixture through the final pass with `vad_filter=False` and compare WER.
+
+- If WER improves, VAD is discarding speech and 9C is required.
+- If it does not change, VAD is ruled out for the cost of one run.
+
+Record the result in this Progress log either way.
+
+### 9C — Make the level gates adaptive
+
+Two gates currently use a hardcoded absolute threshold, and both are applied to
+raw audio.
+
+**Gate 1 — before conditioning** (`:753-756`):
+
+```python
+if chunk_rms < CHUNK_RMS_SILENCE_THRESHOLD:   # 0.003, measured on RAW audio
+    return []
+conditioned_audio = condition_live_audio(audio)   # applies up to 8x gain
+```
+
+Audio below 0.003 raw is discarded *before* the gain that would have lifted it to
+roughly 0.024. The fixture's raw RMS is **0.011630** — under 4x the gate — so
+quiet syllables and sentence endings sit directly on the threshold. Whisper
+already drops trailing words; this compounds it.
+
+**Gate 2 — inside the AGC** (`:583`): blocks below the same 0.003 are skipped and
+never amplified. The intent is right (do not amplify room noise), but the
+constant was calibrated for close-microphone audio.
+
+**Changes:**
+
+1. Move gate 1 to *after* conditioning.
+2. Replace both absolute constants with a threshold derived from a **measured
+   noise floor**: sample the level during VAD-silent stretches early in the
+   session and set the gate relative to it. This is the same measurement Phase 8A
+   needs for its SNR display, so build it once and use it in both places.
+
+### 9D — Spend the offline budget that is already being spent
+
+The final pass has no realtime constraint and already takes 198 s. It is
+currently under-using that budget.
+
+- **Raise the final-pass beam from 8 to 16.** Offline time is cheap.
+- **Use a more accurate final model.** `large-v3` is no longer the leader;
+  Canary-Qwen 2.5B benchmarks at 5.63 % against its ~7–8 %. Strictly better on
+  the audio that already exists. Parakeet TDT is both faster and more accurate,
+  with the language caveat in Phase 8C.
+- **Extend the hotword list** with operator and institution names. The observed
+  `Hal` / `Juan` substitutions for a spoken name are exactly what biasing fixes.
+  Note the 15-term cap from Phase 1 may need raising to fit both terminology and
+  proper nouns.
+
+### Order
+
+9A → 9B → 9C → 9D. 9A has the largest predicted effect and the existing Phase 4
+measurement to support it; 9B is one run and decides whether 9C matters.
+
+Re-score the fixture after each step and record it in Progress, so the
+contribution of each change is separable.
+
+**Touches:** `live_whisper_demo.py:570-601` (conditioning and AGC gate),
+`:753-756` (pre-conditioning gate), `:990-1010` (final pass input),
+`:27` (`CHUNK_RMS_SILENCE_THRESHOLD`); `scripts/tests/test_live_whisper_demo.py`
+
+---
+
+## Phase 10 — Calibration, trailing hallucinations, and a real fixture
+
+**Do this first.** It is already half done, and it invalidates premises that
+Phases 8 and 9 were written on.
+
+### 10A — LibriSpeech calibration (complete — 2026-08-27)
+
+The project fixture is **synthesized** speech (`reference.aiff`, macOS `say`)
+routed through a `Dubbing Virtual Device` loopback. It never passed through a
+speaker, a room, or a microphone. A poor score on it therefore could not
+distinguish a pipeline defect from an unrepresentative signal.
+
+`scripts/calibrate_asr.py` resolves that by decoding LibriSpeech `test-clean` —
+human speech with exact references — through the **production** final-pass
+settings, importing `build_transcribe_kwargs(final_pass=True)` rather than
+calling faster-whisper directly.
+
+Result over 40 utterances, 897 reference words:
+
+| Metric | Value |
+| --- | ---: |
+| WER | **3.68 %** |
+| WER, numbers normalized | 3.57 % |
+| Published `large-v3` baseline | ~2.5 % |
+| Decode speed | 0.91x realtime |
+
+**The decoder is healthy.** The remaining gap to 2.5 % is explained by 10B. The
+15.36 % on the project fixture is the fixture.
+
+Keep this as a permanent regression gate: **if `calibrate_asr.py` ever exceeds
+about 5 %, a change has broken the decoder.** Run it after any decoding change.
+
+Corpus lives at `demo-output/librispeech-calibration/` (gitignored). Re-download
+with `curl -L -O https://www.openslr.org/resources/12/test-clean.tar.gz`.
+
+### 10B — Filter trailing hallucinations (real defect, found by 10A)
+
+Three of the five worst calibration utterances ended with memorized video
+boilerplate appended after the real speech:
+
+```
+HYP: ...doubting of the rest   thank you for watching.
+HYP: ...the great sorceress    we'll be right back.
+HYP: ...part of the royalists  thanks for watching!
+```
+
+These are Whisper training-data artifacts emitted on trailing silence. **They
+defeat every Phase 1 defence:**
+
+- Too short for the structural 3-gram detector, which requires 12+ words.
+- Fluent and high-confidence, so `avg_logprob`, `no_speech_prob` and
+  compression-ratio checks all pass them.
+- `hallucination_silence_threshold=2.0` does not fire, because the trailing
+  silence is shorter than the threshold.
+
+The same failure appeared in live manual testing as stray trailing fragments.
+
+**Change:** add a known-phrase filter applied to both transcript paths. Drop a
+segment when it matches a normalized phrase from the list **and** is the final
+segment **and** is preceded by a silence gap. Seed the list with the documented
+Whisper set — "thank you for watching", "thanks for watching", "we'll be right
+back", "please subscribe", "subtitles by", "amara.org" and similar.
+
+Match on the normalized form so punctuation and casing do not matter. Require the
+positional conditions, so the filter cannot delete a doctor genuinely saying
+"thank you" mid-dictation. Add tests for both the positive case and that
+mid-transcript occurrences survive.
+
+Re-run 10A afterwards; WER should move toward the published baseline.
+
+### 10C — Rebuild the fixture with a human voice
+
+Every accuracy decision so far was made against synthesized audio at RMS
+0.011630. Replace it:
+
+- Read the existing `reference.txt` aloud into a real microphone, so the
+  reference text and its 358-word ground truth are preserved exactly.
+- Verify the level is reasonable before keeping the take.
+- Keep the synthetic fixture as `reference_synthetic.*` for comparison — it is
+  still useful for isolating voice effects from pipeline effects.
+- **Re-baseline Phases 1 through 4 against the new fixture.** The live 59.78 %,
+  the Phase 4 conditioning gain, and the turbo throughput comparison were all
+  measured on the synthetic signal.
+
+### 10D — Validate the fixture scorer
+
+Numbers-normalized WER differed from raw by only 0.11 points on LibriSpeech — but
+LibriSpeech contains almost no numbers, whereas pathology dictation is dense with
+`Ki-67`, `HER2`, grades, and measurements.
+
+Diff `reference.txt` against `baseline_transcript.txt` and classify the 55 errors:
+genuine mishearings, versus tokenization artifacts where `Ki-67` becomes
+`ki 67`. If a material share are artifacts, the scorer needs domain-aware
+normalization before it can be trusted to rank future changes.
+
+### Order
+
+10A is done. Then 10B (real defect, cheap), 10C (unblocks everything else), 10D
+(makes the resulting numbers trustworthy). **Only then** revisit Phases 8 and 9
+with corrected premises.
+
+**Touches:** `scripts/calibrate_asr.py` (exists); `live_whisper_demo.py`
+(hallucination phrase list and segment filter);
+`scripts/tests/test_live_whisper_demo.py`;
+`demo-output/live-accuracy-phase-0/`
+
+---
+
 ## Order and expected payoff
 
 Accuracy figures are for pathology dictation in a normal room, measured against
@@ -554,9 +1082,32 @@ the Phase 0 fixture.
 | 5 — Panel polish | 3 h | perceived stability |
 | 6A/6B — Panel redesign | 6 h | 6 buttons → 1, ~110 px back to the transcript |
 | 6C — Event ↔ transcript linking | 4 h | turns two logs into a review tool |
+| 7A — Cheap pause | 3 h | pause costs ~4 s instead of ~200 s |
+| 7B — Instant pause | 1 d | optional; removes the reload and the silence padding |
+| 8A — SNR meter and gate | 4 h | makes bad audio visible before it ruins a session |
+| 8B — Re-record and re-baseline | 2 h | every number so far was scored on far-field audio |
+| 8C — Parakeet on Metal | 3 d | removes the CPU ceiling forcing every live compromise |
+| 8D — Medical WER metric | 4 h | scores the errors that matter clinically |
+| 9A — Condition the final pass | 2 h | the deliverable finally gets Phase 4's gain |
+| 9B — VAD-off experiment | 30 min | one run; decides whether 9C is needed |
+| 9C — Adaptive level gates | 4 h | stops quiet speech being discarded pre-gain |
+| 9D — Spend the offline budget | 3 h | beam 16, better final model, wider hotwords |
+
+| 10A — LibriSpeech calibration | done | **3.68 % — the decoder is healthy** |
+| 10B — Trailing hallucination filter | 3 h | removes memorized video boilerplate |
+| 10C — Rebuild fixture with a human voice | 2 h | unblocks every other measurement |
+| 10D — Validate the fixture scorer | 2 h | makes future comparisons trustworthy |
+
+**Do Phase 10 before Phases 8 and 9.** 10A is complete and it disproved the
+premise both of those phases were written on: the final path scores 3.68 % on
+human speech, so the 15.36 % is the synthetic fixture, not the decoder. Phase 9
+remains worth doing as a set of genuine corrections, but its expected gain is
+smaller than originally stated, and Phase 8 must not be justified by the 15.36 %.
 
 Phases 6A and 6B are independent of the accuracy work and can be done at any
-point. **6C depends on Phase 3** for word timings.
+point. **6C depends on Phase 3** for word timings. **Phase 7A is a regression
+fix** — Phase 6 removed the only UI route back into an existing recording, so
+resume is currently unreachable even though the machinery for it exists.
 
 ---
 
@@ -574,11 +1125,16 @@ being lost to one bad segment.
 
 ---
 
-## Deliberately out of scope
+## Superseded: "deliberately out of scope"
 
-Swapping the live path to a Metal backend (`mlx-whisper` with
-`mlx-community/whisper-large-v3-turbo`, or `parakeet-mlx` with
-`parakeet-tdt-0.6b-v3`). CTranslate2 is CPU-only, so the GPU sits idle and both
-model loads hardcode `device="cpu"` (`:1598`, `:1668`). It is a real option and
-would be a step change, but it is a separate two-to-three-day project, and Phases
-1–4 should reach the target without it.
+This section previously deferred the Metal backend on the assumption that Phases
+1–4 would reach the accuracy target without it. **That assumption did not
+survive contact with the measurements.**
+
+Phase 3 turbo testing showed the accuracy is reachable (21.23 % WER) but not
+within the time budget on CPU — 14.606 s versus 6.612 s for the small model on
+the same decode path. CTranslate2 is CPU-only and both model loads hardcode
+`device="cpu"` (`:1598`, `:1668`), so the GPU has been idle throughout.
+
+The Metal backend is therefore **no longer out of scope — it is Phase 8C**, and
+it is on the critical path for a trustworthy live preview.

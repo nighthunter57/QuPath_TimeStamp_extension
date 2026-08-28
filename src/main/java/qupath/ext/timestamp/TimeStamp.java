@@ -257,15 +257,36 @@ public class TimeStamp implements QuPathExtension {
         CANCEL
     }
 
-    private enum RecordingWorkflowState {
+    enum RecordingWorkflowState {
         READY,
         STARTING,
         RECORDING,
+        PAUSED,
         FINALIZING,
         UNSAVED_REVIEW,
         SAVING,
         SAVED,
         ERROR
+    }
+
+    enum RecordingPrimaryAction {
+        START,
+        PAUSE,
+        RESUME,
+        SAVE,
+        WAIT
+    }
+
+    private enum TranscriptProcessPurpose {
+        NONE,
+        CAPTURE,
+        FINALIZE
+    }
+
+    private enum TranscriptStopIntent {
+        NONE,
+        PAUSE,
+        DONE
     }
     
     private boolean isInstalled = false;
@@ -284,6 +305,8 @@ public class TimeStamp implements QuPathExtension {
     private static Label liveEventCountLabel;
     private static TextArea liveTranscriptTextArea;
     private static Button recordingPrimaryButton;
+    private static Button recordingDoneButton;
+    private static Button recordMoreButton;
     private static Button transcriptSettingsButton;
     private static MenuButton transcriptMoreButton;
     private static MenuItem panelClearEventsMenuItem;
@@ -310,6 +333,9 @@ public class TimeStamp implements QuPathExtension {
     private static boolean clearLogsWhenRecordingStarts = false;
     private static volatile boolean transcriptStartPending = false;
     private static volatile boolean transcriptStopInProgress = false;
+    private static volatile boolean transcriptResumePending = false;
+    private static volatile TranscriptProcessPurpose transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+    private static volatile TranscriptStopIntent transcriptStopIntent = TranscriptStopIntent.NONE;
     private static volatile String transcriptFinalizationResult = TRANSCRIPT_FINALIZATION_PENDING;
     private static volatile int transcriptLastExitCode = -1;
     private static long transcriptLastModified = -1L;
@@ -586,6 +612,12 @@ public class TimeStamp implements QuPathExtension {
         }
         closeProtectionInstalled = true;
         qupath.getStage().addEventFilter(WindowEvent.WINDOW_CLOSE_REQUEST, event -> {
+            if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
+                event.consume();
+                Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                        "Choose Done and wait for finalization before closing QuPath.");
+                return;
+            }
             if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
                 event.consume();
                 Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
@@ -1062,6 +1094,18 @@ public class TimeStamp implements QuPathExtension {
         configureMonitorButton(recordingPrimaryButton);
         recordingPrimaryButton.setMaxWidth(Double.MAX_VALUE);
 
+        recordingDoneButton = new Button("⏹ Done");
+        recordingDoneButton.setOnAction(e -> finishRecordingSession());
+        configureMonitorButton(recordingDoneButton);
+        recordingDoneButton.setTooltip(new Tooltip(
+                "End this take and create the high-accuracy final transcript"));
+
+        recordMoreButton = new Button("↺ Record more");
+        recordMoreButton.setOnAction(e -> startRecordingSession());
+        configureMonitorButton(recordMoreButton);
+        recordMoreButton.setTooltip(new Tooltip(
+                "Resume this take and append more audio before saving"));
+
         transcriptSettingsButton = new Button("⚙ Settings");
         transcriptSettingsButton.setOnAction(e -> showTranscriptSettingsDialog());
         configureMonitorButton(transcriptSettingsButton);
@@ -1115,6 +1159,7 @@ public class TimeStamp implements QuPathExtension {
         HBox.setHgrow(transcriptAudioLevelBar, Priority.ALWAYS);
 
         transcriptSecondaryControls = new FlowPane(8, 4,
+                recordingDoneButton, recordMoreButton,
                 transcriptSettingsButton, transcriptMoreButton);
         transcriptSecondaryControls.setPrefWrapLength(300);
 
@@ -1125,7 +1170,7 @@ public class TimeStamp implements QuPathExtension {
         header.setPadding(new Insets(0, 0, 8, 0));
 
         transcriptHelpLabel = new Label(
-                "Live text is a preview. After Stop Recording, review it before saving.");
+                "Live text is a preview. Choose Done to create the final transcript before saving.");
         transcriptHelpLabel.setWrapText(true);
         transcriptHelpLabel.setStyle("-fx-text-fill: #667085; -fx-font-size: 11px;");
         transcriptPartialLabel = new Label();
@@ -1211,12 +1256,26 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void handleRecordingPrimaryAction() {
-        switch (recordingWorkflowState) {
-            case READY, SAVED -> startRecordingSession();
-            case STARTING, RECORDING -> pauseRecordingSession();
-            case UNSAVED_REVIEW, ERROR -> saveTranscriptAndTimestamps();
-            case FINALIZING, SAVING -> { }
+        switch (recordingPrimaryAction(recordingWorkflowState)) {
+            case START, RESUME -> startRecordingSession();
+            case PAUSE -> pauseRecordingSession();
+            case SAVE -> saveTranscriptAndTimestamps();
+            case WAIT -> { }
         }
+    }
+
+    static RecordingPrimaryAction recordingPrimaryAction(RecordingWorkflowState state) {
+        return switch (state) {
+            case READY, SAVED -> RecordingPrimaryAction.START;
+            case RECORDING -> RecordingPrimaryAction.PAUSE;
+            case PAUSED -> RecordingPrimaryAction.RESUME;
+            case UNSAVED_REVIEW, ERROR -> RecordingPrimaryAction.SAVE;
+            case STARTING, FINALIZING, SAVING -> RecordingPrimaryAction.WAIT;
+        };
+    }
+
+    static List<String> transcriptLifecycleArguments(boolean finalizeExisting) {
+        return List.of(finalizeExisting ? "--finalize-existing" : "--capture-only");
     }
 
     static boolean usesHorizontalPanelLayout(double width) {
@@ -1488,7 +1547,9 @@ public class TimeStamp implements QuPathExtension {
         if (recordingPrimaryButton != null) {
             recordingPrimaryButton.setText(switch (recordingWorkflowState) {
                 case READY, SAVED -> "Start Recording";
-                case STARTING, RECORDING -> "■ Stop Recording";
+                case STARTING -> "Starting microphone…";
+                case RECORDING -> "⏸ Pause";
+                case PAUSED -> "● Resume";
                 case FINALIZING -> "Creating final transcript…";
                 case UNSAVED_REVIEW, ERROR -> "Save Session";
                 case SAVING -> "Saving session…";
@@ -1497,12 +1558,16 @@ public class TimeStamp implements QuPathExtension {
                 case FINALIZING, SAVING -> true;
                 case UNSAVED_REVIEW, ERROR -> transcriptSessionDir == null;
                 case READY, SAVED -> transcriptBusy;
-                case STARTING, RECORDING -> false;
+                case STARTING -> transcriptBusy;
+                case RECORDING -> transcriptStopInProgress;
+                case PAUSED -> transcriptBusy;
             };
             recordingPrimaryButton.setDisable(primaryUnavailable);
             recordingPrimaryButton.setTooltip(new Tooltip(switch (recordingWorkflowState) {
                 case READY, SAVED -> "Begin recording audio, transcript, and QuPath interactions";
-                case STARTING, RECORDING -> "Stop recording and create the high-accuracy final transcript";
+                case STARTING -> "Waiting for the microphone to become ready";
+                case RECORDING -> "Pause this take without creating the final transcript";
+                case PAUSED -> "Resume audio, transcript, and event capture in this same take";
                 case FINALIZING -> "The complete saved audio is being transcribed";
                 case UNSAVED_REVIEW, ERROR ->
                         "Choose a folder and save transcript, timestamps, and session manifest";
@@ -1521,7 +1586,9 @@ public class TimeStamp implements QuPathExtension {
                 case READY, STARTING ->
                         "The transcript will appear here as soon as recording begins.";
                 case RECORDING ->
-                        "Live text is a preview. Accuracy improves after Stop Recording.";
+                        "Live text is a preview. Pause is reversible; Done creates the final transcript.";
+                case PAUSED ->
+                        "This take is paused. Resume it, or choose Done to create the final transcript.";
                 case FINALIZING, SAVING ->
                         "Please wait while the complete saved audio is processed. Your live text remains protected.";
                 case UNSAVED_REVIEW ->
@@ -1555,18 +1622,35 @@ public class TimeStamp implements QuPathExtension {
             transcriptFinalizationProgressBar.setManaged(showFinalization);
         }
         boolean showSecondaryControls = switch (recordingWorkflowState) {
-            case READY, UNSAVED_REVIEW, SAVED, ERROR -> true;
-            case STARTING, RECORDING, FINALIZING, SAVING -> false;
+            case READY, RECORDING, PAUSED, UNSAVED_REVIEW, SAVED, ERROR -> true;
+            case STARTING, FINALIZING, SAVING -> false;
         };
         if (transcriptSecondaryControls != null) {
             transcriptSecondaryControls.setVisible(showSecondaryControls);
             transcriptSecondaryControls.setManaged(showSecondaryControls);
         }
         if (transcriptSettingsButton != null) {
+            boolean showSettings = recordingWorkflowState != RecordingWorkflowState.RECORDING;
+            transcriptSettingsButton.setVisible(showSettings);
+            transcriptSettingsButton.setManaged(showSettings);
             transcriptSettingsButton.setDisable(recording || transcriptBusy);
+        }
+        boolean showDone = recordingWorkflowState == RecordingWorkflowState.RECORDING ||
+                recordingWorkflowState == RecordingWorkflowState.PAUSED;
+        if (recordingDoneButton != null) {
+            recordingDoneButton.setVisible(showDone);
+            recordingDoneButton.setManaged(showDone);
+            recordingDoneButton.setDisable(transcriptStopInProgress);
+        }
+        boolean showRecordMore = recordingWorkflowState == RecordingWorkflowState.UNSAVED_REVIEW;
+        if (recordMoreButton != null) {
+            recordMoreButton.setVisible(showRecordMore);
+            recordMoreButton.setManaged(showRecordMore);
+            recordMoreButton.setDisable(transcriptBusy);
         }
         if (panelExportTranscriptMenuItem != null) {
             panelExportTranscriptMenuItem.setDisable(recording || transcriptBusy ||
+                    recordingWorkflowState == RecordingWorkflowState.PAUSED ||
                     transcriptFile == null || !transcriptFile.isFile());
         }
         if (panelClearEventsMenuItem != null) {
@@ -1574,6 +1658,9 @@ public class TimeStamp implements QuPathExtension {
                     (eventLog.isEmpty() && mouseMoveLog.isEmpty()));
         }
         if (transcriptMoreButton != null) {
+            boolean showMore = recordingWorkflowState != RecordingWorkflowState.RECORDING;
+            transcriptMoreButton.setVisible(showMore);
+            transcriptMoreButton.setManaged(showMore);
             transcriptMoreButton.setDisable(
                     (panelExportTranscriptMenuItem == null || panelExportTranscriptMenuItem.isDisable()) &&
                     (panelClearEventsMenuItem == null || panelClearEventsMenuItem.isDisable()));
@@ -1588,7 +1675,8 @@ public class TimeStamp implements QuPathExtension {
         if (recordingWorkflowState != lastPanelWorkflowState) {
             if (recordingWorkflowState == RecordingWorkflowState.RECORDING) {
                 setPanelDividerPosition(RECORDING_PANEL_DIVIDER_POSITION);
-            } else if (recordingWorkflowState == RecordingWorkflowState.UNSAVED_REVIEW) {
+            } else if (recordingWorkflowState == RecordingWorkflowState.PAUSED ||
+                    recordingWorkflowState == RecordingWorkflowState.UNSAVED_REVIEW) {
                 setPanelDividerPosition(DEFAULT_PANEL_DIVIDER_POSITION);
             }
             lastPanelWorkflowState = recordingWorkflowState;
@@ -1602,8 +1690,10 @@ public class TimeStamp implements QuPathExtension {
         }
         String stateText = switch (recordingWorkflowState) {
             case READY -> "Ready";
-            case STARTING -> "Starting microphone…";
+            case STARTING -> transcriptResumePending ? "Resuming microphone…" : "Starting microphone…";
             case RECORDING -> "Recording";
+            case PAUSED -> "Paused · " + formatDurationSeconds(
+                    Math.round(recordingAudioDurationSeconds())) + " recorded";
             case FINALIZING -> "Creating final transcript…";
             case UNSAVED_REVIEW -> "Review transcript, then save";
             case SAVING -> "Saving session…";
@@ -1627,6 +1717,7 @@ public class TimeStamp implements QuPathExtension {
         recordingStateDotLabel.setStyle("-fx-text-fill: " + switch (recordingWorkflowState) {
             case READY -> "#98a2b3";
             case RECORDING -> "#d92d20";
+            case PAUSED -> "#d97706";
             case SAVED -> "#2f9e44";
             case STARTING, FINALIZING, SAVING -> "#d97706";
             case UNSAVED_REVIEW -> "#2f80ed";
@@ -1709,6 +1800,7 @@ public class TimeStamp implements QuPathExtension {
         }
 
         clearLogsWhenRecordingStarts = startMode == TranscriptStartMode.NEW_TAKE;
+        transcriptResumePending = startMode == TranscriptStartMode.RESUME;
         transcriptStartPending = true;
         recordingWorkflowState = RecordingWorkflowState.STARTING;
         recordingSessionDirty = true;
@@ -1716,6 +1808,7 @@ public class TimeStamp implements QuPathExtension {
         boolean transcriptStarted = startTranscriptProcess(startMode == TranscriptStartMode.NEW_TAKE);
         if (!transcriptStarted) {
             transcriptStartPending = false;
+            transcriptResumePending = false;
             clearLogsWhenRecordingStarts = false;
             recordEvents.set(false);
             recordingWorkflowState = RecordingWorkflowState.ERROR;
@@ -1765,6 +1858,9 @@ public class TimeStamp implements QuPathExtension {
         transcriptLiveModelReady = false;
         transcriptSilenceWarningActive = false;
         transcriptClippingWarningActive = false;
+        transcriptResumePending = false;
+        transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+        transcriptStopIntent = TranscriptStopIntent.NONE;
         nextEventSequence = 1L;
         recordingSessionDirty = false;
         recordingWorkflowState = RecordingWorkflowState.READY;
@@ -1974,6 +2070,7 @@ public class TimeStamp implements QuPathExtension {
                     previousText,
                     "--hotwords",
                     hotwords));
+            command.addAll(transcriptLifecycleArguments(false));
             if (!device.isBlank()) {
                 command.add("--device");
                 command.add(device);
@@ -1983,6 +2080,8 @@ public class TimeStamp implements QuPathExtension {
             processBuilder.redirectErrorStream(true);
             transcriptProcess = processBuilder.start();
             transcriptStopInProgress = false;
+            transcriptProcessPurpose = TranscriptProcessPurpose.CAPTURE;
+            transcriptStopIntent = TranscriptStopIntent.NONE;
             consumeTranscriptProcessOutput(transcriptProcess);
 
             if (transcriptStatusLabel != null) {
@@ -2006,17 +2105,115 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 
+    private static void startTranscriptFinalizationProcess() {
+        if (transcriptSessionDir == null || transcriptFile == null) {
+            recordingWorkflowState = RecordingWorkflowState.ERROR;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText(
+                        "Transcript: recording files are unavailable for finalization");
+            }
+            updateLiveEventMonitorControls();
+            return;
+        }
+
+        File pythonScript = findTranscriptPythonScript();
+        String pythonExecutable = findTranscriptPythonExecutable();
+        if (pythonScript == null) {
+            recordingWorkflowState = RecordingWorkflowState.ERROR;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: bundled Python helper unavailable");
+            }
+            updateLiveEventMonitorControls();
+            return;
+        }
+
+        try {
+            ClinicalTranscriptSettings settings = clinicalTranscriptSettings();
+            List<String> command = new ArrayList<>(Arrays.asList(
+                    pythonExecutable,
+                    "-u",
+                    pythonScript.getAbsolutePath(),
+                    "--output",
+                    transcriptFile.getAbsolutePath(),
+                    "--model",
+                    settings.finalModel(),
+                    "--language",
+                    defaultIfBlank(transcriptLanguage.get(), DEFAULT_TRANSCRIPT_LANGUAGE),
+                    "--compute-type",
+                    settings.computeType(),
+                    "--beam-size",
+                    settings.beamSize(),
+                    "--best-of",
+                    settings.bestOf(),
+                    "--previous-text",
+                    Boolean.toString(settings.previousText()),
+                    "--hotwords",
+                    defaultIfBlank(transcriptHotwords.get(), DEFAULT_TRANSCRIPT_HOTWORDS)));
+            command.addAll(transcriptLifecycleArguments(true));
+            ProcessBuilder processBuilder = new ProcessBuilder(command);
+            configureTranscriptProcessEnvironment(processBuilder, pythonExecutable);
+            processBuilder.redirectErrorStream(true);
+
+            transcriptFinalizationResult = TRANSCRIPT_FINALIZATION_PENDING;
+            transcriptLastExitCode = -1;
+            transcriptStartPending = false;
+            transcriptResumePending = false;
+            transcriptStopInProgress = true;
+            transcriptProcessPurpose = TranscriptProcessPurpose.FINALIZE;
+            transcriptStopIntent = TranscriptStopIntent.DONE;
+            recordingWorkflowState = RecordingWorkflowState.FINALIZING;
+            resetTranscriptFinalizationProgress();
+            showTranscriptFinalizationProgress();
+            transcriptProcess = processBuilder.start();
+            consumeTranscriptProcessOutput(transcriptProcess);
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: creating final transcript from saved audio");
+            }
+            updateLiveEventMonitorControls();
+            waitForTranscriptFinalization(transcriptProcess);
+        } catch (IOException e) {
+            logger.error("Failed to start final transcript process", e);
+            transcriptProcess = null;
+            transcriptStopInProgress = false;
+            transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+            transcriptStopIntent = TranscriptStopIntent.NONE;
+            transcriptFinalizationResult = TRANSCRIPT_FINALIZATION_FAILED;
+            recordingWorkflowState = RecordingWorkflowState.ERROR;
+            if (transcriptStatusLabel != null) {
+                transcriptStatusLabel.setText("Transcript: failed to start finalization");
+            }
+            updateLiveEventMonitorControls();
+            Dialogs.showErrorMessage("Transcript Finalization Failed",
+                    "Could not start final transcription. " + e.getMessage());
+        }
+    }
+
     private static void pauseRecordingSession() {
         boolean wasRecording = recordEvents.get();
         recordEvents.set(false);
-        recordingWorkflowState = RecordingWorkflowState.FINALIZING;
         transcriptStartPending = false;
+        transcriptResumePending = false;
         clearLogsWhenRecordingStarts = false;
         if (wasRecording) {
             logSessionBoundary("Recording Paused");
         }
-        updateLiveEventMonitorControls();
-        stopTranscriptProcess();
+        stopTranscriptProcess(TranscriptStopIntent.PAUSE);
+    }
+
+    private static void finishRecordingSession() {
+        boolean wasRecording = recordEvents.get();
+        recordEvents.set(false);
+        transcriptStartPending = false;
+        transcriptResumePending = false;
+        clearLogsWhenRecordingStarts = false;
+        if (wasRecording) {
+            logSessionBoundary("Recording Finished");
+        }
+        if (transcriptProcess != null && transcriptProcess.isAlive()) {
+            stopTranscriptProcess(TranscriptStopIntent.DONE);
+        } else {
+            startTranscriptFinalizationProcess();
+        }
     }
 
     private static void ensureTranscriptRefreshStarted() {
@@ -2227,6 +2424,7 @@ public class TimeStamp implements QuPathExtension {
         return switch (recordingWorkflowState) {
             case READY, STARTING -> "Transcript text will appear when recording begins.";
             case RECORDING -> "Listening for speech…";
+            case PAUSED -> "Recording is paused; Resume or choose Done.";
             case FINALIZING, SAVING -> "Processing the complete audio…";
             case UNSAVED_REVIEW, SAVED ->
                     "No speech was transcribed. You may enter a note here before saving.";
@@ -2825,6 +3023,11 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void exportTranscript() {
+        if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Choose Done and wait for the final transcript before exporting.");
+            return;
+        }
         String transcriptText = liveTranscriptTextArea == null ? "" : liveTranscriptTextArea.getText();
         if (transcriptText == null || transcriptText.isBlank()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY, "Transcript is empty. Nothing to export.");
@@ -2852,6 +3055,11 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static boolean saveTranscriptAndTimestamps() {
+        if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Choose Done and wait for the final transcript before saving.");
+            return false;
+        }
         if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
                     "Pause recording and wait for transcript finalization before saving.");
@@ -3178,7 +3386,7 @@ public class TimeStamp implements QuPathExtension {
                                 refreshTranscriptContents(true);
                                 if (transcriptStatusLabel != null && !transcriptClippingWarningActive) {
                                     transcriptStatusLabel.setText(
-                                            "Transcript: receiving fast preview; final accuracy after Stop Recording");
+                                            "Transcript: receiving fast preview; final accuracy after Done");
                                 }
                             }
                             case TRANSCRIPT_PARTIAL ->
@@ -3187,12 +3395,14 @@ public class TimeStamp implements QuPathExtension {
                                 if (!transcriptStartPending || !process.isAlive()) {
                                     return;
                                 }
+                                boolean resumedCapture = transcriptResumePending;
                                 if (clearLogsWhenRecordingStarts) {
                                     eventLog.clear();
                                     mouseMoveLog.clear();
                                     clearLogsWhenRecordingStarts = false;
                                 }
                                 transcriptStartPending = false;
+                                transcriptResumePending = false;
                                 transcriptCaptureStarted = true;
                                 recordingWorkflowState = RecordingWorkflowState.RECORDING;
                                 recordingSessionDirty = true;
@@ -3201,7 +3411,7 @@ public class TimeStamp implements QuPathExtension {
                                     transcriptStatusLabel.setText(
                                             "Transcript: recording audio; warming speech model");
                                 }
-                                logSessionBoundary("Recording Started");
+                                logSessionBoundary(resumedCapture ? "Recording Resumed" : "Recording Started");
                                 updateLiveEventMonitorControls();
                                 refreshLiveEventMonitor();
                             }
@@ -3291,13 +3501,18 @@ public class TimeStamp implements QuPathExtension {
                     if (transcriptProcess != process) {
                         return;
                     }
-                    boolean unexpectedStop = !transcriptStopInProgress &&
+                    boolean unexpectedStop = transcriptProcessPurpose == TranscriptProcessPurpose.CAPTURE &&
+                            transcriptStopIntent == TranscriptStopIntent.NONE &&
+                            !transcriptStopInProgress &&
                             (recordEvents.get() || transcriptStartPending);
                     if (unexpectedStop) {
                         recordEvents.set(false);
                         transcriptStartPending = false;
+                        transcriptResumePending = false;
                         clearLogsWhenRecordingStarts = false;
                         transcriptProcess = null;
+                        transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+                        transcriptStopIntent = TranscriptStopIntent.NONE;
                         logSessionBoundary("Transcription Failed");
                         transcriptFinalizationResult = TRANSCRIPT_FINALIZATION_FAILED;
                         transcriptLastExitCode = safeExitValue(process);
@@ -3309,10 +3524,6 @@ public class TimeStamp implements QuPathExtension {
                         if (unexpectedStop) {
                             transcriptStatusLabel.setText(
                                     "Transcript: Error: microphone process stopped; event recording was paused");
-                        } else if (transcriptStopInProgress) {
-                            transcriptStatusLabel.setText("Transcript: finalizing transcript");
-                        } else {
-                            transcriptStatusLabel.setText("Transcript: paused");
                         }
                     }
                     updateLiveEventMonitorControls();
@@ -3325,17 +3536,30 @@ public class TimeStamp implements QuPathExtension {
         thread.start();
     }
 
-    private static void stopTranscriptProcess() {
+    private static void stopTranscriptProcess(TranscriptStopIntent intent) {
         Process process = transcriptProcess;
         if (process == null) {
             transcriptStartPending = false;
+            transcriptResumePending = false;
             transcriptStopInProgress = false;
             resetTranscriptAudioLevelIndicator();
             transcriptLastExitCode = -1;
-            recordingWorkflowState = RecordingWorkflowState.ERROR;
-            if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText(
-                        "Recorder unavailable; choose Save Session to preserve available data");
+            transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+            transcriptStopIntent = TranscriptStopIntent.NONE;
+            if (intent == TranscriptStopIntent.PAUSE && transcriptCaptureStarted) {
+                recordingWorkflowState = RecordingWorkflowState.PAUSED;
+                if (transcriptStatusLabel != null) {
+                    transcriptStatusLabel.setText("Transcript: paused");
+                }
+            } else if (intent == TranscriptStopIntent.DONE && transcriptCaptureStarted) {
+                startTranscriptFinalizationProcess();
+                return;
+            } else {
+                recordingWorkflowState = RecordingWorkflowState.ERROR;
+                if (transcriptStatusLabel != null) {
+                    transcriptStatusLabel.setText(
+                            "Recorder unavailable; available session data remains protected");
+                }
             }
             updateLiveEventMonitorControls();
             return;
@@ -3345,26 +3569,97 @@ public class TimeStamp implements QuPathExtension {
             int exitCode = safeExitValue(process);
             transcriptProcess = null;
             transcriptStartPending = false;
+            transcriptResumePending = false;
             transcriptStopInProgress = false;
             resetTranscriptAudioLevelIndicator();
             transcriptLastExitCode = exitCode;
-            recordingWorkflowState = RecordingWorkflowState.UNSAVED_REVIEW;
-            if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText(buildReadyToSaveStatusText(transcriptFinalizationResult));
+            transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+            transcriptStopIntent = TranscriptStopIntent.NONE;
+            if (intent == TranscriptStopIntent.PAUSE) {
+                recordingWorkflowState = RecordingWorkflowState.PAUSED;
+                if (transcriptStatusLabel != null) {
+                    transcriptStatusLabel.setText("Transcript: paused");
+                }
+            } else {
+                startTranscriptFinalizationProcess();
+                return;
             }
             updateLiveEventMonitorControls();
             return;
         }
 
         transcriptStopInProgress = true;
-        recordingWorkflowState = RecordingWorkflowState.FINALIZING;
+        transcriptStopIntent = intent;
+        recordingWorkflowState = intent == TranscriptStopIntent.PAUSE
+                ? RecordingWorkflowState.PAUSED
+                : RecordingWorkflowState.FINALIZING;
         updateLiveEventMonitorControls();
         if (transcriptStatusLabel != null) {
-            transcriptStatusLabel.setText("Transcript: finalizing transcript");
+            transcriptStatusLabel.setText(intent == TranscriptStopIntent.PAUSE
+                    ? "Transcript: pausing capture"
+                    : "Transcript: stopping capture before finalization");
         }
-        showTranscriptFinalizationProgress();
         process.destroy();
 
+        Thread waitThread = new Thread(() -> {
+            final boolean[] timedOut = {false};
+            final boolean[] interrupted = {false};
+            final int[] exitCode = {-1};
+            try {
+                long timeoutSeconds = 120L;
+                logger.info("Waiting up to {} seconds for transcript capture to stop", timeoutSeconds);
+                if (!process.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)) {
+                    timedOut[0] = true;
+                    process.destroyForcibly();
+                    process.waitFor();
+                }
+                exitCode[0] = safeExitValue(process);
+                waitForTranscriptOutputDrain();
+            } catch (InterruptedException e) {
+                interrupted[0] = true;
+                Thread.currentThread().interrupt();
+                process.destroyForcibly();
+            } finally {
+                Platform.runLater(() -> {
+                    if (transcriptProcess == process) {
+                        transcriptProcess = null;
+                    }
+                    transcriptStopInProgress = false;
+                    transcriptLastExitCode = exitCode[0];
+                    transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+                    transcriptStopIntent = TranscriptStopIntent.NONE;
+                    resetTranscriptAudioLevelIndicator();
+                    if (timedOut[0] || interrupted[0] || exitCode[0] != 0) {
+                        recordingWorkflowState = RecordingWorkflowState.ERROR;
+                        transcriptFinalizationResult = timedOut[0]
+                                ? "live-preserved-pause-timeout"
+                                : (interrupted[0]
+                                ? "live-preserved-pause-interrupted"
+                                : "live-preserved-pause-failed");
+                        if (transcriptStatusLabel != null) {
+                            transcriptStatusLabel.setText(
+                                    "Warning: capture did not stop cleanly; available audio and transcript are preserved");
+                        }
+                    } else if (intent == TranscriptStopIntent.PAUSE) {
+                        transcriptFinalizationResult = "paused";
+                        recordingWorkflowState = RecordingWorkflowState.PAUSED;
+                        if (transcriptStatusLabel != null) {
+                            transcriptStatusLabel.setText("Transcript: paused; Resume or choose Done");
+                        }
+                    } else {
+                        startTranscriptFinalizationProcess();
+                        return;
+                    }
+                    updateLiveEventMonitorControls();
+                    refreshTranscriptContents(true);
+                });
+            }
+        }, "timestamp-transcript-pause");
+        waitThread.setDaemon(true);
+        waitThread.start();
+    }
+
+    private static void waitForTranscriptFinalization(Process process) {
         Thread waitThread = new Thread(() -> {
             final boolean[] timedOut = {false};
             final boolean[] interrupted = {false};
@@ -3392,9 +3687,13 @@ public class TimeStamp implements QuPathExtension {
                         transcriptProcess = null;
                     }
                     transcriptStopInProgress = false;
+                    transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+                    transcriptStopIntent = TranscriptStopIntent.NONE;
                     transcriptLastExitCode = exitCode[0];
                     transcriptFinalizationResult = finalizationResult;
-                    recordingWorkflowState = timedOut[0] || interrupted[0]
+                    boolean failed = timedOut[0] || interrupted[0] || exitCode[0] != 0 ||
+                            TRANSCRIPT_FINALIZATION_FAILED.equals(finalizationResult);
+                    recordingWorkflowState = failed
                             ? RecordingWorkflowState.ERROR
                             : RecordingWorkflowState.UNSAVED_REVIEW;
                     resetTranscriptAudioLevelIndicator();

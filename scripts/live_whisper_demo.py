@@ -55,6 +55,26 @@ PROMPT_RESET_ON_TEMPERATURE = 0.5
 STRUCTURAL_LOOP_NGRAM_SIZE = 3
 STRUCTURAL_LOOP_MIN_WORDS = 12
 STRUCTURAL_LOOP_MAX_SHARE = 0.30
+TRAILING_HALLUCINATION_MIN_SILENCE_SECONDS = 0.5
+TRAILING_HALLUCINATION_REFERENCE_AUDIO_SECONDS = 0.5
+TRAILING_HALLUCINATION_MAX_LEVEL_RATIO = 0.5
+KNOWN_TRAILING_HALLUCINATION_PHRASES = frozenset({
+    "amaraorg",
+    "like and subscribe",
+    "please like and subscribe",
+    "please subscribe",
+    "subscribe to my channel",
+    "subtitles by",
+    "thank you for watching",
+    "thank you so much for watching",
+    "thanks for watching",
+    "thanks so much for watching",
+    "we will be right back",
+    "well be right back",
+})
+KNOWN_TRAILING_HALLUCINATION_PREFIXES = (
+    "subtitles by ",
+)
 MAX_HOTWORD_TERMS = 15
 FAST_INITIAL_LIVE_WINDOW_SECONDS = 0.5
 FAST_LIVE_STEP_SECONDS = 1.0
@@ -166,6 +186,17 @@ def parse_args() -> argparse.Namespace:
         "--hotwords",
         default=DEFAULT_PATHOLOGY_HOTWORDS,
         help="Comma-separated terminology used to bias live and final recognition",
+    )
+    lifecycle = parser.add_mutually_exclusive_group()
+    lifecycle.add_argument(
+        "--capture-only",
+        action="store_true",
+        help="Capture live audio and transcript updates, but skip the offline final pass on exit",
+    )
+    lifecycle.add_argument(
+        "--finalize-existing",
+        action="store_true",
+        help="Run only the offline final pass for an existing capture without opening a microphone",
     )
     return parser.parse_args()
 
@@ -590,6 +621,13 @@ def condition_live_audio(audio):
     return apply_slow_agc(remove_dc_and_high_pass(audio))
 
 
+def decode_saved_audio(audio_path: Path):
+    """Decode a saved recording to a mono float32 array without changing the WAV."""
+    from faster_whisper.audio import decode_audio
+
+    return decode_audio(str(audio_path), sampling_rate=SAMPLE_RATE)
+
+
 def clipped_sample_fraction(audio) -> float:
     if audio.size == 0:
         return 0.0
@@ -642,6 +680,58 @@ def looks_like_structural_repetition_loop(text: str) -> bool:
         ngram = tuple(words[index:index + ngram_size])
         counts[ngram] = counts.get(ngram, 0) + 1
     return max(counts.values()) / ngram_count > STRUCTURAL_LOOP_MAX_SHARE
+
+
+def looks_like_known_trailing_hallucination(text: str) -> bool:
+    normalized = normalize_transcript_text(text)
+    return (
+        normalized in KNOWN_TRAILING_HALLUCINATION_PHRASES
+        or any(normalized.startswith(prefix) for prefix in KNOWN_TRAILING_HALLUCINATION_PREFIXES)
+    )
+
+
+def final_segment_follows_audio_level_drop(previous_segment, final_segment, audio) -> bool:
+    if audio is None or audio.size == 0:
+        return False
+    final_start_sample = max(0, min(audio.shape[0], round(float(final_segment.start) * SAMPLE_RATE)))
+    final_end_sample = max(
+        final_start_sample,
+        min(audio.shape[0], round(float(final_segment.end) * SAMPLE_RATE)),
+    )
+    reference_samples = round(TRAILING_HALLUCINATION_REFERENCE_AUDIO_SECONDS * SAMPLE_RATE)
+    reference_start_sample = max(0, final_start_sample - reference_samples)
+    final_level = audio_rms(audio[final_start_sample:final_end_sample])
+    reference_level = audio_rms(audio[reference_start_sample:final_start_sample])
+    return (
+        reference_level >= CHUNK_RMS_SILENCE_THRESHOLD
+        and final_level <= reference_level * TRAILING_HALLUCINATION_MAX_LEVEL_RATIO
+    )
+
+
+def filter_trailing_hallucination_segments(segments, audio=None):
+    """Drop known boilerplate only when it follows silence at the transcript tail."""
+    resolved_segments = list(segments)
+    if len(resolved_segments) < 2:
+        return resolved_segments
+    previous_segment = resolved_segments[-2]
+    final_segment = resolved_segments[-1]
+    silence_gap_seconds = max(
+        0.0,
+        float(final_segment.start) - float(previous_segment.end),
+    )
+    if (
+        looks_like_known_trailing_hallucination(final_segment.text)
+        and (
+            silence_gap_seconds >= TRAILING_HALLUCINATION_MIN_SILENCE_SECONDS
+            or final_segment_follows_audio_level_drop(
+                previous_segment,
+                final_segment,
+                audio,
+            )
+        )
+    ):
+        return resolved_segments[:-1]
+    return resolved_segments
 
 
 def should_drop_low_energy_short_segment(text: str, chunk_rms: float) -> bool:
@@ -755,6 +845,7 @@ def transcribe_audio_segments(
             context_prompt=context_prompt,
         ),
     )
+    segments = filter_trailing_hallucination_segments(segments, audio)
 
     entries: list[
         tuple[
@@ -987,8 +1078,10 @@ def transcribe_saved_audio_with_timings(
     hotwords: Optional[str] = DEFAULT_PATHOLOGY_HOTWORDS,
     progress_callback=None,
 ) -> tuple[list[str], list[dict], list[dict]]:
+    raw_audio = decode_saved_audio(audio_path)
+    conditioned_audio = condition_live_audio(raw_audio)
     segments, transcription_info = model.transcribe(
-        str(audio_path),
+        conditioned_audio,
         **build_transcribe_kwargs(
             language,
             beam_size,
@@ -998,6 +1091,7 @@ def transcribe_saved_audio_with_timings(
             hotwords=hotwords,
         ),
     )
+    segments = filter_trailing_hallucination_segments(segments, raw_audio)
 
     duration_seconds = float(getattr(transcription_info, "duration", 0.0) or 0.0)
     if duration_seconds <= 0:
@@ -1253,11 +1347,137 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
     return 0
 
 
+def finalize_existing_capture(
+    whisper_model_class,
+    args: argparse.Namespace,
+    out_path: Path,
+    raw_audio_wave_path: Path,
+    recording_start_time: Optional[datetime],
+    language: Optional[str],
+    previous_text: bool,
+    reusable_model=None,
+    reusable_model_name: Optional[str] = None,
+) -> int:
+    """Regenerate the final transcript from an existing capture and emit one terminal result."""
+    live_backup_path = out_path.with_name(f"{out_path.stem}_live{out_path.suffix}")
+    segment_timing_path = out_path.with_name(f"{out_path.stem}_segments.csv")
+    word_timing_path = out_path.with_name(f"{out_path.stem}_words.csv")
+    finalization_result = "no-audio"
+    finalization_failed = False
+
+    if recording_start_time is not None:
+        try:
+            if wave_audio_duration_seconds(raw_audio_wave_path) > 0:
+                final_model = reusable_model
+                if final_model is None or reusable_model_name != args.model:
+                    print(f"Loading final faster-whisper model: {args.model}")
+                    final_model = None
+                    gc.collect()
+                    final_model, final_compute_type = load_cpu_whisper_model(
+                        whisper_model_class,
+                        args.model,
+                        args.compute_type,
+                    )
+                    if final_compute_type != args.compute_type:
+                        print(
+                            "Warning: final model compute type "
+                            f"'{args.compute_type}' is unavailable; using "
+                            f"'{final_compute_type}'.",
+                            file=sys.stderr,
+                        )
+
+                def report_finalization_progress(completed_seconds: float, total_seconds: float) -> None:
+                    emit_protocol_message(
+                        "FINALIZE_PROGRESS",
+                        f"{max(0.0, completed_seconds):.3f}",
+                        f"{max(0.0, total_seconds):.3f}",
+                    )
+
+                final_lines, segment_rows, word_rows = transcribe_saved_audio_with_timings(
+                    final_model,
+                    raw_audio_wave_path,
+                    language,
+                    recording_start_time,
+                    args.beam_size,
+                    args.best_of,
+                    previous_text,
+                    args.hotwords,
+                    report_finalization_progress,
+                )
+                if final_lines and not has_suspicious_transcript_repetition(final_lines):
+                    existing_lines = []
+                    if out_path.exists():
+                        existing_text = out_path.read_text(encoding="utf-8")
+                        existing_lines = existing_text.splitlines()
+                        live_backup_path.write_text(existing_text, encoding="utf-8")
+                    final_lines = preserve_matching_live_timestamps(final_lines, existing_lines)
+                    write_csv_rows(
+                        segment_timing_path,
+                        ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
+                        segment_rows,
+                    )
+                    write_csv_rows(
+                        word_timing_path,
+                        ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
+                        word_rows,
+                    )
+                    write_lines(out_path, final_lines)
+                    finalization_result = "final"
+                    print(f"Final transcript regenerated from full audio: {out_path}")
+                elif final_lines:
+                    finalization_result = "live-fallback-repetition"
+                    print(
+                        "Warning: final offline transcript contained suspicious repetition; keeping live transcript.",
+                        file=sys.stderr,
+                    )
+                else:
+                    finalization_result = "live-fallback-empty"
+                    print(
+                        "Warning: final offline transcript pass produced no text; keeping live transcript.",
+                        file=sys.stderr,
+                    )
+            else:
+                finalization_result = "no-audio"
+                print("Warning: no saved audio available for final transcript pass.", file=sys.stderr)
+        except Exception as exc:
+            finalization_result = "failed"
+            finalization_failed = True
+            print(f"Warning: failed final offline transcript pass: {exc}", file=sys.stderr)
+
+    if finalization_result.startswith("live-fallback") and out_path.exists():
+        try:
+            fallback_lines = out_path.read_text(encoding="utf-8").splitlines()
+            write_csv_rows(
+                segment_timing_path,
+                ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
+                build_live_fallback_segment_rows(
+                    fallback_lines,
+                    recording_start_time or datetime.now(timezone.utc),
+                ),
+            )
+            write_csv_rows(
+                word_timing_path,
+                ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
+                (),
+            )
+        except OSError as exc:
+            finalization_result = "failed"
+            finalization_failed = True
+            print(f"Warning: failed to save fallback transcript timings: {exc}", file=sys.stderr)
+
+    emit_protocol_message("FINALIZATION_RESULT", finalization_result)
+    print(f"Stopped. Transcript available at: {out_path}")
+    return 1 if finalization_failed else 0
+
+
 def main() -> int:
     args = parse_args()
 
     if not args.list_devices and not args.check_audio and not args.output:
         print("Error: --output is required unless --list-devices or --check-audio is used.", file=sys.stderr)
+        return 2
+    if args.finalize_existing and (args.list_devices or args.check_audio):
+        print("Error: --finalize-existing cannot be combined with audio-device commands.", file=sys.stderr)
         return 2
 
     try:
@@ -1290,20 +1510,22 @@ def main() -> int:
         print_input_devices(sd)
         return 0
 
-    device = resolve_or_fallback_input_device(sd, args.device)
-    try:
-        sd.check_input_settings(
-            device=device,
-            channels=CHANNELS,
-            samplerate=SAMPLE_RATE,
-            dtype="float32",
-        )
-    except Exception as exc:
-        print(f"Error: invalid input device '{args.device}': {exc}", file=sys.stderr)
-        return 2
+    device = None
+    if not args.finalize_existing:
+        device = resolve_or_fallback_input_device(sd, args.device)
+        try:
+            sd.check_input_settings(
+                device=device,
+                channels=CHANNELS,
+                samplerate=SAMPLE_RATE,
+                dtype="float32",
+            )
+        except Exception as exc:
+            print(f"Error: invalid input device '{args.device}': {exc}", file=sys.stderr)
+            return 2
 
-    if args.check_audio:
-        return run_audio_check(sd, np, device, max(0.0, args.check_seconds))
+        if args.check_audio:
+            return run_audio_check(sd, np, device, max(0.0, args.check_seconds))
 
     try:
         from faster_whisper import WhisperModel
@@ -1317,9 +1539,6 @@ def main() -> int:
 
     out_path = Path(args.output).expanduser().resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    live_backup_path = out_path.with_name(f"{out_path.stem}_live{out_path.suffix}")
-    segment_timing_path = out_path.with_name(f"{out_path.stem}_segments.csv")
-    word_timing_path = out_path.with_name(f"{out_path.stem}_words.csv")
     raw_audio_path = out_path.with_name(f"{out_path.stem}_audio.raw")
     raw_audio_wave_path = out_path.with_name(f"{out_path.stem}_audio.wav")
     recording_start_path = out_path.with_name(f"{out_path.stem}_audio.start.txt")
@@ -1330,6 +1549,18 @@ def main() -> int:
         return 1
 
     language = None if args.language.lower() == "auto" else args.language
+    if args.finalize_existing:
+        recording_start_time = read_recording_start(recording_start_path)
+        return finalize_existing_capture(
+            WhisperModel,
+            args,
+            out_path,
+            raw_audio_wave_path,
+            recording_start_time,
+            language,
+            previous_text,
+        )
+
     live_model_candidates = choose_live_model_candidates(args.model, language)
     live_model_name = live_model_candidates[0]
     initial_live_window_seconds = min(FAST_INITIAL_LIVE_WINDOW_SECONDS, args.chunk_seconds, INITIAL_LIVE_WINDOW_SECONDS)
@@ -1712,109 +1943,22 @@ def main() -> int:
     if live_model is not None:
         maybe_transcribe_latest_live_audio(force=True)
 
-    finalization_result = "no-audio"
-    finalization_failed = False
-    if recording_start_time is not None:
-        try:
-            if wave_audio_duration_seconds(raw_audio_wave_path) > 0:
-                final_model = live_model
-                if final_model is None or live_model_name != args.model:
-                    print(f"Loading final faster-whisper model: {args.model}")
-                    live_model = None
-                    final_model = None
-                    gc.collect()
-                    final_model, final_compute_type = load_cpu_whisper_model(
-                        WhisperModel,
-                        args.model,
-                        args.compute_type,
-                    )
-                    if final_compute_type != args.compute_type:
-                        print(
-                            "Warning: final model compute type "
-                            f"'{args.compute_type}' is unavailable; using "
-                            f"'{final_compute_type}'.",
-                            file=sys.stderr,
-                        )
+    if args.capture_only:
+        emit_protocol_message("FINALIZATION_RESULT", "paused")
+        print(f"Paused. Transcript and audio remain resumable at: {out_path}")
+        return 0
 
-                def report_finalization_progress(completed_seconds: float, total_seconds: float) -> None:
-                    emit_protocol_message(
-                        "FINALIZE_PROGRESS",
-                        f"{max(0.0, completed_seconds):.3f}",
-                        f"{max(0.0, total_seconds):.3f}",
-                    )
-
-                final_lines, segment_rows, word_rows = transcribe_saved_audio_with_timings(
-                    final_model,
-                    raw_audio_wave_path,
-                    language,
-                    recording_start_time,
-                    args.beam_size,
-                    args.best_of,
-                    previous_text,
-                    args.hotwords,
-                    report_finalization_progress,
-                )
-                if final_lines and not has_suspicious_transcript_repetition(final_lines):
-                    existing_lines = []
-                    if out_path.exists():
-                        existing_text = out_path.read_text(encoding="utf-8")
-                        existing_lines = existing_text.splitlines()
-                        live_backup_path.write_text(existing_text, encoding="utf-8")
-                    final_lines = preserve_matching_live_timestamps(final_lines, existing_lines)
-                    write_csv_rows(
-                        segment_timing_path,
-                        ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
-                        segment_rows,
-                    )
-                    write_csv_rows(
-                        word_timing_path,
-                        ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
-                        word_rows,
-                    )
-                    write_lines(out_path, final_lines)
-                    finalization_result = "final"
-                    print(f"Final transcript regenerated from full audio: {out_path}")
-                elif final_lines:
-                    finalization_result = "live-fallback-repetition"
-                    print(
-                        "Warning: final offline transcript contained suspicious repetition; keeping live transcript.",
-                        file=sys.stderr,
-                    )
-                else:
-                    finalization_result = "live-fallback-empty"
-                    print("Warning: final offline transcript pass produced no text; keeping live transcript.", file=sys.stderr)
-            else:
-                finalization_result = "no-audio"
-                print("Warning: no saved audio available for final transcript pass.", file=sys.stderr)
-        except Exception as exc:
-            finalization_result = "failed"
-            finalization_failed = True
-            print(f"Warning: failed final offline transcript pass: {exc}", file=sys.stderr)
-
-    if finalization_result.startswith("live-fallback") and out_path.exists():
-        try:
-            fallback_lines = out_path.read_text(encoding="utf-8").splitlines()
-            write_csv_rows(
-                segment_timing_path,
-                ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
-                build_live_fallback_segment_rows(
-                    fallback_lines,
-                    recording_start_time or datetime.now(timezone.utc),
-                ),
-            )
-            write_csv_rows(
-                word_timing_path,
-                ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
-                (),
-            )
-        except OSError as exc:
-            finalization_result = "failed"
-            finalization_failed = True
-            print(f"Warning: failed to save fallback transcript timings: {exc}", file=sys.stderr)
-
-    emit_protocol_message("FINALIZATION_RESULT", finalization_result)
-    print(f"Stopped. Transcript available at: {out_path}")
-    return 1 if finalization_failed else 0
+    return finalize_existing_capture(
+        WhisperModel,
+        args,
+        out_path,
+        raw_audio_wave_path,
+        recording_start_time,
+        language,
+        previous_text,
+        reusable_model=live_model,
+        reusable_model_name=live_model_name,
+    )
 
 
 if __name__ == "__main__":

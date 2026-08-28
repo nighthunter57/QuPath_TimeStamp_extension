@@ -20,7 +20,7 @@ as a log line and never as a state transition.
 | `TRANSCRIPT_UPDATED` | none | The committed live transcript file changed. |
 | `TRANSCRIPT_PARTIAL` | provisional text | Replaces the uncommitted live tail shown below the transcript. An empty field clears it. This text is never saved. |
 | `FINALIZE_PROGRESS` | processed audio seconds, total audio seconds | Progress through the full saved-audio pass. |
-| `FINALIZATION_RESULT` | result code | Terminal final-pass outcome such as `final`, `live-fallback-empty`, or `failed`. |
+| `FINALIZATION_RESULT` | result code | Terminal process outcome such as `paused` for capture-only exit, or final-pass results including `final`, `live-fallback-empty`, and `failed`. |
 
 Rules:
 
@@ -29,4 +29,6 @@ Rules:
 - `TRANSCRIPT_READY` does not establish the recording clock. Only `RECORDING_ORIGIN` does.
 - Elapsed event times are derived when saving from `event.recordedAtUtc - RECORDING_ORIGIN`.
   Missing or negative elapsed values are serialized as empty CSV cells and JSON `null`, never fabricated as zero.
-- `FINALIZATION_RESULT` is emitted exactly once before normal helper exit.
+- `FINALIZATION_RESULT` is emitted exactly once before normal helper exit. A
+  capture-only pause emits `paused`; only `--finalize-existing` performs the
+  offline final pass used by Done.

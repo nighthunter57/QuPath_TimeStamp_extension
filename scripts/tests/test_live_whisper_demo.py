@@ -1,9 +1,14 @@
+import contextlib
+import hashlib
+import io
+import sys
 import tempfile
 import unittest
 import wave
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -11,6 +16,18 @@ from scripts import live_whisper_demo as transcript
 
 
 class TranscriptLogicTest(unittest.TestCase):
+
+    def test_lifecycle_cli_modes_are_mutually_exclusive(self):
+        with patch.object(sys, "argv", ["live_whisper_demo.py", "--output", "case.txt", "--capture-only"]):
+            self.assertTrue(transcript.parse_args().capture_only)
+        with patch.object(sys, "argv", ["live_whisper_demo.py", "--output", "case.txt", "--finalize-existing"]):
+            self.assertTrue(transcript.parse_args().finalize_existing)
+        with patch.object(sys, "argv", [
+            "live_whisper_demo.py", "--output", "case.txt",
+            "--capture-only", "--finalize-existing",
+        ]), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                transcript.parse_args()
 
     def test_timestamp_round_trip_preserves_date(self):
         expected = datetime(2026, 7, 30, 23, 59, 59, 123000).astimezone()
@@ -259,6 +276,88 @@ class TranscriptLogicTest(unittest.TestCase):
             transcript.looks_like_structural_repetition_loop("yes yes yes")
         )
 
+    def test_trailing_hallucination_filter_drops_known_final_phrase_after_silence(self):
+        segments = [
+            SimpleNamespace(start=0.0, end=2.0, text="The margin is negative."),
+            SimpleNamespace(start=2.7, end=3.4, text="THANKS for watching!"),
+        ]
+
+        filtered = transcript.filter_trailing_hallucination_segments(segments)
+
+        self.assertEqual([segments[0]], filtered)
+
+    def test_trailing_hallucination_filter_keeps_mid_transcript_occurrence(self):
+        segments = [
+            SimpleNamespace(start=0.0, end=1.0, text="The doctor said thank you for watching."),
+            SimpleNamespace(start=1.8, end=2.5, text="Thank you for watching."),
+            SimpleNamespace(start=3.2, end=4.0, text="The final margin is negative."),
+        ]
+
+        self.assertEqual(
+            segments,
+            transcript.filter_trailing_hallucination_segments(segments),
+        )
+
+    def test_trailing_hallucination_filter_requires_a_silence_gap(self):
+        segments = [
+            SimpleNamespace(start=0.0, end=2.0, text="The margin is negative."),
+            SimpleNamespace(start=2.1, end=2.8, text="We'll be right back."),
+        ]
+
+        self.assertEqual(
+            segments,
+            transcript.filter_trailing_hallucination_segments(segments),
+        )
+
+    def test_trailing_hallucination_filter_uses_audio_drop_when_timestamps_touch(self):
+        segments = [
+            SimpleNamespace(start=0.0, end=2.0, text="The margin is negative."),
+            SimpleNamespace(start=2.0, end=3.0, text="We'll be right back."),
+        ]
+        audio = np.concatenate((
+            np.full(transcript.SAMPLE_RATE * 2, 0.1, dtype=np.float32),
+            np.full(transcript.SAMPLE_RATE, 0.02, dtype=np.float32),
+        ))
+
+        self.assertEqual(
+            [segments[0]],
+            transcript.filter_trailing_hallucination_segments(segments, audio),
+        )
+
+    def test_trailing_hallucination_filter_is_wired_to_live_and_final_paths(self):
+        segments = [
+            SimpleNamespace(
+                start=0.0, end=2.0, text=" The margin is negative.",
+                avg_logprob=0.0, no_speech_prob=0.0, compression_ratio=1.0,
+                words=[],
+            ),
+            SimpleNamespace(
+                start=2.0, end=3.0, text=" Thanks for watching!",
+                avg_logprob=0.0, no_speech_prob=0.0, compression_ratio=1.0,
+                words=[],
+            ),
+        ]
+        model = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+            segments, SimpleNamespace(duration=3.0)
+        ))
+        audio = np.concatenate((
+            np.full(transcript.SAMPLE_RATE * 2, 0.1, dtype=np.float32),
+            np.full(transcript.SAMPLE_RATE, 0.02, dtype=np.float32),
+        ))
+        recording_start = datetime(2026, 8, 27, tzinfo=timezone.utc)
+
+        live_segments = transcript.transcribe_audio_segments(
+            model, audio, "en", recording_start, 2, 2, False,
+        )
+        with patch.object(transcript, "decode_saved_audio", return_value=audio):
+            final_lines, _, _ = transcript.transcribe_saved_audio_with_timings(
+                model, Path("capture.wav"), "en", recording_start, 8, 8, True,
+            )
+
+        self.assertEqual(["The margin is negative."], [entry[2] for entry in live_segments])
+        self.assertEqual(1, len(final_lines))
+        self.assertIn("The margin is negative.", final_lines[0])
+
     def test_structural_loop_filter_is_wired_to_live_and_final_paths(self):
         loop_text = " ".join(["and system"] * 40)
         segment = SimpleNamespace(
@@ -278,27 +377,32 @@ class TranscriptLogicTest(unittest.TestCase):
         )
         recording_start = datetime(2026, 8, 26, tzinfo=timezone.utc)
 
-        live_segments = transcript.transcribe_audio_segments(
-            model,
-            np.full(transcript.SAMPLE_RATE, 0.01, dtype=np.float32),
-            "en",
-            recording_start,
-            beam_size=2,
-            best_of=2,
-            previous_text=False,
-            strict_segment_filtering=False,
-        )
-        final_lines, segment_rows, word_rows = (
-            transcript.transcribe_saved_audio_with_timings(
+        with patch.object(
+            transcript,
+            "decode_saved_audio",
+            return_value=np.full(transcript.SAMPLE_RATE, 0.01, dtype=np.float32),
+        ):
+            live_segments = transcript.transcribe_audio_segments(
                 model,
-                Path("capture.wav"),
+                np.full(transcript.SAMPLE_RATE, 0.01, dtype=np.float32),
                 "en",
                 recording_start,
-                beam_size=8,
-                best_of=8,
-                previous_text=True,
+                beam_size=2,
+                best_of=2,
+                previous_text=False,
+                strict_segment_filtering=False,
             )
-        )
+            final_lines, segment_rows, word_rows = (
+                transcript.transcribe_saved_audio_with_timings(
+                    model,
+                    Path("capture.wav"),
+                    "en",
+                    recording_start,
+                    beam_size=8,
+                    best_of=8,
+                    previous_text=True,
+                )
+            )
 
         self.assertEqual([], live_segments)
         self.assertEqual(([], [], []), (final_lines, segment_rows, word_rows))
@@ -343,6 +447,8 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual(transcript.LIVE_MAX_BEST_OF, settings["best_of"])
         self.assertEqual(2, settings["beam_size"])
         self.assertEqual(2, settings["best_of"])
+        self.assertTrue(settings["vad_filter"])
+        self.assertIn("vad_parameters", settings)
         self.assertEqual(list(transcript.TRANSCRIPTION_TEMPERATURES), settings["temperature"])
         self.assertNotIn("initial_prompt", settings)
         self.assertEqual(
@@ -454,6 +560,40 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertLess(abs(float(captured["audio"].mean())), 0.001)
         self.assertFalse(np.array_equal(original, captured["audio"]))
 
+    def test_final_transcribe_conditions_copy_without_changing_saved_wav(self):
+        captured = {}
+
+        class RecordingModel:
+            def transcribe(self, audio, **kwargs):
+                captured["audio"] = audio.copy()
+                return [], SimpleNamespace(duration=1.0)
+
+        with tempfile.TemporaryDirectory() as directory:
+            wave_path = Path(directory) / "raw-capture.wav"
+            sample_times = np.arange(transcript.SAMPLE_RATE) / transcript.SAMPLE_RATE
+            raw_audio = (
+                0.02 * np.sin(2 * np.pi * 500 * sample_times) + 0.1
+            ).astype(np.float32)
+            transcript.initialize_incremental_wave(wave_path)
+            transcript.append_wave_audio(wave_path, raw_audio.reshape(-1, 1))
+            before_hash = hashlib.sha256(wave_path.read_bytes()).hexdigest()
+
+            transcript.transcribe_saved_audio_with_timings(
+                RecordingModel(),
+                wave_path,
+                "en",
+                datetime.now(timezone.utc),
+                beam_size=8,
+                best_of=8,
+                previous_text=True,
+            )
+
+            after_hash = hashlib.sha256(wave_path.read_bytes()).hexdigest()
+
+        self.assertEqual(before_hash, after_hash)
+        self.assertLess(abs(float(captured["audio"].mean())), 0.001)
+        self.assertFalse(np.array_equal(raw_audio, captured["audio"]))
+
     def test_wave_capture_keeps_unconditioned_samples(self):
         with tempfile.TemporaryDirectory() as directory:
             wave_path = Path(directory) / "raw-capture.wav"
@@ -542,21 +682,79 @@ class TranscriptLogicTest(unittest.TestCase):
         )
         model = SimpleNamespace(transcribe=lambda *args, **kwargs: ([segment], None))
 
-        lines, segment_rows, word_rows = transcript.transcribe_saved_audio_with_timings(
-            model,
-            Path("capture.wav"),
-            "en",
-            recording_start,
-            beam_size=8,
-            best_of=8,
-            previous_text=True,
-        )
+        with patch.object(
+            transcript,
+            "decode_saved_audio",
+            return_value=np.zeros(transcript.SAMPLE_RATE * 3, dtype=np.float32),
+        ):
+            lines, segment_rows, word_rows = transcript.transcribe_saved_audio_with_timings(
+                model,
+                Path("capture.wav"),
+                "en",
+                recording_start,
+                beam_size=8,
+                best_of=8,
+                previous_text=True,
+            )
 
         self.assertEqual("[2026-08-20T12:00:01.250] lymph node negative", lines[0])
         self.assertEqual(1250, segment_rows[0]["start_ms"])
         self.assertEqual(2750, segment_rows[0]["end_ms"])
         self.assertTrue(segment_rows[0]["start_utc"].endswith("Z"))
         self.assertEqual([1250, 1850], [row["start_ms"] for row in word_rows])
+
+    def test_finalize_existing_capture_regenerates_transcript_without_capture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_path = root / "case_transcript.txt"
+            wave_path = root / "case_transcript_audio.wav"
+            output_path.write_text(
+                "[2026-08-26T12:00:00.000] live preview\n",
+                encoding="utf-8",
+            )
+            transcript.initialize_incremental_wave(wave_path)
+            transcript.append_wave_bytes(
+                wave_path, b"\x00\x00" * transcript.SAMPLE_RATE
+            )
+            recording_start = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+            segment = SimpleNamespace(
+                start=0.0,
+                end=1.0,
+                text=" final transcript",
+                avg_logprob=0.0,
+                no_speech_prob=0.0,
+                compression_ratio=1.0,
+                words=[],
+            )
+            model = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+                [segment], SimpleNamespace(duration=1.0)
+            ))
+            model_factory = lambda *args, **kwargs: model
+            args = SimpleNamespace(
+                model="large-v3",
+                compute_type="int8_float32",
+                beam_size=8,
+                best_of=8,
+                hotwords="Gleason",
+            )
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                exit_code = transcript.finalize_existing_capture(
+                    model_factory,
+                    args,
+                    output_path,
+                    wave_path,
+                    recording_start,
+                    "en",
+                    True,
+                )
+
+            self.assertEqual(0, exit_code)
+            self.assertIn("final transcript", output_path.read_text(encoding="utf-8"))
+            self.assertTrue(root.joinpath("case_transcript_live.txt").is_file())
+            self.assertTrue(root.joinpath("case_transcript_segments.csv").is_file())
+            self.assertIn("FINALIZATION_RESULT\tfinal", stdout.getvalue())
 
     def test_generated_wav_keeps_click_inside_spoken_word_timing(self):
         with tempfile.TemporaryDirectory() as directory:

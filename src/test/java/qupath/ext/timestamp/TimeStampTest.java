@@ -188,6 +188,28 @@ class TimeStampTest {
     }
 
     @Test
+    void usesSeparateCaptureAndFinalizationHelperModes() {
+        assertEquals(List.of("--capture-only"),
+                TimeStamp.transcriptLifecycleArguments(false));
+        assertEquals(List.of("--finalize-existing"),
+                TimeStamp.transcriptLifecycleArguments(true));
+    }
+
+    @Test
+    void mapsPauseResumeDoneWorkflowActionsWithoutEndingTheTake() {
+        assertEquals(TimeStamp.RecordingPrimaryAction.START,
+                TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.READY));
+        assertEquals(TimeStamp.RecordingPrimaryAction.PAUSE,
+                TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.RECORDING));
+        assertEquals(TimeStamp.RecordingPrimaryAction.RESUME,
+                TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.PAUSED));
+        assertEquals(TimeStamp.RecordingPrimaryAction.SAVE,
+                TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.UNSAVED_REVIEW));
+        assertEquals(TimeStamp.RecordingPrimaryAction.WAIT,
+                TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.FINALIZING));
+    }
+
+    @Test
     void mapsTranscriptWindowsAndEventsByRecordingClock() {
         String contents = "[2026-08-26T12:00:00.000] first line\n" +
                 "[2026-08-26T12:00:05.000] second line\n";
