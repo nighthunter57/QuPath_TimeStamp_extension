@@ -49,6 +49,7 @@ LIVE_MAX_BEAM_SIZE = 2
 LIVE_MAX_BEST_OF = 2
 COMPUTE_TYPE_FALLBACK = "int8"
 TRANSCRIPTION_TEMPERATURES = (0.0, 0.2, 0.4, 0.6, 0.8, 1.0)
+LIVE_TEMPERATURES = (0.0,)
 LIVE_REPETITION_PENALTY = 1.15
 FINAL_REPETITION_PENALTY = 1.05
 LIVE_NO_REPEAT_NGRAM_SIZE = 3
@@ -89,8 +90,9 @@ PARAKEET_SUPPORTED_LANGUAGES = frozenset({
 FAST_INITIAL_LIVE_WINDOW_SECONDS = 0.5
 FAST_LIVE_STEP_SECONDS = 1.0
 LOCAL_AGREEMENT_PROMPT_WORDS = 32
-LOCAL_AGREEMENT_MAX_BUFFER_SECONDS = 20.0
-LOCAL_AGREEMENT_SILENCE_SECONDS = 0.7
+ENDPOINT_SILENCE_SECONDS = 0.7
+ENDPOINT_WORD_GAP_SECONDS = 0.7
+ENDPOINT_MAX_TURN_SECONDS = 12.0
 TRANSCRIPT_LINE_GAP_SECONDS = 0.7
 METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
@@ -104,6 +106,7 @@ SNR_SPEECH_TO_NOISE_RATIO = 2.0
 SNR_RECOMMENDED_DB = 8.0
 SNR_CRITICAL_DB = 3.0
 SNR_ANALYSIS_WINDOW_SECONDS = 0.5
+LIVE_VAD_WINDOW_SECONDS = 0.5
 LIVE_VAD_PARAMETERS = {
     "threshold": 0.5,
     "neg_threshold": 0.35,
@@ -130,6 +133,7 @@ PROTOCOL_FIELDS = {
     "LIVE_MODEL_READY": 1,
     "TRANSCRIPT_UPDATED": 0,
     "TRANSCRIPT_PARTIAL": 1,
+    "TURN_ENDED": 1,
     "FINALIZE_PROGRESS": 2,
     "FINALIZATION_RESULT": 1,
 }
@@ -675,6 +679,7 @@ class WhisperLiveTranscriber(LiveTranscriber):
             strict_segment_filtering=True,
             hotwords=self.hotwords,
             context_prompt=context_prompt,
+            audio_is_conditioned=True,
         )
         newly_committed, provisional_words = self.agreement.update(
             decoded_segments_to_timed_words(segments),
@@ -689,6 +694,20 @@ class WhisperLiveTranscriber(LiveTranscriber):
             tuple(provisional_words),
             committed_through,
         )
+
+    def force_current(self, audio_end_time: datetime) -> LiveTranscriptionUpdate:
+        """Commit the latest hypothesis without paying for a duplicate decode."""
+        newly_committed, provisional_words = self.agreement.update([], force=True)
+        committed_through = newly_committed[-1][1] if newly_committed else audio_end_time
+        return LiveTranscriptionUpdate(
+            tuple(self.agreement.committed_words),
+            tuple(provisional_words),
+            committed_through,
+        )
+
+    def reset_turn(self) -> None:
+        self.agreement = LocalAgreementState()
+        self.has_emission = False
 
 
 def parakeet_tokens_to_timed_words(
@@ -779,8 +798,7 @@ class ParakeetMlxLiveTranscriber(LiveTranscriber):
         if self.stream_start_time is None:
             self.stream_start_time = chunk_start_time
         if len(audio):
-            conditioned = condition_live_audio(audio)
-            self.stream.add_audio(self.array_factory(conditioned))
+            self.stream.add_audio(self.array_factory(audio))
         finalized_tokens = list(self.stream.finalized_tokens)
         draft_tokens = list(self.stream.draft_tokens)
         if force:
@@ -822,36 +840,105 @@ def maximum_audio_window_rms(audio, window_samples: int = SAMPLE_RATE // 4) -> f
     )
 
 
+class StatefulHighPassFilter:
+    """Causal one-pole high-pass filter whose state survives capture chunks."""
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        cutoff_hz: float = HIGH_PASS_CUTOFF_HZ,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.cutoff_hz = cutoff_hz
+        if cutoff_hz > 0 and sample_rate > 0:
+            rc_seconds = 1.0 / (2.0 * math.pi * cutoff_hz)
+            sample_period_seconds = 1.0 / sample_rate
+            self.alpha = rc_seconds / (rc_seconds + sample_period_seconds)
+        else:
+            self.alpha = 0.0
+        self.previous_input = 0.0
+        self.previous_output = 0.0
+
+    def process(self, audio):
+        samples = audio.astype("float32", copy=True)
+        if samples.size == 0 or self.alpha <= 0:
+            if samples.size:
+                self.previous_input = float(samples[-1])
+            return samples
+        import numpy as np
+
+        output = np.empty(samples.shape[0], dtype="float64")
+        for block_start in range(0, samples.shape[0], HIGH_PASS_VECTOR_BLOCK_SAMPLES):
+            block_end = min(samples.shape[0], block_start + HIGH_PASS_VECTOR_BLOCK_SAMPLES)
+            block = samples[block_start:block_end].astype("float64", copy=False)
+            prior_inputs = np.empty(block.shape[0], dtype="float64")
+            prior_inputs[0] = self.previous_input
+            if block.shape[0] > 1:
+                prior_inputs[1:] = block[:-1]
+            forcing = self.alpha * (block - prior_inputs)
+            powers = self.alpha ** (1.0 + np.arange(block.shape[0]))
+            filtered = powers * (
+                self.previous_output + np.cumsum(forcing / powers)
+            )
+            output[block_start:block_end] = filtered
+            self.previous_input = float(block[-1])
+            self.previous_output = float(filtered[-1])
+        return output.astype("float32")
+
+
 def remove_dc_and_high_pass(
     audio,
     sample_rate: int = SAMPLE_RATE,
     cutoff_hz: float = HIGH_PASS_CUTOFF_HZ,
 ):
-    """Return a DC-centered, one-pole high-pass filtered float32 copy."""
-    samples = audio.astype("float32", copy=True)
-    if samples.size == 0:
-        return samples
-    samples -= samples.mean(dtype="float64")
-    if cutoff_hz <= 0 or sample_rate <= 0:
-        return samples
-    import numpy as np
+    """Return a causal high-pass-filtered copy; the filter itself removes DC."""
+    return StatefulHighPassFilter(sample_rate, cutoff_hz).process(audio)
 
-    rc_seconds = 1.0 / (2.0 * math.pi * cutoff_hz)
-    sample_period_seconds = 1.0 / sample_rate
-    alpha = rc_seconds / (rc_seconds + sample_period_seconds)
-    output = samples.astype("float64", copy=True)
-    output[0] = 0.0
-    previous_output = 0.0
-    for block_start in range(1, samples.shape[0], HIGH_PASS_VECTOR_BLOCK_SAMPLES):
-        block_end = min(samples.shape[0], block_start + HIGH_PASS_VECTOR_BLOCK_SAMPLES)
-        block = samples[block_start:block_end].astype("float64", copy=False)
-        prior_inputs = samples[block_start - 1:block_end - 1].astype("float64", copy=False)
-        forcing = alpha * (block - prior_inputs)
-        powers = alpha ** (1.0 + np.arange(block.shape[0]))
-        filtered = powers * (previous_output + np.cumsum(forcing / powers))
-        output[block_start:block_end] = filtered
-        previous_output = float(filtered[-1])
-    return output.astype("float32")
+
+class StatefulSlowAgc:
+    """Causal AGC with continuous level and gain state across calls."""
+
+    def __init__(
+        self,
+        sample_rate: int = SAMPLE_RATE,
+        target_rms: float = AGC_TARGET_RMS,
+    ) -> None:
+        self.sample_rate = sample_rate
+        self.target_rms = target_rms
+        self.level_squared = 0.0
+        self.gain = 1.0
+        self.has_speech_gain = False
+
+    def process(self, audio):
+        samples = audio.astype("float32", copy=True)
+        if samples.size == 0 or self.sample_rate <= 0:
+            return samples
+        import numpy as np
+
+        level_smoothing = 1.0 - math.exp(
+            -1.0 / max(1.0, self.sample_rate * AGC_BLOCK_SECONDS)
+        )
+        gain_smoothing = 1.0 - math.exp(
+            -1.0 / max(1.0, self.sample_rate * AGC_TIME_CONSTANT_SECONDS)
+        )
+        for index in range(samples.shape[0]):
+            sample = float(samples[index])
+            self.level_squared += level_smoothing * (
+                sample * sample - self.level_squared
+            )
+            level = math.sqrt(max(0.0, self.level_squared))
+            if level >= CHUNK_RMS_SILENCE_THRESHOLD:
+                desired_gain = min(
+                    AGC_MAX_GAIN,
+                    max(AGC_MIN_GAIN, self.target_rms / level),
+                )
+                if not self.has_speech_gain:
+                    self.gain = desired_gain
+                    self.has_speech_gain = True
+                else:
+                    self.gain += gain_smoothing * (desired_gain - self.gain)
+            samples[index] = sample * self.gain
+        return np.clip(samples, -1.0, 1.0)
 
 
 def apply_slow_agc(
@@ -860,37 +947,23 @@ def apply_slow_agc(
     target_rms: float = AGC_TARGET_RMS,
 ):
     """Move speech toward the target RMS without amplifying quiet-room noise."""
-    samples = audio.astype("float32", copy=True)
-    if samples.size == 0 or sample_rate <= 0:
-        return samples
-    import numpy as np
+    return StatefulSlowAgc(sample_rate, target_rms).process(audio)
 
-    block_samples = max(1, int(round(sample_rate * AGC_BLOCK_SECONDS)))
-    gain = 1.0
-    has_speech_gain = False
-    for block_start in range(0, samples.shape[0], block_samples):
-        block_end = min(samples.shape[0], block_start + block_samples)
-        block = samples[block_start:block_end]
-        block_level = audio_rms(block)
-        if block_level < CHUNK_RMS_SILENCE_THRESHOLD:
-            continue
-        desired_gain = min(AGC_MAX_GAIN, max(AGC_MIN_GAIN, target_rms / block_level))
-        if not has_speech_gain:
-            next_gain = desired_gain
-            has_speech_gain = True
-        else:
-            block_duration = block.shape[0] / sample_rate
-            smoothing = 1.0 - math.exp(-block_duration / AGC_TIME_CONSTANT_SECONDS)
-            next_gain = gain + smoothing * (desired_gain - gain)
-        gains = np.linspace(gain, next_gain, block.shape[0], endpoint=True, dtype="float32")
-        block *= gains
-        gain = next_gain
-    return np.clip(samples, -1.0, 1.0)
+
+class LiveAudioConditioner:
+    """Stateful live front end applied once to each newly captured speech chunk."""
+
+    def __init__(self) -> None:
+        self.high_pass = StatefulHighPassFilter()
+        self.agc = StatefulSlowAgc()
+
+    def process(self, audio):
+        return self.agc.process(self.high_pass.process(audio))
 
 
 def condition_live_audio(audio):
     """Condition a decode copy; captured WAV samples must never pass through here."""
-    return apply_slow_agc(remove_dc_and_high_pass(audio))
+    return LiveAudioConditioner().process(audio)
 
 
 def decode_saved_audio(audio_path: Path):
@@ -1032,8 +1105,6 @@ def build_transcribe_kwargs(
 ) -> dict:
     resolved_beam_size = beam_size
     resolved_best_of = best_of
-    vad_filter = True
-    vad_parameters = LIVE_VAD_PARAMETERS
     patience = 1.0
     word_timestamps = True
     if final_pass:
@@ -1047,11 +1118,13 @@ def build_transcribe_kwargs(
 
     kwargs = {
         "language": language,
-        "vad_filter": vad_filter,
+        "vad_filter": final_pass,
         "beam_size": resolved_beam_size,
         "best_of": resolved_best_of,
         "patience": patience,
-        "temperature": list(TRANSCRIPTION_TEMPERATURES),
+        "temperature": list(
+            TRANSCRIPTION_TEMPERATURES if final_pass else LIVE_TEMPERATURES
+        ),
         "compression_ratio_threshold": SEGMENT_COMPRESSION_RATIO_THRESHOLD,
         "log_prob_threshold": SEGMENT_AVG_LOGPROB_THRESHOLD,
         "no_speech_threshold": SEGMENT_NO_SPEECH_THRESHOLD,
@@ -1066,8 +1139,8 @@ def build_transcribe_kwargs(
         "condition_on_previous_text": previous_text,
         "word_timestamps": word_timestamps,
     }
-    if vad_parameters is not None:
-        kwargs["vad_parameters"] = vad_parameters
+    if final_pass:
+        kwargs["vad_parameters"] = LIVE_VAD_PARAMETERS
     normalized_hotwords = limited_hotwords(hotwords)
     if normalized_hotwords:
         kwargs["hotwords"] = normalized_hotwords
@@ -1092,6 +1165,7 @@ def transcribe_audio_segments(
     strict_segment_filtering: bool = True,
     hotwords: Optional[str] = DEFAULT_PATHOLOGY_HOTWORDS,
     context_prompt: Optional[str] = None,
+    audio_is_conditioned: bool = False,
 ) -> list[
     tuple[
         datetime,
@@ -1104,7 +1178,7 @@ def transcribe_audio_segments(
     if chunk_rms < CHUNK_RMS_SILENCE_THRESHOLD:
         return []
 
-    conditioned_audio = condition_live_audio(audio)
+    conditioned_audio = audio if audio_is_conditioned else condition_live_audio(audio)
     segments, _ = model.transcribe(
         conditioned_audio,
         **build_transcribe_kwargs(
@@ -1678,6 +1752,72 @@ def contains_speech(audio) -> bool:
     ))
 
 
+def should_buffer_live_audio(audio, speech_detector=contains_speech) -> bool:
+    """Gate a captured block before it enters the live decoder's moving window."""
+    if audio.size == 0:
+        return False
+    return bool(speech_detector(audio))
+
+
+class SpeechEndpointState:
+    """Layered live endpoint over capture time, independent of decoder buffering."""
+
+    def __init__(
+        self,
+        silence_seconds: float = ENDPOINT_SILENCE_SECONDS,
+        word_gap_seconds: float = ENDPOINT_WORD_GAP_SECONDS,
+        max_turn_seconds: float = ENDPOINT_MAX_TURN_SECONDS,
+    ) -> None:
+        self.silence_seconds = silence_seconds
+        self.word_gap_seconds = word_gap_seconds
+        self.max_turn_seconds = max_turn_seconds
+        self.turn_started_at: Optional[datetime] = None
+        self.silence_started_at: Optional[datetime] = None
+        self.latest_audio_end: Optional[datetime] = None
+
+    def observe(
+        self,
+        chunk_start: datetime,
+        chunk_duration_seconds: float,
+        speech_active: bool,
+    ) -> None:
+        chunk_end = chunk_start + timedelta(seconds=max(0.0, chunk_duration_seconds))
+        self.latest_audio_end = chunk_end
+        if speech_active:
+            if self.turn_started_at is None:
+                self.turn_started_at = chunk_start
+            self.silence_started_at = None
+        elif self.turn_started_at is not None and self.silence_started_at is None:
+            self.silence_started_at = chunk_start
+
+    def endpoint_reason(
+        self,
+        last_decoded_word_end: Optional[datetime],
+        include_word_gap: bool = True,
+        decoded_audio_end: Optional[datetime] = None,
+    ) -> Optional[str]:
+        if self.turn_started_at is None or self.latest_audio_end is None:
+            return None
+        if self.silence_started_at is not None and (
+            self.latest_audio_end - self.silence_started_at
+        ).total_seconds() >= self.silence_seconds:
+            return "silence"
+        word_gap_clock = decoded_audio_end or self.latest_audio_end
+        if include_word_gap and last_decoded_word_end is not None and (
+            word_gap_clock - last_decoded_word_end
+        ).total_seconds() >= self.word_gap_seconds:
+            return "word-gap"
+        if (
+            self.latest_audio_end - self.turn_started_at
+        ).total_seconds() >= self.max_turn_seconds:
+            return "hard-cap"
+        return None
+
+    def reset(self) -> None:
+        self.turn_started_at = None
+        self.silence_started_at = None
+
+
 class SignalQualityAnalyzer:
     """Buffer audio and update SNR only after real voice-activity classification."""
 
@@ -2034,6 +2174,9 @@ def main() -> int:
     silence_watchdog = AudioSilenceWatchdog()
     clipping_watchdog = AudioClippingWatchdog()
     signal_analyzer = SignalQualityAnalyzer()
+    live_audio_conditioner = LiveAudioConditioner()
+    endpoint_state = SpeechEndpointState()
+    last_decoded_word_end: Optional[datetime] = None
     recording_origin_emitted = False
 
     def request_stop(signum, frame) -> None:
@@ -2083,7 +2226,7 @@ def main() -> int:
     print(f"  Live fallbacks: {', '.join(live_model_candidates)}")
     print(f"  Final model : {args.model}")
     print(f"  Language    : {args.language}")
-    print(f"  Live max buffer: {LOCAL_AGREEMENT_MAX_BUFFER_SECONDS}")
+    print(f"  Live max turn: {ENDPOINT_MAX_TURN_SECONDS}")
     print(f"  First live  : {initial_live_window_seconds}")
     print(f"  Live step   : {step_seconds}")
     print(f"  Agreement prompt words: {LOCAL_AGREEMENT_PROMPT_WORDS}")
@@ -2165,15 +2308,19 @@ def main() -> int:
             emit_signal_quality(signal_result)
             last_meter_emit_time = now_monotonic
 
-        if audio_buffer_start_time is not None and audio_buffer.shape[0] > 0:
-            expected_buffer_end = audio_buffer_start_time + timedelta(seconds=audio_buffer.shape[0] / SAMPLE_RATE)
-            if abs((chunk_start_time - expected_buffer_end).total_seconds()) > RESUME_GAP_TOLERANCE_SECONDS:
-                audio_buffer = np.empty((0, CHANNELS), dtype=np.float32)
-                audio_buffer_start_time = chunk_start_time
+        speech_active = should_buffer_live_audio(chunk[:, 0])
+        endpoint_state.observe(
+            chunk_start_time,
+            chunk.shape[0] / SAMPLE_RATE,
+            speech_active,
+        )
+        conditioned_chunk = live_audio_conditioner.process(chunk[:, 0]).reshape(-1, CHANNELS)
+        if not speech_active:
+            return
 
         if audio_buffer_start_time is None:
             audio_buffer_start_time = chunk_start_time
-        audio_buffer = np.concatenate((audio_buffer, chunk), axis=0)
+        audio_buffer = np.concatenate((audio_buffer, conditioned_chunk), axis=0)
 
     def drain_captured_audio(block: bool = False) -> int:
         nonlocal last_backlog_warning_time
@@ -2250,7 +2397,8 @@ def main() -> int:
             has_live_emission = True
 
     def maybe_transcribe_latest_live_audio(force: bool = False) -> None:
-        nonlocal last_live_decode_end_time
+        nonlocal last_live_decode_end_time, last_decoded_word_end
+        nonlocal existing_live_transcript_entries
         if live_transcriber is None or audio_buffer_start_time is None or audio_buffer.shape[0] == 0:
             return
 
@@ -2267,10 +2415,10 @@ def main() -> int:
         decode_samples = (
             available_samples
             if is_streaming
-            else min(available_samples, int(SAMPLE_RATE * LOCAL_AGREEMENT_MAX_BUFFER_SECONDS))
+            else min(available_samples, int(SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS))
         )
-        current_audio_end_time = audio_buffer_start_time + timedelta(
-            seconds=decode_samples / SAMPLE_RATE,
+        current_audio_end_time = endpoint_state.latest_audio_end or (
+            audio_buffer_start_time + timedelta(seconds=decode_samples / SAMPLE_RATE)
         )
         decode_interval_seconds = step_seconds if has_live_emission else initial_live_window_seconds
         if (
@@ -2281,20 +2429,11 @@ def main() -> int:
 
         audio = audio_buffer[:decode_samples, 0].copy()
         chunk_window_start = audio_buffer_start_time
-        tail_samples = min(
-            audio.shape[0],
-            int(SAMPLE_RATE * LOCAL_AGREEMENT_SILENCE_SECONDS),
+        endpoint_reason = endpoint_state.endpoint_reason(
+            last_decoded_word_end,
+            include_word_gap=False,
         )
-        silence_boundary = (
-            tail_samples > 0
-            and audio_rms(audio[-tail_samples:]) < CHUNK_RMS_SILENCE_THRESHOLD
-        )
-        buffer_seconds = decode_samples / SAMPLE_RATE
-        force_commit = (
-            force
-            or silence_boundary
-            or buffer_seconds >= LOCAL_AGREEMENT_MAX_BUFFER_SECONDS
-        )
+        force_commit = force or endpoint_reason is not None
         committed_words = ()
         if isinstance(live_transcriber, WhisperLiveTranscriber):
             committed_words = live_transcriber.agreement.committed_words
@@ -2307,12 +2446,33 @@ def main() -> int:
                 committed_words,
             ),
         )
+        observed_words = (*update.committed_words, *update.provisional_words)
+        if observed_words:
+            last_decoded_word_end = max(word[1] for word in observed_words)
+        if not force_commit:
+            decoded_audio_end = chunk_window_start + timedelta(
+                seconds=audio.shape[0] / SAMPLE_RATE,
+            )
+            endpoint_reason = endpoint_state.endpoint_reason(
+                last_decoded_word_end,
+                decoded_audio_end=decoded_audio_end,
+            )
+            if endpoint_reason is not None and isinstance(live_transcriber, WhisperLiveTranscriber):
+                update = live_transcriber.force_current(current_audio_end_time)
+                force_commit = True
         last_live_decode_end_time = current_audio_end_time
         emit_live_update(
             update,
             current_audio_end_time,
-            consume_all_audio=is_streaming,
+            consume_all_audio=is_streaming or force_commit,
         )
+        if force_commit:
+            emit_protocol_message("TURN_ENDED", format_utc_timestamp(current_audio_end_time))
+            endpoint_state.reset()
+            last_decoded_word_end = None
+            if isinstance(live_transcriber, WhisperLiveTranscriber):
+                existing_live_transcript_entries = list(live_transcript_entries)
+                live_transcriber.reset_turn()
 
     load_errors: list[str] = []
     model_load_complete = threading.Event()
@@ -2400,6 +2560,7 @@ def main() -> int:
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
+            blocksize=round(SAMPLE_RATE * LIVE_VAD_WINDOW_SECONDS),
             callback=callback,
             device=device,
         ):

@@ -1,6 +1,6 @@
 # Live Transcript Accuracy Plan
 
-Eleven phases to take the live transcript from repetition loops to roughly 95% word
+Twelve phases to take the live transcript from repetition loops to roughly 95% word
 accuracy, in the order that keeps the decoder ahead of the microphone.
 
 - **Target files:** `scripts/live_whisper_demo.py`, `src/main/java/qupath/ext/timestamp/TimeStamp.java`
@@ -190,8 +190,8 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   by 12 errors and 1.34 percentage points, placing it slightly below the
   published ~2.5% `large-v3` reference.
 - All 47 Python helper tests and the complete Gradle build pass after Phase 10B.
-- **Next:** 10C (rebuild the fixture with a human voice) and 10D (validate the
-  fixture scorer). Keep
+- **Next:** 10C (rebuild the fixture with a human voice) and 8B (re-baseline the
+  live path on that recording). Keep
   `calibrate_asr.py` as a permanent regression gate — above about 5% means a
   change has broken the decoder.
 - **Phase 11 complete — 2026-08-28.** `scripts/bench_live_models.py` measured
@@ -272,6 +272,51 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   this accuracy pass.
 - All 62 Python scoring/transcription tests and the complete Java test suite
   pass after the remaining code work.
+- **Phase 12A complete — 2026-09-01.** Live Whisper decoding is greedy at
+  `temperature=(0.0,)`, carries no `vad_parameters`, and receives only
+  Silero-positive 0.5-second microphone blocks. The final pass still carries
+  the full temperature ladder and Phase 9B VAD settings unchanged. A
+  deterministic production-policy replay is now available as
+  `scripts/replay_live_fixture.py`; it committed **342 words at 21.23% raw WER,
+  8.04% domain WER, and 22.86% MCER**. That clears the only prior true
+  LocalAgreement replay (211 words, 59.78% WER); Phase 11's 19.27% was a
+  single full-file decode and is not a streaming baseline.
+- A controlled full-file diagnostic explains the apparent 19.27% → 19.83%
+  one-shot movement: restoring live VAD improves the complete-file score to
+  17.60%, while restoring the temperature ladder changes nothing (19.83%). This
+  is the exact one-shot/moving-window distinction warned about below and is not
+  evidence for putting VAD back into LocalAgreement.
+- **Phase 12B implementation complete — 2026-09-01; human acceptance pending
+  10C.** The RMS endpoint is replaced by Silero trailing silence, a decoded-word
+  gap measured in the decoder's compressed timeline, and a 12-second hard cap.
+  `TURN_ENDED` is defined in Python, Java, the protocol document, and both
+  grammar suites. The synthetic replay produced **11 turns: 1 silence, 1 word
+  gap, and 9 hard-cap**, with no line allowed past 12.0 seconds. The required
+  normal-room per-sentence validation cannot be claimed until a genuine human
+  recording exists.
+- Post-12B model remeasurement uses a 12-second worst-case window. `small.en`
+  remains the only viable quality/speed tradeoff at **19.83% one-shot WER and
+  3.65 seconds per window**. Turbo beam 1 reached 19.27% but needed 12.66
+  seconds; turbo beam 2 needed 12.92 seconds; distil-large needed 12.25–12.43
+  seconds. Distil-small stayed fast at 2.44–2.56 seconds but regressed to 73.74%
+  WER. Auto therefore remains `small.en`; no model verdict is promoted beyond
+  the synthetic fixture.
+- **Phase 12C complete — 2026-09-01.** Mean subtraction is removed; the 80 Hz
+  high-pass and causal AGC now preserve input, level, and gain state across
+  chunks. Every new capture block advances the conditioner exactly once, while
+  only Silero-positive conditioned blocks enter the decoder. Arbitrary chunking
+  matches one-call conditioning to tolerance, gain is continuous across buffer
+  trims, and the raw incremental WAV path is unchanged.
+- **Phase 12D complete — 2026-09-01.** The recording view is an inline
+  append-only `TextFlow`: committed text is emitted as stable nodes and the
+  provisional tail is rendered in the same flow at reduced opacity. `TURN_ENDED`
+  clears/freezes the tail. Review and correction still switch to the editable
+  `TextArea` after finalization, preserving the save/export and event-linking
+  workflows.
+- **Phase 12E remains gated on 10C.** AlignAtt and every live-engine choice must
+  be compared on genuine human audio; the synthetic fixture is not a valid
+  substitute. All **67 Python tests** and the complete Gradle build pass through
+  12D.
 
 ---
 
@@ -1205,6 +1250,310 @@ the model moves that number.
 
 ---
 
+## Phase 12 — Streaming architecture (~1 week, staged)
+
+### Why this phase exists
+
+Phases 1–11 improved a Whisper rolling-window preview on its own terms. This
+phase compares that design against what production live-captioning systems
+actually do — Teams, Meet, Deepgram, AssemblyAI — and corrects the three places
+where the current live path works against its own commit rule.
+
+Three findings from that comparison drive the work.
+
+**1. Production systems encode each audio frame exactly once.** Streaming
+transducers (RNN-T, Conformer-Transducer, cache-aware FastConformer) consume
+audio left to right and cache encoder state for the next step. Chunk size changes
+*when* the model sees context, never *how much* compute is spent, so cost per
+second of speech is constant. NVIDIA measures up to 3x the throughput of a
+buffered system from this property alone. TimeStamp re-decodes up to 20 seconds
+of already-transcribed audio every 1.0–1.5 seconds (`:2267-2296`). **This is why
+every attempt to raise the live model has failed on time rather than on
+quality** — Phase 2's deferred turbo beam 5, Phase 3's "roughly one minute late",
+Phase 11's 5.01-second turbo window. The ceiling is the decode schedule, not the
+CPU.
+
+**2. Segmentation is endpointing, not chunking.** The speaker's pause is a
+modelled event, not a side effect of a buffer filling. Production systems stack
+independent detectors: acoustic VAD silence (Deepgram's `endpointing`, which
+returns `speech_final`), gap since the last *transcribed word* rather than the
+last loud sample (Deepgram's `utterance_end_ms`, ≥ 1000 ms, which exists
+specifically because background noise holds a level gate open), a semantic
+end-of-turn model (AssemblyAI: confidence 0.4, `min_turn_silence` 400 ms,
+acoustic fallback at `max_turn_silence` 1280 ms), and in Google's case an
+end-of-query token predicted by the decoder itself. TimeStamp's entire endpoint
+is `audio_rms(last 0.7 s) < CHUNK_RMS_SILENCE_THRESHOLD` (`:2288-2296`) — one
+fixed absolute amplitude gate, not adaptive to the room, with no word-gap or
+semantic component. A room at the Phase 8A 8 dB SNR floor frequently never
+satisfies it, and when it does not fire the only remaining force-commit is the
+20-second cap.
+
+**3. LocalAgreement-2 is the second-best published streaming policy.** It was
+chosen in Phase 3 because it is by far the easiest to implement correctly, which
+was the right call at the time. AlignAtt (SimulStreaming, 2025) is reported at
+roughly 5x faster for equal or better quality on the same Whisper weights.
+
+### The measurement that frames the phase
+
+| Path | Score | Source |
+| --- | ---: | --- |
+| Final pass, domain-normalized | **0.30 %** | Phase 9D |
+| Final pass, LibriSpeech | **2.34 %** | Phase 10B |
+| Live, synthetic fixture | 19.27 % | Phase 11 |
+| Live, real far-field recording | **~80 %** | Phase 11 note |
+
+The gap between the two live numbers is not model quality. The synthetic fixture
+has clean digital silence in its tails, which satisfies the 0.003 gate and lets
+LocalAgreement commit; a real room does not, so the transcript arrives in
+20-second lurches from the most expensive possible decode. **Phase 12A and 12B
+target that gap directly and need no new model.**
+
+---
+
+### 12A — Stop the live decode fighting its own commit rule (~2 h, low risk, do first)
+
+LocalAgreement commits on exact normalized word-prefix equality between
+consecutive decodes. Two decoder settings currently guarantee those two decodes
+are not comparable.
+
+**`vad_filter=True` applies to both passes** (`:1035`). faster-whisper's VAD does
+not merely gate — it removes silence from the audio before decoding and maps
+timestamps back afterwards. On a growing buffer, one appended chunk can move a
+speech-region boundary, so decode N and decode N+1 run over materially different
+audio and return different segment splits and word timings. Exact prefix
+agreement then becomes a coincidence rather than a signal. That VAD is built for
+one-shot files.
+
+**The six-value temperature ladder applies to both passes** (`:1054`). A buffer
+that trips the compression-ratio or logprob threshold triggers up to six full
+re-decodes of the entire buffer before returning — a multi-second stall, fired
+exactly when the audio is hardest and the schedule has least slack. No production
+streaming system does fallback sampling in a first pass; the second pass exists
+to fix what greedy decoding gets wrong.
+
+#### Changes
+
+- `build_transcribe_kwargs` sets `vad_filter` and `vad_parameters` only when
+  `final_pass` is true. Live voice-activity gating moves to an explicit
+  `contains_speech()` call on each new chunk *before* it enters the decode
+  buffer, so silence never reaches the model and the decoded timeline never
+  shifts underneath a committed prefix.
+- Add `LIVE_TEMPERATURES = (0.0,)`. `TRANSCRIPTION_TEMPERATURES` is passed only
+  when `final_pass` is true.
+- Keep every Phase 1 and Phase 10B filter unchanged. They now protect a greedy
+  decode instead of a sampled one, which is the easier job.
+
+#### Parameter table
+
+| Constant | Live | Final | Rationale |
+| --- | --- | --- | --- |
+| `vad_filter` | **off** | on | live gating moves upstream; Phase 9B keeps it on for the file pass |
+| `LIVE_TEMPERATURES` | **`(0.0,)`** | — | removes up to 6x re-decode stalls |
+| `TRANSCRIPTION_TEMPERATURES` | — | unchanged | the offline budget is already allocated |
+
+#### Acceptance gate
+
+Replay the fixture. **Committed word count must rise and WER must not regress.**
+Phase 9B's result — VAD off made the final pass 1.12 points worse — does not
+transfer and must not be cited against this change: that was a single offline
+decode of a complete file, not repeated decodes of a moving window.
+
+#### Tests to add
+
+- Live kwargs carry no `vad_parameters` and exactly one temperature.
+- Final kwargs still carry both, unchanged.
+- A chunk failing `contains_speech` never reaches the decode buffer.
+
+---
+
+### 12B — A real endpointer (~1 day, medium risk)
+
+Replace the single amplitude gate with the layered pattern every commercial API
+uses: a noise-immune primary signal, an independent secondary, and a hard
+timeout as fallback.
+
+| Detector | Rule | Role |
+| --- | --- | --- |
+| Silero VAD on the trailing window | `contains_speech()` returns false for `ENDPOINT_SILENCE_SECONDS` | primary; immune to the noise floor that defeats RMS |
+| Word gap | now − last decoded word end ≥ `ENDPOINT_WORD_GAP_SECONDS` | secondary; Deepgram's `utterance_end_ms` in miniature |
+| Hard cap | buffer ≥ `ENDPOINT_MAX_TURN_SECONDS` | fallback only, lowered from 20 s |
+
+Any level test that survives must consult
+`SignalToNoiseEstimator.noise_floor()` (`:1609`) rather than a literal, so the
+threshold tracks the room.
+
+**The components already exist and are wired only to the SNR meter.**
+`contains_speech()` (`:1664`) runs Silero over a 0.5-second window and returns a
+clean boolean; `SignalQualityAnalyzer` (`:1681`) already maintains the noise
+floor. Nothing new needs installing.
+
+#### Proposed constants
+
+| Constant | Value | Note |
+| --- | ---: | --- |
+| `ENDPOINT_SILENCE_SECONDS` | 0.7 | supersedes `LOCAL_AGREEMENT_SILENCE_SECONDS` |
+| `ENDPOINT_WORD_GAP_SECONDS` | 0.7 | AssemblyAI ships 400 ms; start conservative for dictation |
+| `ENDPOINT_MAX_TURN_SECONDS` | 12.0 | fallback, not the normal path |
+
+`CHUNK_RMS_SILENCE_THRESHOLD` stays for silence and clipping protection, which is
+what it was designed for. It stops being the endpoint.
+
+#### Protocol change
+
+Add `TURN_ENDED` carrying the turn's end timestamp. Per AGENTS.md that is four
+edits landed together: `PROTOCOL_FIELDS` (`:120`), `TranscriptMessageType`
+(`TimeStamp.java:202`), `docs/TRANSCRIPT_PROTOCOL.md`, and
+`test_protocol_grammar_covers_every_message`. Without this message the panel
+cannot know a line is finished, which is the event every caption UI is built on
+and the prerequisite for 12D.
+
+#### The second effect, which is the larger one
+
+Bounding the buffer by the utterance instead of by 20 seconds is **where the
+compute budget for a bigger live model comes from.** Re-run
+`bench_live_models.py` after this lands: the Phase 11 verdicts assume a
+20-second worst-case window that should no longer occur, and its own caveat
+already flags that assumption.
+
+#### Acceptance gate
+
+On a human recording in a normal room, the endpoint fires per sentence rather
+than per buffer cap, and no committed line exceeds `ENDPOINT_MAX_TURN_SECONDS`
+unless the speaker genuinely did not pause.
+
+---
+
+### 12C — Causal, stateful audio conditioning (~2 h, low risk)
+
+`remove_dc_and_high_pass` subtracts the mean of the **whole current buffer**
+(`:834`). Every appended chunk changes that mean, so every already-decoded sample
+is offset by a slightly different amount than it was on the previous step.
+`apply_slow_agc` (`:857`) restarts at unity gain at the buffer's first sample, so
+each post-commit trim restarts the 3-second gain ramp exactly at the boundary
+where the model is being asked to re-agree.
+
+Neither is a bug in the Phase 4 sense — the conditioning is correct for a
+one-shot file. Both are wrong for a streaming buffer, and both feed input churn
+into a commit rule that demands exact agreement.
+
+#### Changes
+
+- Drop the mean subtraction. The 80 Hz one-pole high-pass already removes DC.
+- Make the high-pass and the AGC stateful objects that carry filter state and
+  `gain` across calls, as a broadcast compressor does.
+- Condition only the newly arrived chunk. Conditioning cost becomes O(new chunk)
+  instead of O(buffer).
+
+The **captured WAV stays unprocessed** invariant is untouched: none of this goes
+near `append_wave_audio`.
+
+#### Tests to add
+
+- Conditioning a stream in chunks equals conditioning it in one call, to
+  tolerance.
+- Gain is continuous across a buffer trim.
+
+---
+
+### 12D — Render like a caption view (~1 day, low risk, after 12B)
+
+Every `TRANSCRIPT_UPDATED` re-reads the whole transcript from disk
+(`TimeStamp.java:2545`) and replaces the entire `TextArea` (`:2397`), then
+restores caret, selection and scroll position by hand. Phase 5 mitigated the
+symptoms with equality guards and tail-follow; the model underneath is still
+whole-document replacement, which is the pattern Google's caption-stability work
+exists to eliminate. Their published algorithm aligns old and new token sequences
+with a Needleman–Wunsch variant, refuses corrections to already-displayed words
+unless a sentence-embedding check (0.85) says the meaning actually changed, and
+animates what remains — validated against a DFT-based flicker metric and a
+123-person study of comfort, distraction, readability and fatigue.
+
+#### Changes
+
+- Render committed text as a `TextFlow` of per-word nodes. Once drawn, a
+  committed line is immutable.
+- Move the provisional tail **inline** at reduced opacity, continuing the last
+  line, instead of a separate dim label below the transcript (`:1186`). Teams,
+  Meet and Zoom all render the volatile tail in the same flow so an utterance
+  reads as one sentence; a label in a different region makes the reader's eye
+  jump and hides the join.
+- Freeze a line on `TURN_ENDED`.
+
+This also removes the Phase 5 blocker recorded above — *"the optional confidence
+colouring remains deliberately unimplemented because no stable word-to-render
+mapping is exposed to the Java panel yet"*. Per-word nodes **are** that mapping.
+
+Full Google-style stabilization (alignment plus semantic suppression of
+corrections) stays out of scope until append-only rendering is in and measured.
+
+---
+
+### 12E — Replace the streaming policy (~3 d, gated on Phase 10C)
+
+Whisper is an offline 30-second encoder–decoder. LocalAgreement, the structural
+loop detector, the trailing-hallucination filter and the boilerplate list are all
+scaffolding to make it behave like a streaming model. The published upgrade path
+for exactly this stack is **AlignAtt** (SimulStreaming), reported at roughly 5x
+faster than LocalAgreement for equal or better quality, with an MLX/CoreML port
+available for Apple Silicon. Same weights, better policy.
+
+**Hardware reality, stated plainly so it is not planned around.** True
+cache-aware transducers are the strongest option on paper — Nemotron 3.5 ASR
+streaming 0.6B reports 7.91 % English FLEURS WER at a 1.12-second chunk with
+runtime-selectable 80/160/320/560/1120 ms latency, and an on-device study reports
+7.28 % at 0.56 s latency with an int4 build of 0.67 GB running above 6x realtime
+on CPU. But the Nemotron model card lists CUDA on Linux only, with no CPU or
+Apple Silicon support. On this hardware the realistic choices are `parakeet-mlx`
+(buffered streaming, the weaker of the two designs, already integrated in 8C) and
+an AlignAtt Whisper policy. Note also that NVIDIA's own chunked-Parakeet figure
+of 9.22 % is the *weak* baseline in that paper, against 6.32 % for the same model
+run offline — the batch-to-stream penalty is real and applies to `parakeet-mlx`
+too.
+
+#### Gate — do not start this before 10C
+
+Every live-engine verdict so far was measured on the synthetic fixture that
+Phase 10A proved is out of distribution: the same final decoder scores 2.34 % on
+LibriSpeech and 14.80 % raw on the fixture. `small.en` over turbo, and Parakeet's
+rejection at 38.55 % raw / 91.43 % MCER, both rest on that ruler. **Parakeet may
+have been rejected by a bad measurement.** Re-run `bench_live_models.py` against
+a human fixture before choosing an engine, and treat 12E's premise as unproven
+until then.
+
+---
+
+### Order
+
+**12A → 12B → 12C → 12D**, then 12E once 10C is done.
+
+12A comes first because there is no point tuning an endpoint while the decoded
+timeline shifts underneath the commit rule. 12B follows because it converts 12A's
+freed budget into shorter buffers, which is what a later model change will spend.
+12C lands after 12B so its effect is measured against a commit loop that is
+already stable. 12D depends on `TURN_ENDED` from 12B.
+
+**Expected payoff is a hypothesis until 10C exists.** 12A–12C are corrections
+that are defensible on their own reasoning, but the size of the gain cannot be
+claimed from the synthetic fixture, for the same reason Phase 9C was cancelled.
+
+### Sources
+
+- Cascaded encoders and two-pass streaming ASR — arXiv 2011.10798; Semantic
+  Scholar, *Cascaded Encoders for Unifying Streaming and Non-Streaming ASR*
+- Endpointing latency metrics (EP50/EP90/EOU) — arXiv 2004.11544; neural
+  endpointer benchmarking — arXiv 2104.02207; conversational endpoint detection
+  — arXiv 2505.17070
+- Deepgram — *End of Speech Detection While Live Streaming*, *UtteranceEnd*
+- AssemblyAI — *Universal-Streaming* (immutable transcripts), *Turn detection*
+- Google Research — *Modeling and improving text stability in live captions*
+- NVIDIA — *Scaling Real-Time Voice Agents with Cache-Aware Streaming ASR*;
+  `nvidia/nemotron-3.5-asr-streaming-0.6b` model card
+- *Pushing the Limits of On-Device Streaming ASR* — arXiv 2604.14493
+- SimulStreaming / AlignAtt — github.com/ufal/SimulStreaming;
+  github.com/altalt-org/Lightning-SimulWhisper
+
+---
+
 ## Order and expected payoff
 
 Accuracy figures are for pathology dictation in a normal room, measured against
@@ -1238,6 +1587,12 @@ the Phase 0 fixture.
 | 10D — Validate the fixture scorer | 2 h | makes future comparisons trustworthy |
 | 11 — Live model selection | done | **63.97 % → 19.27 % live WER, one line** |
 
+| 12A — Live decode hygiene | 2 h | removes the two settings that block LocalAgreement |
+| 12B — A real endpointer | 1 d | **lines cut on the speaker's pause, not the 20 s cap** |
+| 12C — Causal, stateful conditioning | 2 h | removes input churn; conditioning becomes O(chunk) |
+| 12D — Caption-style rendering | 1 d | append-only text; unblocks confidence colouring |
+| 12E — AlignAtt streaming policy | 3 d | gated on 10C; ~5x the policy speed on the same weights |
+
 **Do Phase 10 before Phases 8 and 9.** 10A is complete and it disproved the
 premise both of those phases were written on: the final path scores 3.68 % on
 human speech, so the 15.36 % is the synthetic fixture, not the decoder. Phase 9
@@ -1251,7 +1606,7 @@ resume is currently unreachable even though the machinery for it exists.
 
 ---
 
-## Two things to watch
+## Things to watch
 
 **Do not raise the beam before Phase 3.** Beam 5 on a re-decoded 10-second window
 every second is not achievable on CPU. Either land Phase 3 first, or hold
@@ -1261,6 +1616,17 @@ every second is not achievable on CPU. Either land Phase 3 first, or hold
 duplicate offending segments and their timing rows. The remaining offline
 transcript is preserved instead of falling back wholesale to lower-quality live
 text.
+
+**Do not cite Phase 9B against Phase 12A.** 9B measured VAD off for the *final*
+pass — one offline decode of a complete file — and correctly kept it on there.
+12A turns it off only for the live path, where the same filter is re-cutting a
+moving window's timeline on every step. The two are different experiments on
+different code paths and must be scored separately.
+
+**Do not re-benchmark live models before Phase 12B.** Phase 11's timing verdicts
+assume a 20-second worst-case decode window, which its own caveat flags as
+pessimistic. Once the endpoint bounds the buffer by the utterance, those verdicts
+have to be re-measured before any of them is used to reject a model again.
 
 ---
 

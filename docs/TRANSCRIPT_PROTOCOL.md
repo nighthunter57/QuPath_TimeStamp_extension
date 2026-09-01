@@ -19,6 +19,7 @@ as a log line and never as a state transition.
 | `LIVE_MODEL_READY` | model name | Live decoding can begin; already-buffered audio remains available. Parakeet reports `parakeet-mlx:<model-id>` so the UI/log can distinguish the engine. |
 | `TRANSCRIPT_UPDATED` | none | The committed live transcript file changed. |
 | `TRANSCRIPT_PARTIAL` | provisional text | Replaces the uncommitted live tail shown below the transcript. An empty field clears it. This text is never saved. |
+| `TURN_ENDED` | UTC timestamp | Freezes the current committed caption turn at the detected speech endpoint. |
 | `FINALIZE_PROGRESS` | processed audio seconds, total audio seconds | Progress through the full saved-audio pass. |
 | `FINALIZATION_RESULT` | result code | Terminal process outcome such as `paused` for capture-only exit, or final-pass results including `final`, `live-fallback-empty`, and `failed`. |
 

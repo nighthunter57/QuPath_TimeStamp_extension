@@ -22,6 +22,7 @@ import javafx.scene.control.MenuItem;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.ProgressIndicator;
 import javafx.scene.control.ScrollBar;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.SelectionMode;
 import javafx.scene.control.SplitPane;
 import javafx.scene.control.Tab;
@@ -39,7 +40,10 @@ import javafx.scene.layout.GridPane;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
+import javafx.scene.layout.StackPane;
 import javafx.scene.layout.VBox;
+import javafx.scene.text.Text;
+import javafx.scene.text.TextFlow;
 import javafx.stage.DirectoryChooser;
 import javafx.stage.FileChooser;
 import javafx.stage.WindowEvent;
@@ -212,6 +216,7 @@ public class TimeStamp implements QuPathExtension {
         LIVE_MODEL_READY(1),
         TRANSCRIPT_UPDATED(0),
         TRANSCRIPT_PARTIAL(1),
+        TURN_ENDED(1),
         FINALIZE_PROGRESS(2),
         FINALIZATION_RESULT(1),
         LOG(-1),
@@ -245,7 +250,7 @@ public class TimeStamp implements QuPathExtension {
                 case AUDIO_LEVEL, AUDIO_CHECK_RESULT, AUDIO_CLIPPING ->
                         Double.parseDouble(fields.get(0));
                 case AUDIO_SILENT -> Double.parseDouble(fields.get(0));
-                case RECORDING_ORIGIN -> Instant.parse(fields.get(0));
+                case RECORDING_ORIGIN, TURN_ENDED -> Instant.parse(fields.get(0));
                 case FINALIZE_PROGRESS -> {
                     Double.parseDouble(fields.get(0));
                     Double.parseDouble(fields.get(1));
@@ -311,6 +316,12 @@ public class TimeStamp implements QuPathExtension {
     private static TableView<EventEntry> liveEventTable;
     private static Label liveEventCountLabel;
     private static TextArea liveTranscriptTextArea;
+    private static TextFlow liveCaptionFlow;
+    private static ScrollPane liveCaptionScrollPane;
+    private static StackPane transcriptContentStack;
+    private static final List<Text> provisionalCaptionNodes = new ArrayList<>();
+    private static String captionCommittedContents = "";
+    private static String captionPartialContents = "";
     private static Button recordingPrimaryButton;
     private static Button recordingDoneButton;
     private static Button recordMoreButton;
@@ -1098,6 +1109,16 @@ public class TimeStamp implements QuPathExtension {
         });
         liveTranscriptTextArea.setOnMouseClicked(event ->
                 Platform.runLater(TimeStamp::selectEventsForTranscriptCaret));
+        liveCaptionFlow = new TextFlow();
+        liveCaptionFlow.setLineSpacing(3);
+        liveCaptionFlow.setStyle("-fx-font-family: 'System'; -fx-font-size: 13px;");
+        liveCaptionScrollPane = new ScrollPane(liveCaptionFlow);
+        liveCaptionScrollPane.setFitToWidth(true);
+        liveCaptionScrollPane.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
+        liveCaptionScrollPane.setStyle("-fx-background-color: transparent;");
+        liveCaptionScrollPane.setVisible(false);
+        liveCaptionScrollPane.setManaged(false);
+        transcriptContentStack = new StackPane(liveTranscriptTextArea, liveCaptionScrollPane);
 
         recordingPrimaryButton = new Button("Start Recording");
         recordingPrimaryButton.setOnAction(e -> handleRecordingPrimaryAction());
@@ -1184,18 +1205,14 @@ public class TimeStamp implements QuPathExtension {
         transcriptHelpLabel.setWrapText(true);
         transcriptHelpLabel.setStyle("-fx-text-fill: #667085; -fx-font-size: 11px;");
         transcriptPartialLabel = new Label();
-        transcriptPartialLabel.setWrapText(true);
-        transcriptPartialLabel.setMaxWidth(Double.MAX_VALUE);
-        transcriptPartialLabel.setStyle(
-                "-fx-text-fill: #8a94a6; -fx-font-size: 13px; -fx-font-style: italic;");
         transcriptPartialLabel.setVisible(false);
         transcriptPartialLabel.setManaged(false);
         Label transcriptLabel = new Label("Transcript");
         transcriptLabel.setStyle("-fx-font-weight: bold;");
         VBox transcriptPane = new VBox(
-                5, transcriptLabel, transcriptHelpLabel, liveTranscriptTextArea, transcriptPartialLabel);
+                5, transcriptLabel, transcriptHelpLabel, transcriptContentStack);
         transcriptPane.setPadding(new Insets(4, 0, 4, 0));
-        VBox.setVgrow(liveTranscriptTextArea, Priority.ALWAYS);
+        VBox.setVgrow(transcriptContentStack, Priority.ALWAYS);
 
         liveEventTable = createEventTable();
         Label eventLabel = new Label("Events");
@@ -1591,6 +1608,7 @@ public class TimeStamp implements QuPathExtension {
                 liveTranscriptTextArea.setPromptText(emptyTranscriptPrompt());
             }
         }
+        updateCaptionViewMode();
         if (transcriptHelpLabel != null) {
             transcriptHelpLabel.setText(switch (recordingWorkflowState) {
                 case READY, STARTING ->
@@ -2384,6 +2402,7 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
         String resolved = suppressRunawayTranscriptLines(contents);
+        updateCaptionCommitted(resolved);
         liveTranscriptTextArea.setPromptText(resolved.isBlank() ? emptyTranscriptPrompt() : "");
         if (resolved.equals(liveTranscriptTextArea.getText())) {
             return;
@@ -2454,13 +2473,93 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void updateTranscriptPartial(String text) {
-        if (transcriptPartialLabel == null) {
+        if (liveCaptionFlow == null) {
             return;
         }
         String resolved = suppressRunawayTranscriptLines(text).trim();
-        transcriptPartialLabel.setText(resolved);
-        transcriptPartialLabel.setVisible(!resolved.isBlank());
-        transcriptPartialLabel.setManaged(!resolved.isBlank());
+        if (resolved.equals(captionPartialContents)) {
+            return;
+        }
+        liveCaptionFlow.getChildren().removeAll(provisionalCaptionNodes);
+        provisionalCaptionNodes.clear();
+        captionPartialContents = resolved;
+        if (!resolved.isBlank()) {
+            appendCaptionNodes((captionCommittedContents.isBlank() ? "" : " ") + resolved, true);
+        }
+        followCaptionTail();
+    }
+
+    private static void updateCaptionCommitted(String contents) {
+        if (liveCaptionFlow == null) {
+            return;
+        }
+        String resolved = contents == null ? "" : contents;
+        liveCaptionFlow.getChildren().removeAll(provisionalCaptionNodes);
+        provisionalCaptionNodes.clear();
+        String suffix = appendOnlyCaptionSuffix(captionCommittedContents, resolved);
+        if (suffix == null) {
+            liveCaptionFlow.getChildren().clear();
+            captionCommittedContents = "";
+            suffix = resolved;
+        }
+        if (!suffix.isEmpty()) {
+            appendCaptionNodes(suffix, false);
+        }
+        captionCommittedContents = resolved;
+        if (!captionPartialContents.isBlank()) {
+            appendCaptionNodes((resolved.isBlank() ? "" : " ") + captionPartialContents, true);
+        }
+        followCaptionTail();
+    }
+
+    static String appendOnlyCaptionSuffix(String previous, String current) {
+        String oldText = previous == null ? "" : previous;
+        String newText = current == null ? "" : current;
+        return newText.startsWith(oldText) ? newText.substring(oldText.length()) : null;
+    }
+
+    private static void appendCaptionNodes(String contents, boolean provisional) {
+        int start = 0;
+        while (start < contents.length()) {
+            int end = start;
+            boolean whitespace = Character.isWhitespace(contents.charAt(start));
+            while (end < contents.length() &&
+                    Character.isWhitespace(contents.charAt(end)) == whitespace) {
+                end++;
+            }
+            Text node = new Text(contents.substring(start, end));
+            if (provisional) {
+                node.setOpacity(0.55);
+                node.setStyle("-fx-font-style: italic;");
+                provisionalCaptionNodes.add(node);
+            }
+            liveCaptionFlow.getChildren().add(node);
+            start = end;
+        }
+    }
+
+    private static void followCaptionTail() {
+        if (liveCaptionScrollPane == null) {
+            return;
+        }
+        Platform.runLater(() -> liveCaptionScrollPane.setVvalue(1.0));
+    }
+
+    private static void updateCaptionViewMode() {
+        if (liveCaptionScrollPane == null || liveTranscriptTextArea == null) {
+            return;
+        }
+        boolean showCaption = switch (recordingWorkflowState) {
+            case STARTING, RECORDING, PAUSED, FINALIZING -> true;
+            default -> false;
+        };
+        liveCaptionScrollPane.setVisible(showCaption);
+        liveCaptionScrollPane.setManaged(showCaption);
+        liveTranscriptTextArea.setVisible(!showCaption);
+        liveTranscriptTextArea.setManaged(!showCaption);
+        if (showCaption) {
+            updateCaptionCommitted(liveTranscriptTextArea.getText());
+        }
     }
 
     private static String emptyTranscriptPrompt() {
@@ -3464,6 +3563,7 @@ public class TimeStamp implements QuPathExtension {
                             }
                             case TRANSCRIPT_PARTIAL ->
                                     updateTranscriptPartial(message.fields().get(0));
+                            case TURN_ENDED -> updateTranscriptPartial("");
                             case TRANSCRIPT_READY -> {
                                 if (!transcriptStartPending || !process.isAlive()) {
                                     return;

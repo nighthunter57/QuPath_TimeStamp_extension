@@ -6,7 +6,7 @@ fixture) because `large-v3-turbo` at beam 5 (21.23%) could not keep up with the
 streaming schedule. Nothing between those two points has been measured.
 
 For each candidate this reports:
-  * decode time for one 20-second window, which is the Phase 3 streaming budget
+  * decode time for one 12-second window, the Phase 12 endpoint hard-cap budget
   * WER over the whole fixture, which is the quality the doctor sees
 
 A candidate is viable when the 20-second decode is comfortably under the live
@@ -23,7 +23,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_DIR = REPO_ROOT / "demo-output" / "live-accuracy-phase-0"
 DEFAULT_AUDIO = FIXTURE_DIR / "regression_fixture_audio.wav"
 DEFAULT_REFERENCE = FIXTURE_DIR / "reference.txt"
-WINDOW_SECONDS = 20.0
+WINDOW_SECONDS = 12.0
 CURRENT_DEFAULT_WER = 59.78
 
 # (model, beam, best_of). Ordered cheapest first so early results arrive early.
@@ -123,13 +123,13 @@ def main() -> int:
         errors, words = word_error_rate(reference, hypothesis)
         wer = errors / max(1, words) * 100.0
         results.append((wer, window_seconds, label, len(hypothesis), full_seconds))
-        print(f"    20s window : {window_seconds:6.2f}s")
+        print(f"    {WINDOW_SECONDS:.0f}s window : {window_seconds:6.2f}s")
         print(f"    WER        : {wer:6.2f}%  ({len(hypothesis)} words)")
         print(f"    full pass  : {full_seconds:6.1f}s\n", flush=True)
         del model
 
     print("=" * 72)
-    print(f"{'candidate':<40} {'WER':>8} {'20s win':>9} {'verdict':>12}")
+    print(f"{'candidate':<40} {'WER':>8} {f'{WINDOW_SECONDS:.0f}s win':>9} {'verdict':>12}")
     print("-" * 72)
     for wer, window_seconds, label, _, _ in sorted(results):
         if window_seconds > WINDOW_SECONDS:

@@ -124,6 +124,7 @@ class TimeStampTest {
                 "LIVE_MODEL_READY\tsmall.en",
                 "TRANSCRIPT_UPDATED",
                 "TRANSCRIPT_PARTIAL\tprovisional words",
+                "TURN_ENDED\t2026-08-25T20:00:04.000Z",
                 "FINALIZE_PROGRESS\t12.0\t60.0",
                 "FINALIZATION_RESULT\tfinal");
         for (String message : messages) {
@@ -176,6 +177,13 @@ class TimeStampTest {
         assertFalse(TimeStamp.shouldFollowTranscriptTail(0.5, 1.0, 100, 100));
         assertTrue(TimeStamp.shouldFollowTranscriptTail(0.0, 0.0, 100, 100));
         assertFalse(TimeStamp.shouldFollowTranscriptTail(0.0, 0.0, 50, 100));
+    }
+
+    @Test
+    void captionUpdatesAppendOnlyUntilFinalTextReplacesThePreview() {
+        assertEquals(" second", TimeStamp.appendOnlyCaptionSuffix("first", "first second"));
+        assertEquals("", TimeStamp.appendOnlyCaptionSuffix("same", "same"));
+        assertNull(TimeStamp.appendOnlyCaptionSuffix("live wording", "final wording"));
     }
 
     @Test

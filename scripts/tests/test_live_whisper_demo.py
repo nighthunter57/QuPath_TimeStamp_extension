@@ -59,6 +59,7 @@ class TranscriptLogicTest(unittest.TestCase):
             "LIVE_MODEL_READY": ("small.en",),
             "TRANSCRIPT_UPDATED": (),
             "TRANSCRIPT_PARTIAL": ("provisional words",),
+            "TURN_ENDED": ("2026-08-25T20:00:04.000Z",),
             "FINALIZE_PROGRESS": ("12.0", "60.0"),
             "FINALIZATION_RESULT": ("final",),
         }
@@ -607,9 +608,9 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual(transcript.LIVE_MAX_BEST_OF, settings["best_of"])
         self.assertEqual(2, settings["beam_size"])
         self.assertEqual(2, settings["best_of"])
-        self.assertTrue(settings["vad_filter"])
-        self.assertIn("vad_parameters", settings)
-        self.assertEqual(list(transcript.TRANSCRIPTION_TEMPERATURES), settings["temperature"])
+        self.assertFalse(settings["vad_filter"])
+        self.assertNotIn("vad_parameters", settings)
+        self.assertEqual(list(transcript.LIVE_TEMPERATURES), settings["temperature"])
         self.assertNotIn("initial_prompt", settings)
         self.assertEqual(
             transcript.LIVE_REPETITION_PENALTY,
@@ -631,6 +632,49 @@ class TranscriptLogicTest(unittest.TestCase):
             transcript.SEGMENT_NO_SPEECH_THRESHOLD,
             settings["no_speech_threshold"],
         )
+
+    def test_non_speech_block_never_reaches_live_decode_buffer(self):
+        audio = np.full(transcript.SAMPLE_RATE // 2, 0.01, dtype=np.float32)
+        observed = []
+
+        accepted = transcript.should_buffer_live_audio(
+            audio,
+            speech_detector=lambda candidate: observed.append(candidate.copy()) or False,
+        )
+
+        self.assertFalse(accepted)
+        self.assertEqual(1, len(observed))
+
+    def test_endpoint_layers_silence_word_gap_and_hard_cap(self):
+        start = datetime(2026, 8, 25, 20, 0, tzinfo=timezone.utc)
+
+        silence = transcript.SpeechEndpointState()
+        silence.observe(start, 0.5, True)
+        silence.observe(start + timedelta(seconds=0.5), 0.8, False)
+        self.assertEqual("silence", silence.endpoint_reason(None))
+
+        word_gap = transcript.SpeechEndpointState()
+        word_gap.observe(start, 1.5, True)
+        self.assertEqual(
+            "word-gap",
+            word_gap.endpoint_reason(start + timedelta(seconds=0.5)),
+        )
+        self.assertIsNone(word_gap.endpoint_reason(
+            start + timedelta(seconds=0.5),
+            decoded_audio_end=start + timedelta(seconds=1.0),
+        ))
+
+        hard_cap = transcript.SpeechEndpointState(max_turn_seconds=2.0)
+        hard_cap.observe(start, 2.1, True)
+        self.assertEqual("hard-cap", hard_cap.endpoint_reason(None))
+
+    def test_endpoint_reset_starts_a_new_turn(self):
+        start = datetime(2026, 8, 25, 20, 0, tzinfo=timezone.utc)
+        endpoint = transcript.SpeechEndpointState()
+        endpoint.observe(start, 1.0, True)
+        endpoint.reset()
+
+        self.assertIsNone(endpoint.endpoint_reason(None))
 
     def test_live_context_prompt_is_used_only_when_supplied(self):
         settings = transcript.build_transcribe_kwargs(
@@ -691,8 +735,36 @@ class TranscriptLogicTest(unittest.TestCase):
         conditioned = transcript.condition_live_audio(raw_audio)
 
         np.testing.assert_array_equal(original, raw_audio)
-        self.assertLess(abs(float(conditioned.mean())), 0.001)
+        self.assertLess(abs(float(conditioned[transcript.SAMPLE_RATE // 2 :].mean())), 0.001)
         self.assertFalse(np.array_equal(original, conditioned))
+
+    def test_stateful_conditioning_matches_one_call_across_chunks(self):
+        sample_times = np.arange(transcript.SAMPLE_RATE * 2) / transcript.SAMPLE_RATE
+        raw_audio = (
+            0.02 * np.sin(2 * np.pi * 500 * sample_times) + 0.1
+        ).astype(np.float32)
+        expected = transcript.LiveAudioConditioner().process(raw_audio)
+        conditioner = transcript.LiveAudioConditioner()
+        split_points = (1234, 9100)
+        actual = np.concatenate((
+            conditioner.process(raw_audio[:split_points[0]]),
+            conditioner.process(raw_audio[split_points[0]:split_points[1]]),
+            conditioner.process(raw_audio[split_points[1]:]),
+        ))
+
+        np.testing.assert_allclose(expected, actual, atol=1e-6, rtol=1e-6)
+
+    def test_stateful_agc_gain_is_continuous_across_buffer_trim(self):
+        sample_times = np.arange(transcript.SAMPLE_RATE) / transcript.SAMPLE_RATE
+        speech = (0.01 * np.sin(2 * np.pi * 500 * sample_times)).astype(np.float32)
+        agc = transcript.StatefulSlowAgc()
+        first = agc.process(speech[: transcript.SAMPLE_RATE // 2])
+        gain_before_trim = agc.gain
+        second = agc.process(speech[transcript.SAMPLE_RATE // 2 :])
+
+        self.assertGreater(gain_before_trim, 1.0)
+        self.assertGreater(agc.gain, 1.0)
+        self.assertLess(abs(float(second[0]) - float(first[-1])), 0.04)
 
     def test_live_transcribe_passes_conditioned_copy_to_model(self):
         captured = {}
@@ -717,7 +789,10 @@ class TranscriptLogicTest(unittest.TestCase):
         )
 
         np.testing.assert_array_equal(original, raw_audio)
-        self.assertLess(abs(float(captured["audio"].mean())), 0.001)
+        self.assertLess(
+            abs(float(captured["audio"][transcript.SAMPLE_RATE // 2 :].mean())),
+            0.001,
+        )
         self.assertFalse(np.array_equal(original, captured["audio"]))
 
     def test_final_transcribe_conditions_copy_without_changing_saved_wav(self):
@@ -751,7 +826,10 @@ class TranscriptLogicTest(unittest.TestCase):
             after_hash = hashlib.sha256(wave_path.read_bytes()).hexdigest()
 
         self.assertEqual(before_hash, after_hash)
-        self.assertLess(abs(float(captured["audio"].mean())), 0.001)
+        self.assertLess(
+            abs(float(captured["audio"][transcript.SAMPLE_RATE // 2 :].mean())),
+            0.001,
+        )
         self.assertFalse(np.array_equal(raw_audio, captured["audio"]))
 
     def test_wave_capture_keeps_unconditioned_samples(self):
