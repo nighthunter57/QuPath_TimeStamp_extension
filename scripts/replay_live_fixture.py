@@ -35,6 +35,17 @@ def parse_args() -> argparse.Namespace:
                         default=DEFAULT_FIXTURE / "regression_fixture_audio.wav")
     parser.add_argument("--reference", type=Path,
                         default=DEFAULT_FIXTURE / "reference.txt")
+    parser.add_argument(
+        "--no-score",
+        action="store_true",
+        help="Replay human audio without a matching reference and omit WER metrics",
+    )
+    parser.add_argument(
+        "--no-hotwords",
+        action="store_true",
+        help="Disable pathology vocabulary for non-pathology validation audio",
+    )
+    parser.add_argument("--output", type=Path, help="Write the committed replay transcript")
     parser.add_argument("--model", default="small.en")
     parser.add_argument("--compute-type", default="int8_float32")
     parser.add_argument("--beam-size", type=int, default=2)
@@ -55,7 +66,7 @@ def replay(args: argparse.Namespace) -> dict:
         "en",
         args.beam_size,
         args.best_of,
-        hotwords=DEFAULT_PATHOLOGY_HOTWORDS,
+        hotwords=None if args.no_hotwords else DEFAULT_PATHOLOGY_HOTWORDS,
     )
     conditioner = LiveAudioConditioner()
     endpoint = SpeechEndpointState()
@@ -160,11 +171,16 @@ def replay(args: argparse.Namespace) -> dict:
         for timestamp, text in group_committed_words(completed_words)
     ]
     hypothesis = "\n".join(transcript_lines)
-    metrics = score(
-        args.reference.read_text(encoding="utf-8"),
-        hypothesis,
-        load_concepts(DEFAULT_CONCEPTS),
-    )
+    metrics = None
+    if not args.no_score:
+        metrics = score(
+            args.reference.read_text(encoding="utf-8"),
+            hypothesis,
+            load_concepts(DEFAULT_CONCEPTS),
+        )
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(hypothesis + ("\n" if hypothesis else ""), encoding="utf-8")
     return {
         "model": args.model,
         "audio_seconds": audio.shape[0] / SAMPLE_RATE,
@@ -189,9 +205,14 @@ def main() -> int:
     print(f"Committed words : {result['committed_words']}")
     print(f"Turns           : {result['turns']} {result['endpoint_reasons']}")
     print(f"Longest turn    : {result['max_turn_seconds']:.1f}s")
-    print(f"Raw WER         : {result['metrics']['raw']['wer']:.2f}%")
-    print(f"Domain WER      : {result['metrics']['domain_normalized']['wer']:.2f}%")
-    print(f"Medical CER     : {result['metrics']['medical_concepts']['error_rate']:.2f}%")
+    if result["metrics"] is not None:
+        print(f"Raw WER         : {result['metrics']['raw']['wer']:.2f}%")
+        print(f"Domain WER      : {result['metrics']['domain_normalized']['wer']:.2f}%")
+        print(f"Medical CER     : {result['metrics']['medical_concepts']['error_rate']:.2f}%")
+    else:
+        print("WER metrics     : omitted (no matching reference)")
+    if args.output is not None:
+        print(f"Transcript      : {args.output}")
     return 0
 
 

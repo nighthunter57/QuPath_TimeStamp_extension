@@ -317,6 +317,39 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   be compared on genuine human audio; the synthetic fixture is not a valid
   substitute. All **67 Python tests** and the complete Gradle build pass through
   12D.
+- **Real-human non-pathology validation — 2026-09-01.** Two downloaded mono AAC
+  recordings, `Hao 1.m4a` (41.2 s) and `Hao 2.m4a` (80.7 s), were converted
+  through TimeStamp's own decoder and crash-safe WAV writer. Silero classified
+  72/11 and 155/7 speech/noise half-second blocks; estimated SNR was **13.60 dB**
+  and **8.37 dB**, both `good`. These are genuine human recordings in a normal
+  room, but they describe a food-waste application and have no matching written
+  reference, so they do **not** complete 10C or 8B and cannot yield honest WER or
+  MCER.
+- The Phase 12 replay policy committed **99 words in 6 turns** on Hao 1 (2
+  silence, 2 decoded-word gap, 2 hard-cap) and **259 words in 11 turns** on Hao
+  2 (1 silence, 6 decoded-word gap, 3 hard-cap, 1 stop). No turn exceeded 12.0
+  seconds. This is the first real-room confirmation that the independent
+  decoded-word endpoint fires where the old fixed RMS gate could remain open.
+  `scripts/replay_live_fixture.py` now supports `--no-score`, `--no-hotwords`,
+  and `--output` for this kind of reference-free validation.
+- A real-human engine agreement check further rejects automatic Parakeet. Using
+  large-v3 output only as an agreement proxy—not ground truth—`small.en`
+  disagreed by **30.28%** on Hao 1 and **49.04%** on Hao 2; Parakeet disagreed by
+  **75.23%** and **68.97%**, while omitting 33 and 53 words respectively. The
+  automatic live engine therefore remains `small.en`.
+- The final path succeeded on Hao 1 with transcript, segment CSV, and word CSV.
+  On Hao 2, production large-v3 beam 8 with temperature fallback exceeded the
+  bounded diagnostic without yielding a segment and was terminated inside
+  `generate_with_fallback`; a greedy large-v3 diagnostic completed in **97.4
+  seconds** with 259 words. QuPath's duration-based supervisor preserves the live
+  transcript when this occurs. This is a final-search performance finding, not
+  an accuracy result, because no reference exists.
+- **12E dependency audit — 2026-09-01.** Lightning-SimulWhisper does expose an
+  MLX/CoreML AlignAtt path for Apple Silicon, but it is a separate external
+  runtime/model conversion rather than a drop-in faster-whisper policy, and its
+  documented CIF checkpoints do not include large-v3. Do not add that runtime
+  until 10C supplies a scored pathology recording: the two available human
+  samples can reject a divergent engine, but cannot prove clinical accuracy.
 
 ---
 
