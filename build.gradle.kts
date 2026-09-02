@@ -1,3 +1,7 @@
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+
 plugins {
     // To optionally create a shadow/fat jar that bundle up any non-core dependencies
     id("com.gradleup.shadow") version "8.3.5"
@@ -78,9 +82,31 @@ tasks.register("deployToQuPath") {
                 }
             }
 
-        copy {
-            from(sourceJar)
-            into(extensionsDirectory)
+        val targetJar = extensionsDirectory.resolve(sourceJar.name)
+        val stagedJar = extensionsDirectory.resolve(".${sourceJar.name}.${System.nanoTime()}.tmp")
+        try {
+            sourceJar.copyTo(stagedJar, overwrite = true)
+            try {
+                Files.move(
+                    stagedJar.toPath(),
+                    targetJar.toPath(),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            } catch (_: AtomicMoveNotSupportedException) {
+                Files.move(
+                    stagedJar.toPath(),
+                    targetJar.toPath(),
+                    StandardCopyOption.REPLACE_EXISTING,
+                )
+            }
+        } catch (exception: Exception) {
+            throw GradleException(
+                "Could not replace ${targetJar.absolutePath}. Close QuPath and try again.",
+                exception,
+            )
+        } finally {
+            stagedJar.delete()
         }
 
         logger.lifecycle("Installed ${sourceJar.name} to ${extensionsDirectory.absolutePath}")
