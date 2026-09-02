@@ -1,7 +1,8 @@
 # Live Transcript Accuracy Plan
 
-Twelve phases to take the live transcript from repetition loops to roughly 95% word
-accuracy, in the order that keeps the decoder ahead of the microphone.
+Thirteen phases to take the live transcript from repetition loops to roughly 95% word
+accuracy, in the order that keeps the decoder ahead of the microphone, and to make
+the recorder usable by a doctor who is looking at a specimen rather than at the panel.
 
 - **Target files:** `scripts/live_whisper_demo.py`, `src/main/java/qupath/ext/timestamp/TimeStamp.java`
 - **Stack:** faster-whisper 1.2.1/CTranslate2 4.8.1 on CPU, with optional
@@ -288,7 +289,7 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   evidence for putting VAD back into LocalAgreement.
 - **Phase 12B implementation complete — 2026-09-01; human acceptance pending
   10C.** The RMS endpoint is replaced by Silero trailing silence, a decoded-word
-  gap measured in the decoder's compressed timeline, and a 12-second hard cap.
+  gap measured on the recording clock, and a 12-second hard cap.
   `TURN_ENDED` is defined in Python, Java, the protocol document, and both
   grammar suites. The synthetic replay produced **11 turns: 1 silence, 1 word
   gap, and 9 hard-cap**, with no line allowed past 12.0 seconds. The required
@@ -301,12 +302,13 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   seconds. Distil-small stayed fast at 2.44–2.56 seconds but regressed to 73.74%
   WER. Auto therefore remains `small.en`; no model verdict is promoted beyond
   the synthetic fixture.
-- **Phase 12C complete — 2026-09-01.** Mean subtraction is removed; the 80 Hz
-  high-pass and causal AGC now preserve input, level, and gain state across
-  chunks. Every new capture block advances the conditioner exactly once, while
-  only Silero-positive conditioned blocks enter the decoder. Arbitrary chunking
-  matches one-call conditioning to tolerance, gain is continuous across buffer
-  trims, and the raw incremental WAV path is unchanged.
+- **Phase 12C complete — 2026-09-01.** Mean subtraction is removed from the live
+  path; the 80 Hz high-pass and causal AGC now preserve input, level, and gain
+  state across chunks. Every new capture block advances the conditioner exactly
+  once, while only Silero-positive conditioned blocks enter the decoder.
+  Arbitrary chunking matches one-call conditioning to tolerance, gain is
+  continuous across buffer trims, the calibrated offline conditioner remains
+  final-pass-only, and the raw incremental WAV path is unchanged.
 - **Phase 12D complete — 2026-09-01.** The recording view is an inline
   append-only `TextFlow`: committed text is emitted as stable nodes and the
   provisional tail is rendered in the same flow at reduced opacity. `TURN_ENDED`
@@ -350,6 +352,37 @@ accuracy, in the order that keeps the decoder ahead of the microphone.
   documented CIF checkpoints do not include large-v3. Do not add that runtime
   until 10C supplies a scored pathology recording: the two available human
   samples can reject a divergent engine, but cannot prove clinical accuracy.
+- **Post-Phase-12 correctness audit — 2026-09-02.** Upstream Silero gating
+  compressed the decoder buffer, but its word timestamps and commit trimming
+  still treated retained blocks as contiguous recording time. A span map now
+  projects every Whisper and Parakeet decoder offset back onto the original
+  capture clock and trims the matching retained samples. This preserves event
+  alignment across discarded silence without allowing that silence into the
+  Whisper decode buffer.
+- The same audit separated the causal live conditioner from the Phase
+  10B-calibrated offline conditioner; Phase 12C had unintentionally routed the
+  final pass through the new live filter state. Re-running
+  `.venv-whisper/bin/python -m scripts.calibrate_asr --count 40` after the fix
+  restored the exact accepted result: **21 errors over 897 words, 2.34% WER,
+  and 2.23% numbers-normalized WER**. The run took 1214.9 seconds for 343.6
+  seconds of audio on this audit run; accuracy, not wall-clock throughput, is
+  the regression gate.
+- Capture-clock mapping exposed that the proposed 0.7-second word-gap fallback
+  was firing on ordinary decoder lag. At 0.7 seconds the fixture split into 14
+  turns and regressed to **22.07% raw WER, 9.23% domain WER, and 28.57% MCER**.
+  Raising only `ENDPOINT_WORD_GAP_SECONDS` to the documented 1.0-second lower
+  bound restored 11 turns (1 silence, 1 word gap, 9 hard-cap) and improved the
+  replay to **339 committed words, 19.27% raw WER, 6.25% domain WER, and 20.00%
+  MCER** in 634.6 decode seconds. No turn exceeded 12.0 seconds. All **70 Python
+  tests** and all **29 Java tests** pass with the corrected policy.
+- **Phase 13A complete — 2026-09-02.** The 80-word render guard was confirmed
+  to replace a legitimate 137-word line in the real `hao_2` replay. Java now
+  mirrors Python's repeated-3-gram structural detector instead of treating line
+  length as corruption, so the long human line survives while the original
+  runaway-loop shape is still suppressed. The replay writer also preserves
+  each detected turn as a line instead of flattening completed turns and
+  regrouping them afterward. Save and Export remain byte-identical to the safe
+  panel text. Phase 13B is next; there are still no keyboard accelerators.
 
 ---
 
@@ -1425,7 +1458,7 @@ floor. Nothing new needs installing.
 | Constant | Value | Note |
 | --- | ---: | --- |
 | `ENDPOINT_SILENCE_SECONDS` | 0.7 | supersedes `LOCAL_AGREEMENT_SILENCE_SECONDS` |
-| `ENDPOINT_WORD_GAP_SECONDS` | 0.7 | AssemblyAI ships 400 ms; start conservative for dictation |
+| `ENDPOINT_WORD_GAP_SECONDS` | 1.0 | avoids firing on ordinary decoder lag; matches Deepgram's documented lower bound |
 | `ENDPOINT_MAX_TURN_SECONDS` | 12.0 | fallback, not the normal path |
 
 `CHUNK_RMS_SILENCE_THRESHOLD` stays for silence and clipping protection, which is
@@ -1587,6 +1620,242 @@ claimed from the synthetic fixture, for the same reason Phase 9C was cancelled.
 
 ---
 
+## Phase 13 — Clinical workflow and panel (~1 week, staged)
+
+### Why this phase exists
+
+Phases 5, 6 and 12D improved the transcript *view*. This phase reviews the whole
+operator workflow — every control a doctor touches from install to saved
+session — against how clinical dictation tools are actually used, and fixes one
+front-end defect that silently destroys recorded words.
+
+Comparable tools were used as the reference point. Dragon Medical ships the
+PowerMic with programmable hardware buttons and supports USB foot pedals; LIS
+vendors are embedding speech-to-text directly in the sign-out screen so the
+dictation is already bound to the case. The common assumption is that **the
+clinician's hands are on slide navigation and their eyes are on the specimen** —
+the software must be operable without either.
+
+### What is already right, and must not be regressed
+
+These came out of Phases 6 and 7 and are better than the commercial comparison.
+Any change below must preserve them.
+
+- One full-width primary action whose label, tooltip, and help text always name
+  the next step (`:1575-1602`). Nine workflow states collapse to five actions.
+- **Done is separate from Pause**, so a take cannot be ended by mistake
+  mid-thought.
+- **Save is refused while `PAUSED`** (`:3197`) — the "live preview is not the
+  deliverable" invariant enforced in the UI.
+- Unsaved-session recovery on startup (`:672`), with `.saved`/`.discarded`
+  markers so it does not nag.
+- Raw audio excluded from Save by default, with an explicit PHI hint (`:3356`).
+- Microphone test reports a real SNR *before* recording, not after.
+- Secondary controls hide rather than grey out during `RECORDING`.
+
+---
+
+### 13A — Stop the panel destroying recorded words (complete — 2026-09-02)
+
+**This is a defect, not a UX improvement.** It is first because it silently
+corrupts saved sessions, which AGENTS.md names as the failure class that matters
+most.
+
+`suppressRunawayTranscriptLines` (`TimeStamp.java:2456`) replaces any transcript
+line longer than `MAX_TRANSCRIPT_RENDER_WORDS_PER_LINE = 80` with
+`[decode error suppressed]`. It was added in Phase 5 to hide Phase 1's 211-word
+runaway hallucination loop. It is a raw word count, so it cannot distinguish a
+hallucination loop from a person talking for 39 seconds without pausing.
+
+Measured on the real human sample `hao_2`: **136 of 259 words — 52.5 % of the
+transcript — are replaced by the marker.** `hao_1` is unaffected; its longest
+line is 41 words.
+
+The words are correct in the file that Python writes. The loss happens in the
+panel, and then propagates:
+
+1. `updateTranscriptTextArea` (`:2404`) stores the **suppressed** text in
+   `liveTranscriptTextArea`.
+2. `saveRecording` (`:3278`) and `exportTranscript` (`:3203`) write
+   `liveTranscriptTextArea.getText()`.
+3. `validateExactTextFile` then confirms the saved file matches the display, so
+   the marker is written to the session **and verified as correct**.
+
+This bites hardest in the case already observed: when the final pass is
+terminated and the live transcript is preserved as the deliverable.
+
+#### Root cause is upstream
+
+`group_committed_words` (`live_whisper_demo.py:429`) still breaks lines only on
+sentence punctuation or a `TRANSCRIPT_LINE_GAP_SECONDS` inter-word gap. Measured
+on `hao_1`: **0 sentence-enders and exactly 1 inter-word gap ≥ 0.7 s in 41.2
+seconds of real speech.** Whisper's word timestamps are contiguous by
+construction — the end of word *N* is the start of word *N+1* — so most measured
+gaps are literally 0.00 s and gap-based line breaking cannot work on them.
+
+Phase 12B already detects the boundaries: 11 turns on `hao_2`, none over 12
+seconds. The renderer discards 3 of them.
+
+#### Implemented changes
+
+- Production already grouped each LocalAgreement turn independently after
+  `TURN_ENDED`; the replay tool was the path that flattened them. It now keeps
+  those completed-turn groups through scoring and output. With turns capped at
+  `ENDPOINT_MAX_TURN_SECONDS = 12.0`, replay lines no longer merge across turn
+  boundaries.
+- The Java guard is now **content-based, not length-based**, with the same
+  minimum length, 3-gram, and maximum-share constants as Python's
+  `looks_like_structural_repetition_loop`. It suppresses only structural loops.
+- Keep display and save byte-identical. The "what you see is what you save"
+  invariant is worth preserving — fix the display, do not desynchronize the two.
+
+#### Acceptance
+
+- A 137-word legitimate line survives the Java renderer unchanged.
+- A 90-word repeated 3-gram loop is still replaced by
+  `[decode error suppressed]`.
+- Replay output carries completed-turn groups directly, including when no
+  punctuation or word-timestamp gap exists inside a turn.
+
+---
+
+### 13B — Make it operable without the mouse (~1 day)
+
+**There are zero keyboard accelerators in all 4,725 lines of `TimeStamp.java`** —
+no `KeyCombination`, no `setAccelerator`, no key handlers. Every state
+transition requires the doctor to stop dictating, look away from the specimen,
+find the panel, and click.
+
+This is the largest single workflow difference from the tools this product
+competes with, and the fix is cheap.
+
+#### Changes
+
+- Accelerators for Start, Pause/Resume, and Done. USB dictation foot pedals emit
+  keystrokes, so this delivers pedal support with no extra work.
+- A compact always-visible recording indicator (QuPath toolbar) carrying at
+  minimum elapsed time, the signal dot, and Pause/Done. Today, hiding the
+  recorder panel leaves an in-flight recording with no controls at all.
+
+---
+
+### 13C — Bind a session to a case (~half a day)
+
+The Save dialog asks for a "Session name" defaulting to a timestamp such as
+`20260901_154212_123` (`:3344`). In a laboratory the unit of work is an
+accession number, so saved sessions cannot be reconciled with the LIS
+afterwards. This is the main structural gap against LIS-embedded dictation,
+where the dictation is already bound to the case.
+
+#### Changes
+
+- Capture a Case ID at **Start**, not at Save — at Save the doctor has already
+  stopped thinking about the case.
+- Stamp it into the recording manifest, the transcript header, and the default
+  session name.
+- Keep it optional so a scratch recording still works.
+
+---
+
+### 13D — Bound the finalization wait (~half a day)
+
+`FINALIZING` disables the primary action and hides the secondary row, with a
+progress bar and no exit. On the real `hao_2` sample the final pass **never
+completed** — large-v3 beam 8 with temperature fallback was terminated by the
+duration supervisor. The doctor sees "Creating final transcript…" for minutes
+with no estimate and no way out.
+
+#### Changes
+
+- Show an ETA. The realtime factor is known and measured (0.75–1.6x depending on
+  model and beam); the audio duration is known exactly.
+- Add an explicit escape that keeps the live preview and stops the final pass.
+  The supervisor already preserves the live transcript in this situation — say
+  so at the moment it happens, rather than leaving the doctor to infer it.
+
+---
+
+### 13E — Stop showing the doctor the implementation (~half a day)
+
+The settings dialog currently reads, verbatim: *"Parakeet MLX is an experimental
+Apple-Silicon option until it passes the human-voice quality gate"* and *"Live
+context is a maximum uncommitted-audio buffer, not a repeated decode window"*
+(`:3134-3138`). A pathologist should never be choosing an ASR engine.
+
+#### Changes
+
+- Move Live engine behind an Advanced disclosure. Leave Input device, Language,
+  and terminology at the top level.
+- Replace the raw comma-separated `Pathology terms` TextArea (`:3128`) with an
+  editable term list, and add per-specialty presets. Breast, GI and derm need
+  different vocabularies, and this is the setting with the **largest measured
+  accuracy effect in the whole plan** — Phase 9D moved Medical Concept Error
+  Rate from 8.57 % to 2.86 % by widening it.
+
+---
+
+### 13F — Make review a safety step (~1 day, after 12D)
+
+The transcript is editable in `UNSAVED_REVIEW`, but it is a plain `TextArea`
+with no confidence highlighting, no jump-to-uncertain-word, and no check against
+the terminology list. Phase 5 recorded confidence colouring as blocked; Phase
+12D's per-word caption nodes remove that blocker.
+
+Given that `in situ` → `C2` is a documented failure in the project's own fixture,
+review is where clinical safety actually happens, and the UI currently offers no
+help finding the risky spots.
+
+---
+
+### 13G — Consent and consistency (~2 h)
+
+- **Mouse tracking is invisible while it happens.** `logEvent` records Tool
+  Changed, Click, Pan End, **MouseMove**, and annotation geometry (`:772-932`).
+  There is a PHI hint about audio at Save time, but nothing at Record time tells
+  the doctor their cursor is being logged. That is a consent question before it
+  is a UX one.
+- **Duplicated menu paths disagree.** Export transcript, Clear event log and
+  Transcript settings exist in both the QuPath menu (`:508-528`) and the panel's
+  More menu. The panel's export is *disabled* while paused; the menu's export is
+  enabled and *warns* instead (`:3197`). Both are safe, but they teach different
+  rules for the same action.
+
+---
+
+### 13H — First-run friction (~2 h, docs and installer)
+
+The current sequence is: open QuPath once and finish its user-folder setup →
+close QuPath → run the installer → reopen QuPath. A "must be closed" requirement
+in the middle is a classic place for non-technical users to fail, and the model
+download size is never stated.
+
+State the download size up front, and have the installer detect and report a
+running QuPath rather than failing partway.
+
+---
+
+### Order
+
+**13A first** — it is a correctness defect that corrupts saved sessions, and its
+root cause is one line-grouping change in Python.
+
+Then **13B**, which is the largest workflow gain per hour of work. **13C** and
+**13D** next; both are small and both address moments where the doctor is
+currently stuck or under-informed. **13E**, **13G** and **13H** are cleanups.
+**13F** depends on Phase 12D's per-word nodes.
+
+### Sources
+
+- Dragon Medical One foot-pedal and PowerMic hands-free control —
+  startstop.com, tvps.com dictation pedal documentation
+- LigoLab — speech-to-text embedded in LIS sign-out
+- *Improving the creation and reporting of structured findings during digital
+  pathology review* — PMC4977970
+- *A comparative usability assessment of computer input devices for navigating
+  digital whole slide images* — PMC12221461
+
+---
+
 ## Order and expected payoff
 
 Accuracy figures are for pathology dictation in a normal room, measured against
@@ -1626,6 +1895,15 @@ the Phase 0 fixture.
 | 12D — Caption-style rendering | 1 d | append-only text; unblocks confidence colouring |
 | 12E — AlignAtt streaming policy | 3 d | gated on 10C; ~5x the policy speed on the same weights |
 
+| 13A — Stop the panel destroying words | 3 h | **recovers 52.5 % of a real saved transcript** |
+| 13B — Hotkeys and a toolbar indicator | 1 d | operable without leaving the specimen; foot pedals work |
+| 13C — Bind a session to a case | 4 h | saved sessions can be reconciled with the LIS |
+| 13D — Bound the finalization wait | 4 h | an ETA and an exit instead of an open-ended spinner |
+| 13E — Hide the implementation | 4 h | per-specialty terms, the setting with the largest MCER effect |
+| 13F — Review as a safety step | 1 d | confidence surfaced where clinical errors are caught |
+| 13G — Consent and consistency | 2 h | mouse logging disclosed; one rule per action |
+| 13H — First-run friction | 2 h | fewer failed installs on a new workstation |
+
 **Do Phase 10 before Phases 8 and 9.** 10A is complete and it disproved the
 premise both of those phases were written on: the final path scores 3.68 % on
 human speech, so the 15.36 % is the synthetic fixture, not the decoder. Phase 9
@@ -1660,6 +1938,12 @@ different code paths and must be scored separately.
 assume a 20-second worst-case decode window, which its own caveat flags as
 pessimistic. Once the endpoint bounds the buffer by the utterance, those verdicts
 have to be re-measured before any of them is used to reject a model again.
+
+**The 80-word render guard is not a safety net — it is a data-loss bug.** It was
+added in Phase 5 against Phase 1's runaway loop, but it destroys legitimate
+speech and the destruction reaches Save and Export. Any measurement of live
+quality taken from the *panel* rather than from the Python-written file is
+therefore suspect until 13A lands. The file on disk has always been correct.
 
 ---
 

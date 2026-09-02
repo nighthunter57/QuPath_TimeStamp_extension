@@ -659,10 +659,6 @@ class TranscriptLogicTest(unittest.TestCase):
             "word-gap",
             word_gap.endpoint_reason(start + timedelta(seconds=0.5)),
         )
-        self.assertIsNone(word_gap.endpoint_reason(
-            start + timedelta(seconds=0.5),
-            decoded_audio_end=start + timedelta(seconds=1.0),
-        ))
 
         hard_cap = transcript.SpeechEndpointState(max_turn_seconds=2.0)
         hard_cap.observe(start, 2.1, True)
@@ -675,6 +671,56 @@ class TranscriptLogicTest(unittest.TestCase):
         endpoint.reset()
 
         self.assertIsNone(endpoint.endpoint_reason(None))
+        self.assertIsNone(endpoint.latest_audio_end)
+
+    def test_decode_timeline_maps_gated_gaps_and_trims_matching_samples(self):
+        start = datetime(2026, 8, 25, 20, 0, tzinfo=timezone.utc)
+        timeline = transcript.SpeechDecodeTimeline(sample_rate=10)
+        timeline.append(start, 10)
+        timeline.append(start + timedelta(seconds=3), 10)
+
+        self.assertEqual(start + timedelta(seconds=0.5), timeline.map_offset(0.5))
+        self.assertEqual(start + timedelta(seconds=1), timeline.map_offset(1.0, prefer_end=True))
+        self.assertEqual(start + timedelta(seconds=3), timeline.map_offset(1.0))
+        self.assertEqual(start + timedelta(seconds=3.5), timeline.map_offset(1.5))
+
+        self.assertEqual(15, timeline.trim_through(start + timedelta(seconds=3.5)))
+        self.assertEqual(5, timeline.frame_count)
+        self.assertEqual(start + timedelta(seconds=3.5), timeline.start_time)
+
+    def test_transcribe_maps_compressed_word_offsets_to_capture_clock(self):
+        start = datetime(2026, 8, 25, 20, 0, tzinfo=timezone.utc)
+        timeline = transcript.SpeechDecodeTimeline(sample_rate=transcript.SAMPLE_RATE)
+        timeline.append(start, transcript.SAMPLE_RATE)
+        timeline.append(start + timedelta(seconds=3), transcript.SAMPLE_RATE)
+        word = SimpleNamespace(word=" second", start=1.2, end=1.5)
+        segment = SimpleNamespace(
+            text="second",
+            start=1.2,
+            end=1.5,
+            words=[word],
+            avg_logprob=0.0,
+            no_speech_prob=0.0,
+            compression_ratio=1.0,
+        )
+        model = SimpleNamespace(transcribe=lambda audio, **kwargs: ([segment], None))
+        audio = np.full(transcript.SAMPLE_RATE * 2, 0.02, dtype=np.float32)
+
+        entries = transcript.transcribe_audio_segments(
+            model,
+            audio,
+            "en",
+            start,
+            beam_size=2,
+            best_of=2,
+            previous_text=False,
+            audio_is_conditioned=True,
+            audio_timeline=timeline,
+        )
+
+        self.assertEqual(start + timedelta(seconds=3.2), entries[0][0])
+        self.assertEqual(start + timedelta(seconds=3.5), entries[0][1])
+        self.assertEqual(start + timedelta(seconds=3.2), entries[0][3][0][0])
 
     def test_live_context_prompt_is_used_only_when_supplied(self):
         settings = transcript.build_transcribe_kwargs(
@@ -737,6 +783,21 @@ class TranscriptLogicTest(unittest.TestCase):
         np.testing.assert_array_equal(original, raw_audio)
         self.assertLess(abs(float(conditioned[transcript.SAMPLE_RATE // 2 :].mean())), 0.001)
         self.assertFalse(np.array_equal(original, conditioned))
+
+    def test_final_conditioner_remains_separate_from_causal_live_path(self):
+        sample_times = np.arange(transcript.SAMPLE_RATE * 2) / transcript.SAMPLE_RATE
+        raw_audio = (
+            0.004 * np.sin(2 * np.pi * 500 * sample_times) + 0.1
+        ).astype(np.float32)
+
+        expected = transcript.apply_slow_agc(
+            transcript.remove_dc_and_high_pass(raw_audio)
+        )
+        final_audio = transcript.condition_final_audio(raw_audio)
+        live_audio = transcript.condition_live_audio(raw_audio)
+
+        np.testing.assert_array_equal(expected, final_audio)
+        self.assertFalse(np.array_equal(final_audio, live_audio))
 
     def test_stateful_conditioning_matches_one_call_across_chunks(self):
         sample_times = np.arange(transcript.SAMPLE_RATE * 2) / transcript.SAMPLE_RATE

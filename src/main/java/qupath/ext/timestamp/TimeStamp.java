@@ -96,8 +96,10 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -122,7 +124,9 @@ public class TimeStamp implements QuPathExtension {
     private static final double LEGACY_OVERLAY_FONT_SIZE = 24.0;
     private static final long OVERLAY_EVENT_VISIBLE_MILLIS = 4_000L;
     private static final int MAX_LIVE_MONITOR_EVENTS = 200;
-    private static final int MAX_TRANSCRIPT_RENDER_WORDS_PER_LINE = 80;
+    private static final int TRANSCRIPT_LOOP_NGRAM_SIZE = 3;
+    private static final int TRANSCRIPT_LOOP_MIN_WORDS = 12;
+    private static final double TRANSCRIPT_LOOP_MAX_SHARE = 0.30;
     private static final double WIDE_PANEL_MINIMUM_WIDTH = 720.0;
     private static final double DEFAULT_PANEL_DIVIDER_POSITION = 0.5;
     private static final double RECORDING_PANEL_DIVIDER_POSITION = 0.75;
@@ -1272,8 +1276,10 @@ public class TimeStamp implements QuPathExtension {
                 new ReadOnlyStringWrapper(cell.getValue().details()));
         detailsColumn.setMinWidth(140);
 
-        table.getColumns().addAll(elapsedColumn, typeColumn, detailsColumn);
-        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY);
+        table.getColumns().add(elapsedColumn);
+        table.getColumns().add(typeColumn);
+        table.getColumns().add(detailsColumn);
+        table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
         table.getSelectionModel().selectedItemProperty().addListener((obs, oldEntry, newEntry) -> {
             if (!synchronizingTranscriptAndEvents && newEntry != null) {
                 selectTranscriptForEvent(newEntry);
@@ -2463,13 +2469,40 @@ public class TimeStamp implements QuPathExtension {
             int timestampEnd = line.startsWith("[") ? line.indexOf("] ") : -1;
             String prefix = timestampEnd >= 0 ? line.substring(0, timestampEnd + 2) : "";
             String transcriptText = timestampEnd >= 0 ? line.substring(timestampEnd + 2) : line;
-            String trimmed = transcriptText.trim();
-            int wordCount = trimmed.isEmpty() ? 0 : trimmed.split("\\s+").length;
-            if (wordCount > MAX_TRANSCRIPT_RENDER_WORDS_PER_LINE) {
+            if (looksLikeStructuralRepetitionLoop(transcriptText)) {
                 lines[index] = prefix + TRANSCRIPT_RUNAWAY_MARKER;
             }
         }
         return String.join("\n", lines);
+    }
+
+    static boolean looksLikeStructuralRepetitionLoop(String text) {
+        if (text == null || text.isBlank()) {
+            return false;
+        }
+        String normalized = text.toLowerCase(Locale.ROOT)
+                .replaceAll("[^\\p{L}\\p{N}_\\s]", " ")
+                .trim()
+                .replaceAll("\\s+", " ");
+        if (normalized.isEmpty()) {
+            return false;
+        }
+        String[] words = normalized.split(" ");
+        if (words.length < TRANSCRIPT_LOOP_MIN_WORDS) {
+            return false;
+        }
+        int ngramCount = words.length - TRANSCRIPT_LOOP_NGRAM_SIZE + 1;
+        Map<String, Integer> counts = new HashMap<>();
+        int maximumCount = 0;
+        for (int index = 0; index < ngramCount; index++) {
+            String ngram = String.join("\u0000", Arrays.copyOfRange(
+                    words,
+                    index,
+                    index + TRANSCRIPT_LOOP_NGRAM_SIZE));
+            int count = counts.merge(ngram, 1, Integer::sum);
+            maximumCount = Math.max(maximumCount, count);
+        }
+        return (double) maximumCount / ngramCount > TRANSCRIPT_LOOP_MAX_SHARE;
     }
 
     private static void updateTranscriptPartial(String text) {

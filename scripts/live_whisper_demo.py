@@ -91,7 +91,7 @@ FAST_INITIAL_LIVE_WINDOW_SECONDS = 0.5
 FAST_LIVE_STEP_SECONDS = 1.0
 LOCAL_AGREEMENT_PROMPT_WORDS = 32
 ENDPOINT_SILENCE_SECONDS = 0.7
-ENDPOINT_WORD_GAP_SECONDS = 0.7
+ENDPOINT_WORD_GAP_SECONDS = 1.0
 ENDPOINT_MAX_TURN_SECONDS = 12.0
 TRANSCRIPT_LINE_GAP_SECONDS = 0.7
 METER_EMIT_INTERVAL_SECONDS = 0.25
@@ -618,6 +618,84 @@ class LiveTranscriptionUpdate:
     committed_through: Optional[datetime]
 
 
+@dataclass
+class DecodeTimelineSpan:
+    """One retained decoder span and its position on the capture clock."""
+
+    source_start: datetime
+    frame_count: int
+
+
+class SpeechDecodeTimeline:
+    """Map silence-compressed decoder offsets back to the recording clock."""
+
+    def __init__(self, sample_rate: int = SAMPLE_RATE) -> None:
+        self.sample_rate = sample_rate
+        self.spans: list[DecodeTimelineSpan] = []
+
+    @property
+    def frame_count(self) -> int:
+        return sum(span.frame_count for span in self.spans)
+
+    @property
+    def start_time(self) -> Optional[datetime]:
+        return self.spans[0].source_start if self.spans else None
+
+    def append(self, source_start: datetime, frame_count: int) -> None:
+        if frame_count > 0:
+            self.spans.append(DecodeTimelineSpan(source_start, frame_count))
+
+    def extend(self, other: "SpeechDecodeTimeline", frame_count: Optional[int] = None) -> None:
+        remaining = other.frame_count if frame_count is None else max(0, frame_count)
+        for span in other.spans:
+            retained = min(span.frame_count, remaining)
+            if retained <= 0:
+                break
+            self.append(span.source_start, retained)
+            remaining -= retained
+
+    def prefix(self, frame_count: int) -> "SpeechDecodeTimeline":
+        copied = SpeechDecodeTimeline(self.sample_rate)
+        copied.extend(self, frame_count)
+        return copied
+
+    def map_offset(self, offset_seconds: float, prefer_end: bool = False) -> datetime:
+        if not self.spans:
+            raise ValueError("cannot map an empty decoder timeline")
+        offset_frames = max(0.0, offset_seconds * self.sample_rate)
+        consumed = 0
+        for index, span in enumerate(self.spans):
+            span_end = consumed + span.frame_count
+            before_boundary = offset_frames < span_end
+            at_final_boundary = index == len(self.spans) - 1 and offset_frames <= span_end
+            if before_boundary or (prefer_end and offset_frames <= span_end) or at_final_boundary:
+                local_frames = min(span.frame_count, max(0.0, offset_frames - consumed))
+                return span.source_start + timedelta(seconds=local_frames / self.sample_rate)
+            consumed = span_end
+        final_span = self.spans[-1]
+        return final_span.source_start + timedelta(
+            seconds=final_span.frame_count / self.sample_rate
+        )
+
+    def trim_through(self, source_time: datetime) -> int:
+        trimmed = 0
+        while self.spans:
+            span = self.spans[0]
+            if source_time <= span.source_start:
+                break
+            span_seconds = (source_time - span.source_start).total_seconds()
+            span_frames = min(span.frame_count, max(0, int(span_seconds * self.sample_rate)))
+            if span_frames <= 0:
+                break
+            trimmed += span_frames
+            if span_frames < span.frame_count:
+                span.source_start += timedelta(seconds=span_frames / self.sample_rate)
+                span.frame_count -= span_frames
+                break
+            self.spans.pop(0)
+        return trimmed
+
+
 class LiveTranscriber:
     """Common interface for incremental live ASR engines."""
 
@@ -630,6 +708,7 @@ class LiveTranscriber:
         chunk_start_time: datetime,
         force: bool = False,
         context_prompt: Optional[str] = None,
+        audio_timeline: Optional[SpeechDecodeTimeline] = None,
     ) -> LiveTranscriptionUpdate:
         raise NotImplementedError
 
@@ -666,6 +745,7 @@ class WhisperLiveTranscriber(LiveTranscriber):
         chunk_start_time: datetime,
         force: bool = False,
         context_prompt: Optional[str] = None,
+        audio_timeline: Optional[SpeechDecodeTimeline] = None,
     ) -> LiveTranscriptionUpdate:
         segments = transcribe_audio_segments(
             self.model,
@@ -680,6 +760,7 @@ class WhisperLiveTranscriber(LiveTranscriber):
             hotwords=self.hotwords,
             context_prompt=context_prompt,
             audio_is_conditioned=True,
+            audio_timeline=audio_timeline,
         )
         newly_committed, provisional_words = self.agreement.update(
             decoded_segments_to_timed_words(segments),
@@ -688,7 +769,11 @@ class WhisperLiveTranscriber(LiveTranscriber):
         self.has_emission = bool(self.agreement.committed_words or provisional_words)
         committed_through = newly_committed[-1][1] if newly_committed else None
         if force and not provisional_words and committed_through is None:
-            committed_through = chunk_start_time + timedelta(seconds=len(audio) / SAMPLE_RATE)
+            committed_through = (
+                audio_timeline.map_offset(len(audio) / SAMPLE_RATE, prefer_end=True)
+                if audio_timeline is not None and audio_timeline.start_time is not None
+                else chunk_start_time + timedelta(seconds=len(audio) / SAMPLE_RATE)
+            )
         return LiveTranscriptionUpdate(
             tuple(self.agreement.committed_words),
             tuple(provisional_words),
@@ -758,6 +843,25 @@ def parakeet_tokens_to_timed_words(
     return resolved
 
 
+def remap_timed_words(
+    words: Sequence[tuple[datetime, datetime, str]],
+    timeline: SpeechDecodeTimeline,
+    decode_origin: Optional[datetime] = None,
+) -> list[tuple[datetime, datetime, str]]:
+    """Project word times from compressed decoder audio onto capture time."""
+    origin = decode_origin or timeline.start_time
+    if origin is None:
+        return list(words)
+    return [
+        (
+            timeline.map_offset((start - origin).total_seconds()),
+            timeline.map_offset((end - origin).total_seconds(), prefer_end=True),
+            text,
+        )
+        for start, end, text in words
+    ]
+
+
 class ParakeetMlxLiveTranscriber(LiveTranscriber):
     """Native Apple-Silicon streaming adapter for parakeet-mlx."""
 
@@ -785,6 +889,7 @@ class ParakeetMlxLiveTranscriber(LiveTranscriber):
         )
         self.stream = self.stream_context.__enter__()
         self.stream_start_time: Optional[datetime] = None
+        self.decode_timeline = SpeechDecodeTimeline()
         self.closed = False
 
     def accept_audio(
@@ -793,11 +898,16 @@ class ParakeetMlxLiveTranscriber(LiveTranscriber):
         chunk_start_time: datetime,
         force: bool = False,
         context_prompt: Optional[str] = None,
+        audio_timeline: Optional[SpeechDecodeTimeline] = None,
     ) -> LiveTranscriptionUpdate:
         del context_prompt
         if self.stream_start_time is None:
             self.stream_start_time = chunk_start_time
         if len(audio):
+            if audio_timeline is None:
+                self.decode_timeline.append(chunk_start_time, len(audio))
+            else:
+                self.decode_timeline.extend(audio_timeline, len(audio))
             self.stream.add_audio(self.array_factory(audio))
         finalized_tokens = list(self.stream.finalized_tokens)
         draft_tokens = list(self.stream.draft_tokens)
@@ -812,6 +922,8 @@ class ParakeetMlxLiveTranscriber(LiveTranscriber):
             draft_tokens,
             self.stream_start_time,
         )
+        committed_words = remap_timed_words(committed_words, self.decode_timeline)
+        provisional_words = remap_timed_words(provisional_words, self.decode_timeline)
         committed_through = committed_words[-1][1] if committed_words else None
         return LiveTranscriptionUpdate(
             tuple(committed_words),
@@ -891,8 +1003,31 @@ def remove_dc_and_high_pass(
     sample_rate: int = SAMPLE_RATE,
     cutoff_hz: float = HIGH_PASS_CUTOFF_HZ,
 ):
-    """Return a causal high-pass-filtered copy; the filter itself removes DC."""
-    return StatefulHighPassFilter(sample_rate, cutoff_hz).process(audio)
+    """Return the calibrated offline DC-centered, high-pass-filtered copy."""
+    samples = audio.astype("float32", copy=True)
+    if samples.size == 0:
+        return samples
+    samples -= samples.mean(dtype="float64")
+    if cutoff_hz <= 0 or sample_rate <= 0:
+        return samples
+    import numpy as np
+
+    rc_seconds = 1.0 / (2.0 * math.pi * cutoff_hz)
+    sample_period_seconds = 1.0 / sample_rate
+    alpha = rc_seconds / (rc_seconds + sample_period_seconds)
+    output = samples.astype("float64", copy=True)
+    output[0] = 0.0
+    previous_output = 0.0
+    for block_start in range(1, samples.shape[0], HIGH_PASS_VECTOR_BLOCK_SAMPLES):
+        block_end = min(samples.shape[0], block_start + HIGH_PASS_VECTOR_BLOCK_SAMPLES)
+        block = samples[block_start:block_end].astype("float64", copy=False)
+        prior_inputs = samples[block_start - 1:block_end - 1].astype("float64", copy=False)
+        forcing = alpha * (block - prior_inputs)
+        powers = alpha ** (1.0 + np.arange(block.shape[0]))
+        filtered = powers * (previous_output + np.cumsum(forcing / powers))
+        output[block_start:block_end] = filtered
+        previous_output = float(filtered[-1])
+    return output.astype("float32")
 
 
 class StatefulSlowAgc:
@@ -946,8 +1081,33 @@ def apply_slow_agc(
     sample_rate: int = SAMPLE_RATE,
     target_rms: float = AGC_TARGET_RMS,
 ):
-    """Move speech toward the target RMS without amplifying quiet-room noise."""
-    return StatefulSlowAgc(sample_rate, target_rms).process(audio)
+    """Apply the calibrated offline block AGC without changing the source."""
+    samples = audio.astype("float32", copy=True)
+    if samples.size == 0 or sample_rate <= 0:
+        return samples
+    import numpy as np
+
+    block_samples = max(1, int(round(sample_rate * AGC_BLOCK_SECONDS)))
+    gain = 1.0
+    has_speech_gain = False
+    for block_start in range(0, samples.shape[0], block_samples):
+        block_end = min(samples.shape[0], block_start + block_samples)
+        block = samples[block_start:block_end]
+        block_level = audio_rms(block)
+        if block_level < CHUNK_RMS_SILENCE_THRESHOLD:
+            continue
+        desired_gain = min(AGC_MAX_GAIN, max(AGC_MIN_GAIN, target_rms / block_level))
+        if not has_speech_gain:
+            next_gain = desired_gain
+            has_speech_gain = True
+        else:
+            block_duration = block.shape[0] / sample_rate
+            smoothing = 1.0 - math.exp(-block_duration / AGC_TIME_CONSTANT_SECONDS)
+            next_gain = gain + smoothing * (desired_gain - gain)
+        gains = np.linspace(gain, next_gain, block.shape[0], endpoint=True, dtype="float32")
+        block *= gains
+        gain = next_gain
+    return np.clip(samples, -1.0, 1.0)
 
 
 class LiveAudioConditioner:
@@ -964,6 +1124,11 @@ class LiveAudioConditioner:
 def condition_live_audio(audio):
     """Condition a decode copy; captured WAV samples must never pass through here."""
     return LiveAudioConditioner().process(audio)
+
+
+def condition_final_audio(audio):
+    """Condition an offline decode copy with the Phase 10B-calibrated path."""
+    return apply_slow_agc(remove_dc_and_high_pass(audio))
 
 
 def decode_saved_audio(audio_path: Path):
@@ -1166,6 +1331,7 @@ def transcribe_audio_segments(
     hotwords: Optional[str] = DEFAULT_PATHOLOGY_HOTWORDS,
     context_prompt: Optional[str] = None,
     audio_is_conditioned: bool = False,
+    audio_timeline: Optional[SpeechDecodeTimeline] = None,
 ) -> list[
     tuple[
         datetime,
@@ -1213,8 +1379,12 @@ def transcribe_audio_segments(
             continue
         segment_start_offset = max(0.0, float(segment.start))
         segment_end_offset = max(segment_start_offset, float(segment.end))
-        segment_start_time = chunk_start_time + timedelta(seconds=segment_start_offset)
-        segment_end_time = chunk_start_time + timedelta(seconds=segment_end_offset)
+        if audio_timeline is None:
+            segment_start_time = chunk_start_time + timedelta(seconds=segment_start_offset)
+            segment_end_time = chunk_start_time + timedelta(seconds=segment_end_offset)
+        else:
+            segment_start_time = audio_timeline.map_offset(segment_start_offset)
+            segment_end_time = audio_timeline.map_offset(segment_end_offset, prefer_end=True)
         timed_words = []
         for word in segment.words or []:
             word_text = word.word
@@ -1222,11 +1392,13 @@ def transcribe_audio_segments(
                 continue
             word_start_offset = max(segment_start_offset, float(word.start))
             word_end_offset = max(word_start_offset, float(word.end))
-            timed_words.append((
-                chunk_start_time + timedelta(seconds=word_start_offset),
-                chunk_start_time + timedelta(seconds=word_end_offset),
-                word_text,
-            ))
+            if audio_timeline is None:
+                word_start_time = chunk_start_time + timedelta(seconds=word_start_offset)
+                word_end_time = chunk_start_time + timedelta(seconds=word_end_offset)
+            else:
+                word_start_time = audio_timeline.map_offset(word_start_offset)
+                word_end_time = audio_timeline.map_offset(word_end_offset, prefer_end=True)
+            timed_words.append((word_start_time, word_end_time, word_text))
         entries.append((
             segment_start_time,
             segment_end_time,
@@ -1425,7 +1597,7 @@ def transcribe_saved_audio_with_timings(
     progress_callback=None,
 ) -> tuple[list[str], list[dict], list[dict]]:
     raw_audio = decode_saved_audio(audio_path)
-    conditioned_audio = condition_live_audio(raw_audio)
+    conditioned_audio = condition_final_audio(raw_audio)
     segments, transcription_info = model.transcribe(
         conditioned_audio,
         **build_transcribe_kwargs(
@@ -1794,7 +1966,6 @@ class SpeechEndpointState:
         self,
         last_decoded_word_end: Optional[datetime],
         include_word_gap: bool = True,
-        decoded_audio_end: Optional[datetime] = None,
     ) -> Optional[str]:
         if self.turn_started_at is None or self.latest_audio_end is None:
             return None
@@ -1802,9 +1973,8 @@ class SpeechEndpointState:
             self.latest_audio_end - self.silence_started_at
         ).total_seconds() >= self.silence_seconds:
             return "silence"
-        word_gap_clock = decoded_audio_end or self.latest_audio_end
         if include_word_gap and last_decoded_word_end is not None and (
-            word_gap_clock - last_decoded_word_end
+            self.latest_audio_end - last_decoded_word_end
         ).total_seconds() >= self.word_gap_seconds:
             return "word-gap"
         if (
@@ -1816,6 +1986,7 @@ class SpeechEndpointState:
     def reset(self) -> None:
         self.turn_started_at = None
         self.silence_started_at = None
+        self.latest_audio_end = None
 
 
 class SignalQualityAnalyzer:
@@ -2250,21 +2421,26 @@ def main() -> int:
 
     audio_buffer = np.empty((0, CHANNELS), dtype=np.float32)
     audio_buffer_start_time: Optional[datetime] = None
+    audio_buffer_timeline = SpeechDecodeTimeline()
     live_transcriber: Optional[LiveTranscriber] = None
     reusable_whisper_model = None
     live_compute_type: Optional[str] = None
 
     def trim_live_audio_buffer_through(committed_through: datetime) -> None:
         nonlocal audio_buffer, audio_buffer_start_time
-        if audio_buffer_start_time is None:
+        if audio_buffer_start_time is None or not audio_buffer_timeline.spans:
             return
-        trim_seconds = (committed_through - audio_buffer_start_time).total_seconds()
-        trim_samples = min(audio_buffer.shape[0], max(0, int(trim_seconds * SAMPLE_RATE)))
+        trim_samples = min(
+            audio_buffer.shape[0],
+            audio_buffer_timeline.trim_through(committed_through),
+        )
         if trim_samples <= 0:
             return
         audio_buffer = audio_buffer[trim_samples:]
-        audio_buffer_start_time = audio_buffer_start_time + timedelta(seconds=trim_samples / SAMPLE_RATE)
-        if audio_buffer.shape[0] == 0:
+        audio_buffer_start_time = audio_buffer_timeline.start_time
+        if audio_buffer.shape[0] == 0 or audio_buffer_start_time is None:
+            audio_buffer = np.empty((0, CHANNELS), dtype=np.float32)
+            audio_buffer_timeline.spans.clear()
             audio_buffer_start_time = None
 
     def align_resumed_wave_audio(first_chunk_start_time: datetime) -> None:
@@ -2320,6 +2496,7 @@ def main() -> int:
 
         if audio_buffer_start_time is None:
             audio_buffer_start_time = chunk_start_time
+        audio_buffer_timeline.append(chunk_start_time, conditioned_chunk.shape[0])
         audio_buffer = np.concatenate((audio_buffer, conditioned_chunk), axis=0)
 
     def drain_captured_audio(block: bool = False) -> int:
@@ -2445,17 +2622,14 @@ def main() -> int:
                 existing_live_transcript_entries,
                 committed_words,
             ),
+            audio_timeline=audio_buffer_timeline.prefix(decode_samples),
         )
         observed_words = (*update.committed_words, *update.provisional_words)
         if observed_words:
             last_decoded_word_end = max(word[1] for word in observed_words)
         if not force_commit:
-            decoded_audio_end = chunk_window_start + timedelta(
-                seconds=audio.shape[0] / SAMPLE_RATE,
-            )
             endpoint_reason = endpoint_state.endpoint_reason(
                 last_decoded_word_end,
-                decoded_audio_end=decoded_audio_end,
             )
             if endpoint_reason is not None and isinstance(live_transcriber, WhisperLiveTranscriber):
                 update = live_transcriber.force_current(current_audio_end_time)

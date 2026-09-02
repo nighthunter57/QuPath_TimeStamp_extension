@@ -155,18 +155,22 @@ class TimeStampTest {
     }
 
     @Test
-    void suppressesOnlyTranscriptLinesOverEightyWords() {
-        String eightyWords = String.join(" ", java.util.Collections.nCopies(80, "word"));
-        String eightyOneWords = String.join(" ", java.util.Collections.nCopies(81, "loop"));
-        String contents = "[2026-08-26T12:00:00.000] " + eightyWords + "\n" +
-                "[2026-08-26T12:00:01.000] " + eightyOneWords + "\n";
+    void suppressesStructuralLoopsWithoutDestroyingLongSpeech() {
+        String longSpeech = java.util.stream.IntStream.range(0, 137)
+                .mapToObj(index -> "clinical" + index)
+                .collect(java.util.stream.Collectors.joining(" "));
+        String repeatedLoop = String.join(
+                " ",
+                java.util.Collections.nCopies(30, "and system repeats"));
+        String contents = "[2026-08-26T12:00:00.000] " + longSpeech + "\n" +
+                "[2026-08-26T12:00:01.000] " + repeatedLoop + "\n";
 
         String rendered = TimeStamp.suppressRunawayTranscriptLines(contents);
 
-        assertTrue(rendered.contains(eightyWords));
+        assertTrue(rendered.contains(longSpeech));
         assertTrue(rendered.contains(
                 "[2026-08-26T12:00:01.000] [decode error suppressed]"));
-        assertFalse(rendered.contains(eightyOneWords));
+        assertFalse(rendered.contains(repeatedLoop));
         assertTrue(rendered.endsWith("\n"));
     }
 
