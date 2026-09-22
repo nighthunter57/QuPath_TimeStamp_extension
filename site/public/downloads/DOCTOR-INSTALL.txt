@@ -1,0 +1,58 @@
+TIMESTAMP FOR QUPATH 0.6 — DOCTOR INSTALLATION
+
+Supported systems:
+- Windows 10/11: x64 or ARM64
+- macOS: Apple Silicon or Intel
+- Linux: x64 or ARM64
+
+Before installation:
+1. Connect the computer to the internet for the one-time runtime/model download.
+2. Install QuPath 0.6.
+3. Open QuPath once and complete its first-time user-folder setup, keeping the
+   recommended default QuPath user folder.
+4. Close QuPath completely.
+
+Windows:
+Double-click "Install TimeStamp on Windows.bat".
+
+macOS:
+Double-click "Install TimeStamp.command". If macOS blocks it, Control-click the
+file, choose Open, then choose Open again.
+
+Linux:
+Open a terminal in this folder and run:
+  chmod +x "Install TimeStamp on Linux.sh"
+  ./"Install TimeStamp on Linux.sh"
+The installer may request the administrator password if PortAudio is missing.
+
+Wait for "TimeStamp is ready for the doctor." The high-accuracy model is a
+large download, so installation can take a while. Then open QuPath and allow
+microphone access if the operating system asks.
+
+Use:
+Extensions > TimeStamp Extension > Open Clinical Session Recorder
+
+Click Start Recording. Pause/Resume keeps the same session open. Done stops
+capture and prepares the final transcript. Review the text, then click Save Session.
+The folder choice appears only after Save. Recent actions remain visible while
+recording; View all actions expands the list.
+
+Privacy:
+Recording and transcription run locally after installation. Audio is not sent
+to a transcription service. The installer uses the internet only to download
+the private runtime, Python libraries, and speech-to-text models.
+Working audio is retained under your QuPath user folder in timestamp/recordings,
+even when you exclude audio from the exported session. Review changes are
+checkpointed every two seconds. Undo history itself is only kept while open.
+No automatic deletion or application-level encryption is configured. Protect this
+computer and its QuPath folder using your organization's storage policy. To remove
+a working recording deliberately, close QuPath and remove only its identified
+session folder after verifying your saved copy. Discard marks a session as ignored;
+it does not erase the audio. Avoid patient details in session names.
+
+Updates:
+Normal TimeStamp JAR updates preserve the private runtime and downloaded models.
+Restart QuPath after updating the extension.
+Previous extension JARs are backed up under timestamp/extension-backups. To roll
+back, close QuPath, move the current TimeStamp JAR out of extensions, and restore
+the previous JAR from that backup. Keep only one TimeStamp JAR in extensions.

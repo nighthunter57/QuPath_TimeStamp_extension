@@ -48,6 +48,10 @@ jobs:
           GITHUB_PAGES: "true"
         run: npm run build
 
+      - name: Verify installation guide and downloads
+        working-directory: site
+        run: npm run test:guide
+
       - name: Upload site
         uses: actions/upload-pages-artifact@v4
         with:
