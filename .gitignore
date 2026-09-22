@@ -2,6 +2,8 @@
 docs/*
 !docs/TRANSCRIPT_PROTOCOL.md
 !docs/LIVE_TRANSCRIPT_ACCURACY_PLAN.md
+!docs/TRANSCRIPT_REVIEW.md
+!docs/RECORDER_HARDENING.md
 
 # Website
 site/node_modules/

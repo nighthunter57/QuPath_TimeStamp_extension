@@ -12,6 +12,65 @@ the recorder usable by a doctor who is looking at a specimen rather than at the 
 
 ## Progress
 
+- **Workflow and boundary corrections — 2026-09-22.** Sequentially added alias-safe
+  export, durable review revisions across Record more, slide identity at event
+  capture, clearer themed controls, and incremental finalization progress. Then
+  corrected the Phase 12B drain so queued speech cannot erase a completed pause;
+  endpoint commits bypass minimum size/cadence gates. Matched synthetic replay
+  p95 delay changed 15.28 → 14.23 s and max turn 15.5 → 12.0 s; raw WER worsened
+  20.67 → 21.51% while domain WER improved 11.01 → 8.93%. No broad accuracy claim
+  or engine/beam change follows from that mixed result. All 101 Python tests,
+  40 Java tests, build, and isolated JavaFX review/recovery/layout checks pass.
+  Human-reference acceptance remains pending. See
+  [RECORDER_HARDENING.md](RECORDER_HARDENING.md#september-22-implementation-update).
+
+- **Final timestamp consistency — 2026-09-21.** Finalization now keeps the
+  timestamps generated from the full recording instead of substituting live
+  timestamps based on matching phrase prefixes. Final text, segment/word CSVs,
+  and review metadata therefore use the same audio-derived times. The live
+  preview remains in its separate backup. Regression coverage exercises distant
+  matching phrases, repeated phrases, and revised segmentation through the full
+  finalization writer, including unchanged WAV bytes and review-text offsets.
+  This changes final timestamp persistence, not decoding settings or old saved
+  recordings. See [PIPELINE_WORKFLOW_ACCURACY_AUDIT.md](PIPELINE_WORKFLOW_ACCURACY_AUDIT.md).
+
+- **Recorder hardening — 2026-09-15.** Resident Pause/Resume now closes and
+  reopens the microphone independently of inference, keeping the model loaded;
+  Done ends capture before final review. Added disk-backed decode backlog,
+  bounded writer buffering with explicit failures, always-visible recent actions,
+  Undo/Redo and source-bound review recovery, durable working-session storage,
+  saved-artifact checksums, and installer rollback backups. Decoder model/beam
+  defaults, the recording origin, and original WAV samples remain unchanged.
+  Validation: 88 Python tests, 36 Java tests, JavaFX controls/recovery/scroll and
+  320/420/900-pixel layout checks, website production build, and isolated macOS
+  runtime installation plus upgrade (model download and microphone capture
+  deliberately disabled). The existing 40-utterance benchmark remains 21 errors
+  in 897 words: 2.34% WER, or 2.23% with numbers normalized. This is not a
+  pathology/live-accuracy claim. Remote OS jobs, real-device long-session tests,
+  and a human pathology cohort remain pending; see
+  [RECORDER_HARDENING.md](RECORDER_HARDENING.md).
+
+- **Review UI — 2026-09-09.** Unified highlighted transcript with inline word
+  correction, replay, and checked decisions; compact display-only timestamps;
+  collapsed-by-default Events; and reading-position preservation with Jump to
+  live. Saved reviewed metadata is separate from original machine confidence.
+  Validation: 34 Java tests, 80 Python tests, and JavaFX state/interaction smoke
+  checks at 320, 420, and 900 pixels. No model, protocol, recording clock, or
+  raw-audio changes; these usability improvements do not establish ASR accuracy.
+
+- **Reliability and word review — 2026-09-05.** Following the repository review,
+  capped live decoding retains undecoded backlog, and a separate audio writer
+  persists original chunks during inference. Both fixes passed regression tests
+  before confidence/review work proceeded. Word confidence now reaches caption
+  coloring, review selection/audio replay, the word CSV, and a versioned atomic
+  JSON companion. Uncertain speech segments can leave a timed review marker.
+  The replay now accounts for measured decode time and conditions every block.
+  Validation: 80 Python tests, 31 Java tests, JavaFX render/interaction smoke,
+  and the existing 40-utterance benchmark at unchanged 2.34% WER. The corrected
+  synthetic streaming replay still shows substantial delay and recognition
+  errors; it is not evidence of near-perfect live accuracy. See
+  [TRANSCRIPT_REVIEW.md](TRANSCRIPT_REVIEW.md) for details and measured limits.
+
 - **Phase 0 complete — 2026-08-26.** The dependency floors are enforced,
   `deepdml/faster-whisper-large-v3-turbo-ct2` is cached, and the installed
   versions are faster-whisper 1.2.1 with CTranslate2 4.8.1.

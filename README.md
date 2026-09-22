@@ -1,205 +1,256 @@
-# QuPath extension template
+# TimeStamp QuPath Extension
 
-This repo contains a template and instructions to help create a new extension for [QuPath](https://qupath.github.io).
+TimeStamp is a QuPath extension for recording timestamped image events together
+with a live microphone transcript. It is intended for recorded QuPath sessions:
+the Java extension logs user events, and the Python Whisper helper captures
+microphone audio, shows live text, preserves working audio for finalization, and
+regenerates a final transcript from the full recording when capture stops.
 
-It already contains two minimal extensions - one using Java, one using Groovy - so the first task is to make sure that they work.
-Then, it's a matter of customizing the code to make it more useful.
+## Requirements
 
-> **Update!** 
-> For QuPath v0.6.0 this repo switched to use Kotlin DSL for Gradle build files - 
-> and also to use the [QuPath Gradle Plugin](https://github.com/qupath/qupath-gradle-plugin).
-> 
-> The outcome is that the build files are _much_ simpler.
+- QuPath 0.6.0
+- Microphone access for QuPath and the private TimeStamp recorder
 
+Doctors should use the cross-platform doctor package from `build/distributions`. It
+installs the extension, a private managed Python runtime, the recorder
+libraries, and the default live/final Whisper models. Doctors do not install
+Python or enter a Python executable path themselves. Internet access is needed
+once while the installer downloads the runtime and models; recording and
+transcription are local afterward.
 
-## Build the extension
+Build the doctor package with:
 
-Building the extension with Gradle should be pretty easy - you don't even need to install Gradle separately, because the 
-[Gradle Wrapper](https://docs.gradle.org/current/userguide/gradle_wrapper.html) will take care of that.
-
-Open a command prompt, navigate to where the code lives, and use
 ```bash
-gradlew build
+./scripts/build_doctor_package.sh 0.1.0
 ```
 
-The built extension should be found inside `build/libs`.
-You can drag this onto QuPath to install it.
-You'll be prompted to create a user directory if you don't already have one.
+Send the resulting `TimeStamp-Doctor-0.1.0.zip`, not the standalone JAR, to a
+new doctor workstation. It includes installers for Windows 10/11 (x64 and
+ARM64), macOS (Apple Silicon and Intel), and Linux (x64 and ARM64). On a
+brand-new workstation, open QuPath once and complete its initial user-folder
+setup before running the TimeStamp installer. QuPath must be closed while the
+installer runs. Linux may request administrator access to install PortAudio if
+the system does not already provide it.
 
-The minimal extension here doesn't do much, but it should at least install a new command under the 'Extensions' menu in 
-QuPath.
+### Developer environment
 
-> In case your extension contains external dependencies beyond what QuPath already includes, you can create a 
-> [single jar file](https://imperceptiblethoughts.com/shadow/introduction/#benefits-of-shadow) that bundles these along 
-> with your extension by using
-> ```bash
-> gradlew shadowJar
-> ```
-> If you don't do that, you'll need to drag *all* the extra dependences onto QuPath to install them as well.
+Developers building from source also need a Java 21 JDK and Python 3 with a
+local `.venv-whisper` environment.
 
+Create the Whisper environment from the repo root:
 
-## Configure the extension
-
-Edit `settings.gradle.kts` to specify which version of QuPath your extension should be compatible with, e.g.
-
-```kotlin
-qupath {
-    version = "0.6.0"
-}
+```bash
+python3 -m venv .venv-whisper
+source .venv-whisper/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-whisper.txt
 ```
 
-Edit `build.gradle.kts` to specify the details of your extension
+For a source/development installation, open QuPath Preferences and set
+`TimeStamp > Transcript Python executable` to the full path of the Python
+executable inside this environment. For example:
 
-```kotlin
-qupathExtension {
-  name = "qupath-extension-template"
-  group = "io.github.qupath"
-  version = "0.1.0-SNAPSHOT"
-  description = "A simple QuPath extension"
-  automaticModule = "io.github.qupath.extension.template"
-}
+```text
+/path/to/qupath-extension-template/.venv-whisper/bin/python
 ```
 
+The extension JAR includes the transcription helper script. During development,
+the repository `.venv-whisper` is detected automatically. A doctor package
+runtime is detected first at `~/QuPath/v0.6/timestamp/runtime/.venv`, so the
+doctor does not need to configure this preference.
 
-## Run QuPath + the extension
+## Build
 
-During development, your probably want to run QuPath easily with your extension installed for debugging.
+Use Java 21 when building:
 
-### 0. Make sure you have Java installed
-You'll need to install Java first.
-
-At the time of writing, we use a Java 21 JDK downloaded from https://adoptium.net/
-
-> Java 21 is a 'Long Term Support' release - which is why we use it instead of the very latest version.
-
-### 1. Get QuPath's source code
-You can find instructions at https://qupath.readthedocs.io/en/stable/docs/reference/building.html
-
-### 2. Create an `include-extra` file
-Create a file called `include-extra` in the root directory of the QuPath source code (*not* the extension code!).
-
-Set the contents of this file to:
-```
-[includeBuild]
-/path/to/your/extension
-
-[dependencies]
-extension-group:extension-name
-```
-replacing the default lines where needed.
-
-For example, to build the extension with the names given above you'd use
-```
-[includeBuild]
-../qupath-extension-template
-
-[dependencies]
-io.github.qupath:qupath-extension-template
+```bash
+export JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home
+./gradlew build
 ```
 
-### 3. Run QuPath
-Run QuPath from the command line using
+The extension JAR is written to `build/libs`.
+
+## Development Auto-Reload
+
+QuPath loads Java extensions when its JVM starts, so a running production
+instance cannot safely replace the TimeStamp classes in place. For development,
+use the watcher instead:
+
+```bash
+./scripts/dev_watch_qupath.sh
 ```
-gradlew run
+
+The watcher builds the project, launches a separate QuPath instance directly
+from `build/classes`, and watches the Java, Python, shell, test, and Gradle source
+files. After a change, it runs the tests and restarts only that development
+instance. It does not reinstall the extension JAR.
+
+The watcher uses an isolated temporary home and preferences directory. It must
+not be used for clinical work or unsaved QuPath annotations. If TimeStamp is
+recording, finalizing, or has an unsaved recording, the automatic restart waits
+until the recording is saved or discarded.
+
+The defaults match the macOS development machine used for this project. Override
+them when necessary:
+
+```bash
+TIMESTAMP_QUPATH_APP_DIR="/Applications/QuPath.app" \
+TIMESTAMP_JAVA_HOME="/path/to/jdk-21" \
+./scripts/dev_watch_qupath.sh
 ```
-If all goes well, QuPath should launch and you can check the *Extensions* mention to confirm the extension is installed.
 
+Press `Ctrl+C` in the watcher terminal to close its development QuPath instance
+and stop watching.
 
-## Set up in an IDE (optional)
+## Install a Development Build
 
-During development, things are likely to be much easier if you work within an IDE.
+Build and copy the latest JAR into the local QuPath extensions directory:
 
-QuPath itself is developed using IntelliJ, and you can import the extension template there.
+```bash
+./gradlew deployToQuPath
+```
 
-The setup process is as above, and you'll need a a [Run configuration](https://www.jetbrains.com/help/idea/run-debug-configuration.html) 
-to call `gradlew run`.
+The default destination is `~/QuPath/v0.6/extensions`. Override it when QuPath
+uses another user directory:
 
+```bash
+./gradlew deployToQuPath -PqupathUserDir="/path/to/QuPath/v0.6"
+```
 
-## Customize the extension
+The task replaces older directly installed `TimeStamp-*.jar` files so QuPath
+does not load duplicate versions. Restart QuPath after deployment because Java
+extensions are loaded at application startup.
 
-Now you're ready for the creative part.
+## Release and Automatic Updates
 
-You can develop the extension using either Java or Groovy - the template includes examples of both.
+The repository includes `catalog.json`, which follows QuPath's extension catalog
+format. To publish a release:
 
-### Create the extension Java or Groovy file(s)
+1. Open GitHub Actions and run `Build draft extension release`.
+2. Enter a semantic version such as `0.1.0`.
+3. Review and publish the generated draft GitHub release.
+4. The `Update QuPath extension catalog` workflow adds the published release to
+   `catalog.json`.
 
-For the extension to work, you need to create at least one file that extends `qupath.lib.gui.extensions.QuPathExtension`.
+Users add this catalog in
+`Extensions > Manage extensions > Manage extension catalogs`:
 
-There are two examples in the template, in two languages:
-* **Java:** `qupath.ext.template.DemoExtension.java`.
-* **Groovy:** `qupath.ext.template.DemoGroovyExtension.java`.
+```text
+https://github.com/nighthunter57/QuPath_TimeStamp_extension
+```
 
-You can pick the one that corresponds to the language you want to use, and delete the other.
+After the first published release is present in `catalog.json`, QuPath's
+Extension Manager can detect newer catalog releases and install them. QuPath
+must still be restarted after an extension update.
 
-Then take your chosen file and rename it, edit it, move it to another package... basically, make it your own.
+The private doctor runtime and downloaded models are stored outside the
+extension JAR. Extension Manager updates therefore preserve transcription
+support and do not download the multi-gigabyte models again.
 
-> Please **don't neglect this step!** 
-> If you do, there's a chance of multiple extensions being created with the same class names... and causing confusion later.
+## Demo Session
 
-### Update the `META-INF/services` file
+The helper script can still prepare a folder for command-line demos:
 
-For QuPath to *find* the extension later, the full class name needs to be available in `resources/META-INFO/services/qupath.lib.gui.extensions.QuPathExtensions`.
+```bash
+./scripts/prepare_demo.sh caseA ./demo-output
+```
 
-So remember to edit that file to include the class name that you actually used for your extension.
+Start live transcription directly:
 
-### Specify your license
+```bash
+./scripts/start_live_transcript.sh ./demo-output/<session_id> large-v3 en
+```
 
-Add a license file to your GitHub repo so that others know what they can and can't do with your extension.
+For the normal QuPath workflow, no session folder is needed before recording:
 
-This should be compatible with QuPath's license -- see https://github.com/qupath/qupath
+1. Install the built extension JAR in QuPath.
+2. Open `Extensions > TimeStamp Extension > Open Clinical Session Recorder`.
+3. Click `Start Recording`; the extension creates a private, durable working
+   session automatically.
+4. Use `Pause` and `Resume` as needed; they keep one continuous take and do not
+   run the slow final transcript pass or reload the model. Wait for the
+   acknowledged Paused/Recording state before speaking again. Done is separate.
+5. Click `Done` once to finish the take, then wait until the monitor says the
+   transcript is ready. Do not close QuPath while
+   the status says `Finalizing transcript`.
+6. Review or edit the transcript. Choose `Record more` to resume the same take,
+   or click `Save Session` when it is complete.
+7. In the Save dialog, choose the parent folder, enter a session name, and decide
+   whether to include the raw audio. Clicking Save creates the named session
+   folder and writes the transcript and all timestamp data together.
 
-## Repository configuration
+Nothing is copied to the user's chosen location when recording stops. Save is
+always an explicit user action. Raw audio stays in the private working
+working session and is excluded from the saved package by default because it may
+contain sensitive speech.
 
-### Easy install
+Working sessions live under the QuPath user folder at `timestamp/recordings`.
+Older temporary recordings are still discovered for recovery. Text corrections
+and checked-word decisions are checkpointed every two seconds during review;
+Undo/Redo is available while the panel remains open. The original machine text
+and timings are preserved separately. Actions remain visible throughout recording.
 
-If you follow some conventions in naming your extension and making releases, then other QuPath users will find it easy to automatically
-install and update your extension!
+See [Recorder hardening and validation](docs/RECORDER_HARDENING.md) for the tested
+scope, privacy/retention behavior, real-human evaluation procedure, and remaining
+acceptance work. Do not interpret confidence highlighting as verified accuracy.
 
-First, we suggest you name your extension `qupath-extension-[something]`, and keep it in its own repository (named the same as the extension),
-separate from other projects.
+After Save, the transcript is written to:
 
-Next, when you want to publish a new version of your extension, use the `github_release.yml` workflow included in this repository.
+```text
+<parent_folder>/<session_name>/video/<session_name>_transcript.txt
+```
 
-To do so, you'd need to navigate to `Actions -> Make draft release -> Run workflow -> Run workflow` as shown in the following screenshot:
+Transcript timing companions are saved next to it:
 
-![Screenshot from 2024-03-14 18-44-42](https://github.com/alanocallaghan/qupath-extension-template/assets/10779688/4712a209-eda7-4f80-8bed-bbab20e4f50a)
+- `<session_name>_transcript_timed.txt`
+- `<session_name>_transcript_segments.csv`
+- `<session_name>_transcript_words.csv`
+- `<session_name>_transcript_live.txt`
 
-This will automatically build the extension, and create a draft release containing the extension jar (and its associated sources and javadoc).
-You can then navigate to `Releases` and fill out information about the release --- the version, any significant changes, etc.
-Once published, users will be able to automatically install the extension as described here:
-https://qupath.readthedocs.io/en/0.5/docs/intro/extensions.html#installing-extensions
+The main transcript is the user-reviewed text. The `_timed.txt` file preserves
+the machine transcript to which the segment and word timing rows refer, so text
+corrections made during review do not silently invalidate the timing evidence.
+The timing CSVs contain UTC timestamps and elapsed milliseconds from the
+recording start. If `Include raw audio files` is selected, these additional files
+are saved next to the transcript:
 
-### Catalogs
+- `<session_name>_transcript_audio.raw`
+- `<session_name>_transcript_audio.wav`
+- `<session_name>_transcript_audio.start.txt`
 
-QuPath's extension manager can easily install an extension if it is referenced in a **catalog**.
-A catalog is a JSON file hosted on a GitHub repository containing information about extensions, making it possible to easily manage them from QuPath.
+When the user chooses a folder from `Save Session`, the extension
+saves the displayed transcript and automatically writes all matching timestamp
+artifacts:
 
-To create a catalog, follow the [extension catalog model documentation](https://qupath.github.io/extension-catalog-model/).
-You will need to create a JSON file containing specific information about your extension and host it on a dedicated GitHub repository.
-Once the catalog is created, any user will be able to easily install your catalog by:
+- `events/<session_name>_event.csv`
+- `events/<session_name>_event.json`
+- `cursor/<session_name>_cursor.json`
+- `<session_name>_recording_manifest.json`
 
-* Opening QuPath's extension manager by clicking on `Extensions` -> `Manage extensions` in QuPath.
-* Adding the URL to your catalog by clicking on `Manage extension catalogs` -> `Add` in the extension manager.
-* Clicking on the `+` symbol next to your extension in the extension manager.
+Every event has a stable sequence number, local display time, UTC instant, and
+elapsed milliseconds. The save operation writes each file atomically, reads the
+critical files back to verify their contents, and writes the completed manifest
+last. The UI only changes to `Saved` after these checks succeed.
 
-QuPath will then make it easy to manage your extension and automatically inform users when an update is available.
+The manifest is written last. Its `workflowState` is `complete` only when the
+transcript helper exits successfully and the final transcript exists;
+`complete_with_warning` identifies a preserved live-transcript fallback or a
+recording with no audio, and `incomplete` identifies an interrupted or failed
+finalization. `Record more` before Save resumes the current take. Starting again
+after a successful Save creates a new temporary recording session.
 
-### Replace this readme
+While a take is unsaved, closing QuPath offers Save, Discard, or Cancel. A small
+recovery checkpoint is also written during recording; if QuPath or the computer
+stops unexpectedly, the next launch offers to recover the latest unsaved
+transcript and event log for review and saving.
 
-Don't forget to replace the contents of this readme with your own!
+## Transcript Behavior
 
+The live transcript is optimized for immediate feedback and may revise recent
+lines. The final transcript is regenerated from the full saved WAV after capture
+stops, so the final text is the source of truth.
 
-## Getting help
-
-For questions about QuPath and/or creating new extensions, please use the forum at https://forum.image.sc/tag/qupath
-
-------
-
-## License
-
-This is just a template, you're free to use it however you like.
-You can treat the contents of *this repository only* as being under [the Unlicense](https://unlicense.org) (except for the Gradle wrapper, which has its own license included).
-
-If you use it to create a new QuPath extension, I'd strongly encourage you to select a suitable open-source license for the extension.
-
-Note that *QuPath itself* is available under the GPL, so you do have to abide by those terms: see https://github.com/qupath/qupath for more.
+If live decoding falls behind, the script preserves the full raw audio and skips
+stale live decode windows instead of trying to transcribe every old chunk. This
+keeps the UI closer to the current speaker while still protecting the final
+offline transcript.
