@@ -15,6 +15,7 @@ as a log line and never as a state transition.
 | `AUDIO_SILENT` | quiet seconds | No usable input has been observed for the watchdog interval. Emitted once per quiet stretch. |
 | `AUDIO_RECOVERED` | none | Input recovered after `AUDIO_SILENT`. |
 | `TRANSCRIPT_READY` | none | Audio capture is open. Recording may begin even while the model is warming. |
+| `CAPTURE_STATE` | `paused` or `recording` | Acknowledges in-process microphone Pause/Resume. Paused is emitted after the stream closes and queued raw audio is written, independently of live decoding. |
 | `RECORDING_ORIGIN` | ISO-8601 UTC instant | ADC-derived start of audio frame zero. This is the only recording time origin. |
 | `LIVE_MODEL_READY` | model name | Live decoding can begin; already-buffered audio remains available. Parakeet reports `parakeet-mlx:<model-id>` so the UI/log can distinguish the engine. |
 | `TRANSCRIPT_UPDATED` | none | The committed live transcript file changed. |
@@ -24,6 +25,12 @@ as a log line and never as a state transition.
 | `FINALIZATION_RESULT` | result code | Terminal process outcome such as `paused` for capture-only exit, or final-pass results including `final`, `live-fallback-empty`, and `failed`. |
 
 Rules:
+
+- With `--interactive-control`, stdin accepts exact lines `PAUSE`, `RESUME`, and
+  `STOP`. Pause closes the microphone but retains the process/model; Resume opens
+  it again with the same recording origin. Existing silence-gap padding is retained
+  for file compatibility. STOP closes capture and drains the preview before exit;
+  Done then starts `--finalize-existing`. Closing stdin also stops capture.
 
 - A known message with the wrong number or type of fields is malformed and must not change UI state.
 - Message fields must not contain tabs or newlines; the helper replaces them with spaces.

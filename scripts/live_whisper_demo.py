@@ -5,6 +5,7 @@ import argparse
 import csv
 import gc
 import importlib.util
+import json
 import math
 import platform
 import queue
@@ -18,7 +19,8 @@ import wave
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Callable, Optional, Sequence
+from types import SimpleNamespace
+from typing import Any, Callable, Iterable, Iterator, Optional, Sequence
 
 SAMPLE_RATE = 16000
 CHANNELS = 1
@@ -62,6 +64,7 @@ STRUCTURAL_LOOP_MAX_SHARE = 0.30
 TRAILING_HALLUCINATION_MIN_SILENCE_SECONDS = 0.5
 TRAILING_HALLUCINATION_REFERENCE_AUDIO_SECONDS = 0.5
 TRAILING_HALLUCINATION_MAX_LEVEL_RATIO = 0.5
+FINAL_SEGMENT_LOOKBEHIND = 2
 KNOWN_TRAILING_HALLUCINATION_PHRASES = frozenset({
     "amaraorg",
     "like and subscribe",
@@ -99,6 +102,13 @@ AUDIO_SILENCE_WARNING_SECONDS = 30.0
 BACKLOG_WARNING_SECONDS = 6.0
 RESUME_GAP_TOLERANCE_SECONDS = 0.25
 AUDIO_CLOCK_DRIFT_TOLERANCE_SECONDS = 1.0
+AUDIO_WRITER_JOIN_SECONDS = 10.0
+CAPTURE_CONTROL_POLL_SECONDS = 0.1
+MAX_PENDING_CAPTURE_CHUNKS = 240  # Two minutes at the fixed half-second callback size.
+WORD_REVIEW_CONFIDENCE_THRESHOLD = 0.6
+UNCLEAR_SPEECH_MARKER = "[unclear speech - review]"
+WORD_CSV_FIELDS = ("segment_index", "word_index", "word", "start_utc", "end_utc",
+                   "start_ms", "end_ms", "confidence", "needs_review")
 SILENCE_WRITE_CHUNK_FRAMES = SAMPLE_RATE * 30
 SNR_MIN_CLASS_SAMPLES = 3
 SNR_MAX_HISTORY_SAMPLES = 120
@@ -129,6 +139,7 @@ PROTOCOL_FIELDS = {
     "AUDIO_SILENT": 1,
     "AUDIO_RECOVERED": 0,
     "TRANSCRIPT_READY": 0,
+    "CAPTURE_STATE": 1,
     "RECORDING_ORIGIN": 1,
     "LIVE_MODEL_READY": 1,
     "TRANSCRIPT_UPDATED": 0,
@@ -230,6 +241,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Run only the offline final pass for an existing capture without opening a microphone",
     )
+    parser.add_argument("--interactive-control", action="store_true",
+                        help="Accept PAUSE, RESUME and STOP on stdin without reloading the model")
     return parser.parse_args()
 
 
@@ -339,6 +352,90 @@ def normalized_words(text: str) -> list[str]:
     return normalize_transcript_text(text).split()
 
 
+def word_confidence(value) -> Optional[float]:
+    try:
+        probability = float(value)
+        return probability if math.isfinite(probability) and 0 <= probability <= 1 else None
+    except (TypeError, ValueError):
+        return None
+
+
+class TimedWord(tuple):
+    """A backward-compatible timing triple carrying optional model confidence."""
+
+    def __new__(cls, start: datetime, end: datetime, text: str, confidence=None):
+        word = super().__new__(cls, (start, end, text))
+        word.confidence = word_confidence(confidence)
+        return word
+
+
+def timed_word_review_rows(words: Sequence, origin: datetime) -> list[dict]:
+    return [{
+        "word": word[2].strip(),
+        "start_ms": round((word[0] - origin).total_seconds() * 1000),
+        "end_ms": round((word[1] - origin).total_seconds() * 1000),
+        "confidence": getattr(word, "confidence", None),
+    } for word in words]
+
+
+def write_review_metadata(out_path: Path, lines: Sequence[str], word_rows: Sequence[dict]) -> None:
+    """Anchor confidence to exact machine text; offsets use Java's UTF-16 units."""
+    contents = "".join(line + "\n" for line in lines)
+    # Exclude timestamp prefixes from matching words, including repeated words.
+    spans = [(match.start(1), match.end(1)) for match in re.finditer(
+        r"^\[[^\n]+?\] (.*)$", contents, re.MULTILINE)]
+    utf16_offsets = [0]
+    for character in contents:
+        utf16_offsets.append(utf16_offsets[-1] + (2 if ord(character) > 0xffff else 1))
+    cursor = 0
+    span_index = 0
+    mapped = []
+    for row in word_rows:
+        text = str(row["word"]).strip()
+        if not text:
+            continue
+        position = -1
+        pattern = re.compile(r"(?<!\w)" + re.escape(text) + r"(?!\w)")
+        while span_index < len(spans) and spans[span_index][1] <= cursor:
+            span_index += 1
+        for index in range(span_index, len(spans)):
+            start, end = spans[index]
+            match = pattern.search(contents, max(cursor, start), end)
+            if match is not None:
+                position = match.start()
+                span_index = index
+                break
+        if position < 0:
+            continue
+        confidence = word_confidence(row.get("confidence"))
+        mapped.append({
+            "word": text,
+            "start": utf16_offsets[position],
+            "end": utf16_offsets[position + len(text)],
+            "start_ms": row["start_ms"], "end_ms": row["end_ms"],
+            "confidence": confidence,
+            "needs_review": text == UNCLEAR_SPEECH_MARKER or (
+                confidence is not None and confidence < WORD_REVIEW_CONFIDENCE_THRESHOLD),
+        })
+        cursor = position + len(text)
+    path = out_path.with_name(f"{out_path.stem}_review.json")
+    temporary = path.with_name(f"{path.name}.tmp")
+    temporary.write_text(json.dumps({"version": 1, "transcript": contents, "words": mapped},
+                                    ensure_ascii=False, allow_nan=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_review_rows(out_path: Path) -> list[dict]:
+    path = out_path.with_name(f"{out_path.stem}_review.json")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if document["transcript"] == out_path.read_text(encoding="utf-8"):
+            return document["words"]
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return []
+
+
 def common_prefix_word_count(first_words: Sequence[str], second_words: Sequence[str]) -> int:
     count = 0
     for first_word, second_word in zip(first_words, second_words):
@@ -434,7 +531,7 @@ def group_committed_words(
     for index, word in enumerate(words):
         current_words.append(word)
         next_word = words[index + 1] if index + 1 < len(words) else None
-        sentence_end = bool(re.search(r"[.!?][\"')\]]*$", word[2].strip()))
+        sentence_end = word[2] == UNCLEAR_SPEECH_MARKER or bool(re.search(r"[.!?][\"')\]]*$", word[2].strip()))
         gap_seconds = (
             (next_word[0] - word[1]).total_seconds()
             if next_word is not None
@@ -452,15 +549,10 @@ def local_agreement_prompt(
     existing_entries: Sequence[tuple[datetime, str]],
     committed_words: Sequence[tuple[datetime, datetime, str]],
 ) -> str:
-    words = normalized_words(" ".join(text for _, text in existing_entries))
-    words.extend(word[2].strip() for word in committed_words if word[2].strip())
+    words = normalized_words(" ".join(text for _, text in existing_entries).replace(UNCLEAR_SPEECH_MARKER, ""))
+    words.extend(word[2].strip() for word in committed_words
+                 if word[2].strip() and word[2] != UNCLEAR_SPEECH_MARKER)
     return " ".join(words[-LOCAL_AGREEMENT_PROMPT_WORDS:])
-
-
-def transcript_prefix_matches(first_text: str, second_text: str) -> bool:
-    first_words = normalized_words(first_text)[:5]
-    second_words = normalized_words(second_text)[:5]
-    return bool(first_words) and first_words == second_words
 
 
 def load_live_transcript_entries(out_path: Path) -> list[tuple[datetime, str]]:
@@ -694,6 +786,185 @@ class SpeechDecodeTimeline:
                 break
             self.spans.pop(0)
         return trimmed
+
+
+class DiskAudioQueue:
+    """Keep the decoder backlog on disk, preserving original float32 input exactly."""
+
+    def __init__(self, directory):
+        import tempfile
+        self.file = tempfile.TemporaryFile(dir=directory, prefix="timestamp-preview-")
+        self.lock = threading.Lock()
+        self.items = queue.Queue()
+        self.write_offset = 0
+
+    def put(self, item):
+        chunk, started_at = item
+        data = chunk.tobytes()
+        with self.lock:
+            offset = self.write_offset
+            self.file.seek(offset)
+            self.file.write(data)
+            self.file.flush()
+            self.write_offset += len(data)
+            self.items.put((offset, len(data), chunk.shape, chunk.dtype, started_at))
+
+    def get(self, block=True, timeout=None):
+        import numpy as np
+        offset, size, shape, dtype, started_at = self.items.get(block=block, timeout=timeout)
+        with self.lock:
+            self.file.seek(offset)
+            data = self.file.read(size)
+            if self.items.empty() and offset + size == self.write_offset:
+                self.file.seek(0)
+                self.file.truncate()
+                self.write_offset = 0
+        if len(data) != size:
+            raise OSError("Incomplete preview backlog; original WAV is preserved")
+        return np.frombuffer(data, dtype=dtype).copy().reshape(shape), started_at
+
+    def get_nowait(self):
+        return self.get(block=False)
+
+    def empty(self):
+        return self.items.empty()
+
+    def close(self):
+        self.file.close()
+
+
+class AudioCaptureWriter:
+    """Persist raw chunks before publishing them to the decoder, on a separate worker."""
+
+    def __init__(self, persist: Callable, output_queue: queue.Queue) -> None:
+        self.persist = persist
+        self.output_queue = output_queue
+        self.pending: queue.Queue = queue.Queue(maxsize=MAX_PENDING_CAPTURE_CHUNKS)
+        self.error: Optional[Exception] = None
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name="audio-capture-writer", daemon=True)
+        self.thread.start()
+
+    def submit(self, chunk, started_at: datetime) -> None:
+        if self.closed:
+            raise RuntimeError("audio writer is closed")
+        try:
+            self.pending.put_nowait((chunk, started_at))
+        except queue.Full as exc:
+            self.error = RuntimeError("Storage cannot keep up with capture; recording stopped. Saved audio is preserved.")
+            raise self.error from exc
+
+    def _run(self) -> None:
+        try:
+            while True:
+                item = self.pending.get()
+                if item is None:
+                    return
+                if isinstance(item, threading.Event):
+                    item.set()
+                    continue
+                self.persist(*item)
+                self.output_queue.put(item)
+        except Exception as exc:
+            self.error = exc
+
+    def check(self) -> None:
+        if self.error is not None:
+            raise RuntimeError(f"Audio recording could not be saved: {self.error}") from self.error
+
+    def flush(self) -> None:
+        self.check()
+        barrier = threading.Event()
+        self.pending.put(barrier, timeout=AUDIO_WRITER_JOIN_SECONDS)
+        if not barrier.wait(AUDIO_WRITER_JOIN_SECONDS):
+            self.check()
+            raise RuntimeError("Audio writer did not acknowledge saved audio")
+
+    def close(self) -> None:
+        if not self.closed:
+            self.closed = True
+            self.pending.put(None, timeout=AUDIO_WRITER_JOIN_SECONDS)
+        self.thread.join(AUDIO_WRITER_JOIN_SECONDS)
+        if self.thread.is_alive():
+            raise RuntimeError("Audio writer did not finish saving queued audio")
+        self.check()
+
+
+class CaptureController:
+    """Own microphone lifecycle independently of model inference; acknowledge actual state."""
+
+    def __init__(self, open_stream, flush, before_resume, announce, check_writer=lambda: None):
+        self.open_stream = open_stream
+        self.flush = flush
+        self.before_resume = before_resume
+        self.announce = announce
+        self.check_writer = check_writer
+        self.commands = queue.Queue()
+        self.commands.put("RESUME")
+        self.finished = threading.Event()
+        self.error = None
+
+    def command(self, command):
+        if command not in {"PAUSE", "RESUME", "STOP"}:
+            raise ValueError("Unknown capture command")
+        self.commands.put(command)
+
+    def read_commands(self, source):
+        try:
+            for line in source:
+                command = line.strip()
+                if command in {"PAUSE", "RESUME", "STOP"}:
+                    self.command(command)
+                    if command == "STOP":
+                        return
+        except Exception as exc:
+            self.error = RuntimeError(f"Recorder control pipe failed: {exc}")
+        finally:
+            # A closed parent pipe must not leave a hidden microphone recording.
+            self.command("STOP")
+
+    def run(self):
+        first = True
+        try:
+            while True:
+                command = self.commands.get()
+                if command == "STOP":
+                    return
+                if command != "RESUME":
+                    continue
+                self.before_resume()
+                with self.open_stream() as stream:
+                    self.announce("ready" if first else "recording")
+                    first = False
+                    while True:
+                        try:
+                            command = self.commands.get(timeout=CAPTURE_CONTROL_POLL_SECONDS)
+                        except queue.Empty:
+                            self.check_writer()
+                            if not getattr(stream, "active", True):
+                                raise RuntimeError("Microphone disconnected; captured audio is preserved")
+                            continue
+                        if command in {"PAUSE", "STOP"}:
+                            break
+                # Closing the stream joins its callback before acknowledging Pause.
+                self.flush()
+                if command == "STOP":
+                    return
+                self.announce("paused")
+        except Exception as exc:
+            self.error = exc
+        finally:
+            self.finished.set()
+
+
+def live_decode_boundary(timeline: SpeechDecodeTimeline, available_samples: int,
+                         latest_audio_end: datetime, streaming: bool = False) -> tuple[int, datetime]:
+    """Never consume beyond the audio actually submitted to the decoder."""
+    decode_samples = available_samples if streaming else min(
+        available_samples, round(SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS))
+    decoded_end = timeline.map_offset(decode_samples / SAMPLE_RATE, prefer_end=True)
+    # Trailing silence can end a turn, but speech beyond the prefix must survive.
+    return decode_samples, decoded_end if decode_samples < available_samples else latest_audio_end
 
 
 class LiveTranscriber:
@@ -1175,6 +1446,17 @@ def looks_like_low_confidence_segment(segment) -> bool:
     return False
 
 
+def should_mark_unclear_speech(segment, audio) -> bool:
+    """Flag uncertain speech; retain the existing non-speech and loop rejection."""
+    if float(getattr(segment, "no_speech_prob", 0.0) or 0.0) > SEGMENT_NO_SPEECH_THRESHOLD:
+        return False
+    if float(getattr(segment, "compression_ratio", 0.0) or 0.0) > SEGMENT_COMPRESSION_RATIO_THRESHOLD:
+        return False
+    start = max(0, round(float(segment.start) * SAMPLE_RATE))
+    end = min(len(audio), round(float(segment.end) * SAMPLE_RATE))
+    return end > start and maximum_audio_window_rms(audio[start:end]) >= CHUNK_RMS_SILENCE_THRESHOLD
+
+
 def looks_like_structural_repetition_loop(text: str) -> bool:
     words = normalized_words(text)
     if len(words) < STRUCTURAL_LOOP_MIN_WORDS:
@@ -1252,6 +1534,21 @@ def should_drop_low_energy_short_segment(text: str, chunk_rms: float) -> bool:
 
     word_count = len(normalize_transcript_text(text).split())
     return 0 < word_count <= LOW_ENERGY_SHORT_SEGMENT_MAX_WORDS
+
+
+def iter_final_segments(
+    segments: Iterable[Any], audio: Any, duration_seconds: float,
+    progress_callback: Optional[Callable[[float, float], None]] = None,
+) -> Iterator[Any]:
+    """Report decoding as it happens, retaining only the tail needed for filtering."""
+    pending: list[Any] = []
+    for segment in segments:
+        if progress_callback is not None:
+            progress_callback(min(float(segment.end), duration_seconds or float(segment.end)), duration_seconds)
+        pending.append(segment)
+        if len(pending) > FINAL_SEGMENT_LOOKBEHIND:
+            yield pending.pop(0)
+    yield from filter_trailing_hallucination_segments(pending, audio)
 
 
 def limited_hotwords(hotwords: Optional[str]) -> str:
@@ -1374,8 +1671,10 @@ def transcribe_audio_segments(
         if looks_like_structural_repetition_loop(text):
             continue
         if strict_segment_filtering and looks_like_low_confidence_segment(segment):
-            continue
-        if not allow_low_energy_short_segments and should_drop_low_energy_short_segment(text, chunk_rms):
+            if not should_mark_unclear_speech(segment, audio):
+                continue
+            text = UNCLEAR_SPEECH_MARKER
+        if text != UNCLEAR_SPEECH_MARKER and not allow_low_energy_short_segments and should_drop_low_energy_short_segment(text, chunk_rms):
             continue
         segment_start_offset = max(0.0, float(segment.start))
         segment_end_offset = max(segment_start_offset, float(segment.end))
@@ -1386,7 +1685,9 @@ def transcribe_audio_segments(
             segment_start_time = audio_timeline.map_offset(segment_start_offset)
             segment_end_time = audio_timeline.map_offset(segment_end_offset, prefer_end=True)
         timed_words = []
-        for word in segment.words or []:
+        if text == UNCLEAR_SPEECH_MARKER:
+            timed_words.append(TimedWord(segment_start_time, segment_end_time, text))
+        for word in ([] if text == UNCLEAR_SPEECH_MARKER else segment.words or []):
             word_text = word.word
             if not word_text.strip():
                 continue
@@ -1398,7 +1699,8 @@ def transcribe_audio_segments(
             else:
                 word_start_time = audio_timeline.map_offset(word_start_offset)
                 word_end_time = audio_timeline.map_offset(word_end_offset, prefer_end=True)
-            timed_words.append((word_start_time, word_end_time, word_text))
+            timed_words.append(TimedWord(word_start_time, word_end_time, word_text,
+                                        getattr(word, "probability", None)))
         entries.append((
             segment_start_time,
             segment_end_time,
@@ -1609,8 +1911,6 @@ def transcribe_saved_audio_with_timings(
             hotwords=hotwords,
         ),
     )
-    segments = filter_trailing_hallucination_segments(segments, raw_audio)
-
     duration_seconds = float(getattr(transcription_info, "duration", 0.0) or 0.0)
     if duration_seconds <= 0:
         duration_seconds = wave_audio_duration_seconds(audio_path)
@@ -1620,16 +1920,17 @@ def transcribe_saved_audio_with_timings(
     lines: list[str] = []
     segment_rows: list[dict] = []
     word_rows: list[dict] = []
-    for segment_index, segment in enumerate(segments):
-        if progress_callback is not None:
-            progress_callback(min(float(segment.end), duration_seconds or float(segment.end)), duration_seconds)
+    for segment_index, segment in enumerate(iter_final_segments(
+            segments, raw_audio, duration_seconds, progress_callback)):
         text = segment.text.strip()
         if not text:
             continue
         if looks_like_structural_repetition_loop(text):
             continue
         if looks_like_low_confidence_segment(segment):
-            continue
+            if not should_mark_unclear_speech(segment, raw_audio):
+                continue
+            text = UNCLEAR_SPEECH_MARKER
         segment_start_offset = max(0.0, float(segment.start))
         segment_end_offset = max(segment_start_offset, float(segment.end))
         segment_time = recording_start_time + timedelta(seconds=segment_start_offset)
@@ -1643,7 +1944,10 @@ def transcribe_saved_audio_with_timings(
             "start_ms": round(segment_start_offset * 1000),
             "end_ms": round(segment_end_offset * 1000),
         })
-        for word_index, word in enumerate(segment.words or []):
+        segment_words = segment.words or []
+        if text == UNCLEAR_SPEECH_MARKER:
+            segment_words = [SimpleNamespace(word=text, start=segment.start, end=segment.end)]
+        for word_index, word in enumerate(segment_words):
             word_text = str(word.word)
             if not word_text.strip():
                 continue
@@ -1661,6 +1965,10 @@ def transcribe_saved_audio_with_timings(
                 ),
                 "start_ms": round(word_start_offset * 1000),
                 "end_ms": round(word_end_offset * 1000),
+                "confidence": word_confidence(getattr(word, "probability", None)),
+                "needs_review": word_text.strip() == UNCLEAR_SPEECH_MARKER or (
+                    word_confidence(getattr(word, "probability", None)) is not None and
+                    float(word.probability) < WORD_REVIEW_CONFIDENCE_THRESHOLD),
             })
     if progress_callback is not None and duration_seconds > 0:
         progress_callback(duration_seconds, duration_seconds)
@@ -1760,7 +2068,8 @@ def drop_repeated_final_segments(
     counts = {text: normalized.count(text) for text in set(normalized) if text}
     offenders = {
         text for text, count in counts.items()
-        if count >= 4 and count / max(1, len(normalized)) >= 0.4
+        if text != normalize_transcript_text(UNCLEAR_SPEECH_MARKER)
+        and count >= 4 and count / max(1, len(normalized)) >= 0.4
     }
     seen: set[str] = set()
     kept_positions = []
@@ -1789,36 +2098,6 @@ def drop_repeated_final_segments(
         kept_word_rows,
         len(resolved_lines) - len(kept_lines),
     )
-
-
-def preserve_matching_live_timestamps(
-    final_lines: Sequence[str],
-    live_lines: Sequence[str],
-) -> list[str]:
-    live_entries = [
-        parsed for line in live_lines
-        if (parsed := parse_transcript_line(line)) is not None
-    ]
-    next_live_index = 0
-    resolved_lines: list[str] = []
-
-    for line in final_lines:
-        final_entry = parse_transcript_line(line)
-        if final_entry is None:
-            resolved_lines.append(line)
-            continue
-
-        final_time, final_text = final_entry
-        resolved_time = final_time
-        for live_index in range(next_live_index, len(live_entries)):
-            live_time, live_text = live_entries[live_index]
-            if transcript_prefix_matches(live_text, final_text):
-                resolved_time = live_time
-                next_live_index = live_index + 1
-                break
-        resolved_lines.append(format_transcript_line(resolved_time, final_text))
-
-    return resolved_lines
 
 
 class AudioSilenceWatchdog:
@@ -1987,6 +2266,17 @@ class SpeechEndpointState:
         self.turn_started_at = None
         self.silence_started_at = None
         self.latest_audio_end = None
+
+
+def restore_backlog_endpoint(endpoint: SpeechEndpointState, timeline: SpeechDecodeTimeline,
+                             latest_capture_end: Optional[datetime]) -> None:
+    endpoint.reset()
+    for span in timeline.spans:
+        endpoint.observe(span.source_start, span.frame_count / SAMPLE_RATE, True)
+    if timeline.spans and latest_capture_end is not None:
+        retained_end = timeline.map_offset(timeline.frame_count / SAMPLE_RATE, prefer_end=True)
+        endpoint.observe(retained_end, max(
+            0.0, (latest_capture_end - retained_end).total_seconds()), False)
 
 
 class SignalQualityAnalyzer:
@@ -2165,12 +2455,11 @@ def finalize_existing_capture(
                         file=sys.stderr,
                     )
                 if final_lines:
-                    existing_lines = []
                     if out_path.exists():
                         existing_text = out_path.read_text(encoding="utf-8")
-                        existing_lines = existing_text.splitlines()
                         live_backup_path.write_text(existing_text, encoding="utf-8")
-                    final_lines = preserve_matching_live_timestamps(final_lines, existing_lines)
+                    # Final text, CSV timings, and review metadata share the final
+                    # audio-derived clock. Repeated live phrases cannot retime it.
                     write_csv_rows(
                         segment_timing_path,
                         ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
@@ -2178,9 +2467,10 @@ def finalize_existing_capture(
                     )
                     write_csv_rows(
                         word_timing_path,
-                        ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
+                        WORD_CSV_FIELDS,
                         word_rows,
                     )
+                    write_review_metadata(out_path, final_lines, word_rows)
                     write_lines(out_path, final_lines)
                     finalization_result = "final"
                     print(f"Final transcript regenerated from full audio: {out_path}")
@@ -2211,7 +2501,7 @@ def finalize_existing_capture(
             )
             write_csv_rows(
                 word_timing_path,
-                ("segment_index", "word_index", "word", "start_utc", "end_utc", "start_ms", "end_ms"),
+                WORD_CSV_FIELDS,
                 (),
             )
         except OSError as exc:
@@ -2321,7 +2611,7 @@ def main() -> int:
     step_seconds = min(FAST_LIVE_STEP_SECONDS, live_window_seconds, LIVE_STEP_SECONDS)
     initial_samples_per_chunk = int(SAMPLE_RATE * initial_live_window_seconds)
     min_flush_samples = int(SAMPLE_RATE * MIN_FLUSH_SECONDS)
-    audio_queue: queue.Queue[tuple[np.ndarray, datetime]] = queue.Queue()
+    audio_queue = DiskAudioQueue(out_path.parent)
     stop_requested = False
     (
         live_transcript_entries,
@@ -2334,6 +2624,8 @@ def main() -> int:
         raw_audio_wave_path,
     )
     existing_live_transcript_entries = list(live_transcript_entries)
+    existing_live_review_rows = load_review_rows(out_path)
+    live_review_rows = list(existing_live_review_rows)
     has_live_emission = bool(live_transcript_entries)
     last_partial_text = ""
     last_meter_emit_time = 0.0
@@ -2349,16 +2641,20 @@ def main() -> int:
     endpoint_state = SpeechEndpointState()
     last_decoded_word_end: Optional[datetime] = None
     recording_origin_emitted = False
+    capture_controller = None
 
     def request_stop(signum, frame) -> None:
         del signum, frame
         nonlocal stop_requested
         stop_requested = True
+        if capture_controller is not None:
+            capture_controller.command("STOP")
 
     def callback(indata, frames, time_info, status) -> None:
         nonlocal stream_time_anchor, stream_wall_anchor
         if status:
-            print(f"Audio status: {status}", file=sys.stderr)
+            print(f"Warning: microphone input status {status}; check this recording for missing audio.",
+                  file=sys.stderr, flush=True)
         chunk_duration = frames / SAMPLE_RATE
         fallback_chunk_start_time = datetime.now(timezone.utc) - timedelta(seconds=chunk_duration)
         chunk_start_time = fallback_chunk_start_time
@@ -2385,7 +2681,7 @@ def main() -> int:
         now_monotonic = time_module.monotonic()
         for kind, fields in silence_watchdog.update(chunk_rms, now_monotonic):
             emit_protocol_message(kind, *fields)
-        audio_queue.put((indata.copy(), chunk_start_time))
+        capture_writer.submit(indata.copy(), chunk_start_time)
 
     preferred_live_engine = resolve_live_engine(
         args.live_engine,
@@ -2461,10 +2757,8 @@ def main() -> int:
         append_wave_silence(raw_audio_wave_path, silence_frames)
         print(f"Inserted {gap_seconds:.2f}s transcript silence gap for resumed capture.")
 
-    def append_captured_chunk(chunk, chunk_start_time: datetime) -> None:
-        nonlocal audio_buffer, audio_buffer_start_time, recording_start_time, recording_origin_emitted
-        nonlocal last_meter_emit_time
-
+    def persist_captured_chunk(chunk, chunk_start_time: datetime) -> None:
+        nonlocal recording_start_time, recording_origin_emitted
         if recording_start_time is None:
             existing_audio_seconds = wave_audio_duration_seconds(raw_audio_wave_path)
             recording_start_time = chunk_start_time - timedelta(seconds=existing_audio_seconds)
@@ -2478,6 +2772,8 @@ def main() -> int:
 
         append_wave_audio(raw_audio_wave_path, chunk)
 
+    def append_captured_chunk(chunk, chunk_start_time: datetime) -> None:
+        nonlocal audio_buffer, audio_buffer_start_time, last_meter_emit_time
         signal_result = signal_analyzer.update(chunk[:, 0])
         now_monotonic = time_module.monotonic()
         if signal_result is not None and now_monotonic - last_meter_emit_time >= METER_EMIT_INTERVAL_SECONDS:
@@ -2504,7 +2800,14 @@ def main() -> int:
         drained_chunks = 0
         drained_seconds = 0.0
 
-        if block:
+        def turn_pending() -> bool:
+            return audio_buffer.shape[0] > 0 and endpoint_state.endpoint_reason(
+                last_decoded_word_end, include_word_gap=False) is not None
+
+        if turn_pending():
+            return 0
+
+        if block and audio_buffer.shape[0] < SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS:
             try:
                 chunk, chunk_start_time = audio_queue.get(timeout=0.25)
             except queue.Empty:
@@ -2513,7 +2816,7 @@ def main() -> int:
             drained_chunks += 1
             drained_seconds += chunk.shape[0] / SAMPLE_RATE
 
-        while True:
+        while audio_buffer.shape[0] < SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS and not turn_pending():
             try:
                 chunk, chunk_start_time = audio_queue.get_nowait()
             except queue.Empty:
@@ -2541,6 +2844,7 @@ def main() -> int:
     ) -> None:
         nonlocal has_live_emission, last_partial_text
         nonlocal committed_live_audio_through, live_transcript_entries
+        nonlocal live_review_rows
         previous_lines = [
             format_transcript_line(timestamp, text)
             for timestamp, text in live_transcript_entries
@@ -2560,6 +2864,9 @@ def main() -> int:
             format_transcript_line(timestamp, text)
             for timestamp, text in live_transcript_entries
         ]
+        live_review_rows = existing_live_review_rows + timed_word_review_rows(
+            update.committed_words, recording_start_time)
+        write_review_metadata(out_path, updated_lines, live_review_rows)
         if updated_lines != previous_lines:
             write_lines(
                 out_path,
@@ -2576,12 +2883,16 @@ def main() -> int:
     def maybe_transcribe_latest_live_audio(force: bool = False) -> None:
         nonlocal last_live_decode_end_time, last_decoded_word_end
         nonlocal existing_live_transcript_entries
+        nonlocal existing_live_review_rows
         if live_transcriber is None or audio_buffer_start_time is None or audio_buffer.shape[0] == 0:
             return
 
         available_samples = audio_buffer.shape[0]
         is_streaming = isinstance(live_transcriber, ParakeetMlxLiveTranscriber)
-        required_samples = 1 if force else (
+        endpoint_reason = endpoint_state.endpoint_reason(
+            last_decoded_word_end, include_word_gap=False)
+        force_commit = force or endpoint_reason is not None
+        required_samples = 1 if force_commit else (
             min_flush_samples
             if is_streaming or has_live_emission
             else initial_samples_per_chunk
@@ -2589,28 +2900,21 @@ def main() -> int:
         if available_samples < required_samples:
             return
 
-        decode_samples = (
-            available_samples
-            if is_streaming
-            else min(available_samples, int(SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS))
-        )
-        current_audio_end_time = endpoint_state.latest_audio_end or (
-            audio_buffer_start_time + timedelta(seconds=decode_samples / SAMPLE_RATE)
+        decode_samples, current_audio_end_time = live_decode_boundary(
+            audio_buffer_timeline, available_samples,
+            endpoint_state.latest_audio_end or audio_buffer_timeline.map_offset(
+                available_samples / SAMPLE_RATE, prefer_end=True),
+            streaming=is_streaming,
         )
         decode_interval_seconds = step_seconds if has_live_emission else initial_live_window_seconds
         if (
-                not force and
+                not force_commit and
                 last_live_decode_end_time is not None and
                 (current_audio_end_time - last_live_decode_end_time).total_seconds() < decode_interval_seconds):
             return
 
         audio = audio_buffer[:decode_samples, 0].copy()
         chunk_window_start = audio_buffer_start_time
-        endpoint_reason = endpoint_state.endpoint_reason(
-            last_decoded_word_end,
-            include_word_gap=False,
-        )
-        force_commit = force or endpoint_reason is not None
         committed_words = ()
         if isinstance(live_transcriber, WhisperLiveTranscriber):
             committed_words = live_transcriber.agreement.committed_words
@@ -2642,10 +2946,14 @@ def main() -> int:
         )
         if force_commit:
             emit_protocol_message("TURN_ENDED", format_utc_timestamp(current_audio_end_time))
-            endpoint_state.reset()
+            latest_capture_end = endpoint_state.latest_audio_end
+            # Retained backlog belongs to the next turn; keep its capture clock.
+            restore_backlog_endpoint(endpoint_state, audio_buffer_timeline, latest_capture_end)
+            last_live_decode_end_time = None
             last_decoded_word_end = None
             if isinstance(live_transcriber, WhisperLiveTranscriber):
                 existing_live_transcript_entries = list(live_transcript_entries)
+                existing_live_review_rows = list(live_review_rows)
                 live_transcriber.reset_turn()
 
     load_errors: list[str] = []
@@ -2729,39 +3037,78 @@ def main() -> int:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
-    try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
-            dtype="float32",
-            blocksize=round(SAMPLE_RATE * LIVE_VAD_WINDOW_SECONDS),
-            callback=callback,
-            device=device,
-        ):
-            emit_protocol_message("TRANSCRIPT_READY")
-            if recording_start_time is not None and not recording_origin_emitted:
-                emit_protocol_message("RECORDING_ORIGIN", format_utc_timestamp(recording_start_time))
-                recording_origin_emitted = True
-            model_thread = threading.Thread(target=load_live_model, name="live-asr-model-loader")
-            model_thread.start()
+    capture_writer = AudioCaptureWriter(persist_captured_chunk, audio_queue)
+    capture_error = None
+    def open_capture_stream():
+        return sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS, dtype="float32",
+                              blocksize=round(SAMPLE_RATE * LIVE_VAD_WINDOW_SECONDS),
+                              callback=callback, device=device)
 
-            while not stop_requested:
-                if drain_captured_audio(block=True):
+    def prepare_resume():
+        nonlocal resume_gap_checked, stream_time_anchor, stream_wall_anchor
+        # Preserve the existing wall-clock WAV timeline, including silence gaps.
+        resume_gap_checked = False
+        stream_time_anchor = None
+        stream_wall_anchor = None
+
+    try:
+        if args.interactive_control:
+            capture_controller = CaptureController(open_capture_stream, capture_writer.flush, prepare_resume,
+                lambda state: emit_protocol_message("TRANSCRIPT_READY") if state == "ready"
+                else emit_protocol_message("CAPTURE_STATE", state), capture_writer.check)
+            capture_thread = threading.Thread(target=capture_controller.run, name="microphone-controller", daemon=True)
+            capture_thread.start()
+            threading.Thread(target=capture_controller.read_commands, args=(sys.stdin,),
+                             name="capture-commands", daemon=True).start()
+            model_thread = threading.Thread(target=load_live_model, name="live-asr-model-loader", daemon=True)
+            model_thread.start()
+            while not capture_controller.finished.is_set():
+                capture_writer.check()
+                drain_captured_audio(block=True)
+                maybe_transcribe_latest_live_audio()
+                if live_transcriber is None:
+                    time_module.sleep(CAPTURE_CONTROL_POLL_SECONDS)
+            if capture_controller.error is not None:
+                raise capture_controller.error
+        else:
+            with open_capture_stream():
+                emit_protocol_message("TRANSCRIPT_READY")
+                model_thread = threading.Thread(target=load_live_model, name="live-asr-model-loader", daemon=True)
+                model_thread.start()
+                while not stop_requested:
+                    capture_writer.check()
+                    drain_captured_audio(block=True)
                     maybe_transcribe_latest_live_audio()
     except KeyboardInterrupt:
         stop_requested = True
     except sd.PortAudioError as exc:
-        print(f"Error: {explain_portaudio_error(exc)}", file=sys.stderr)
-        return 1
+        capture_error = explain_portaudio_error(exc)
     except Exception as exc:
-        print(f"Error: transcription failed: {exc}", file=sys.stderr)
+        capture_error = str(exc)
+    finally:
+        if capture_controller is not None:
+            capture_controller.command("STOP")
+            capture_thread.join(AUDIO_WRITER_JOIN_SECONDS)
+            if capture_thread.is_alive():
+                capture_error = "Microphone did not close; session requires recovery"
+        # InputStream is closed before the sentinel, so no callback can race shutdown.
+        try:
+            capture_writer.close()
+        except Exception as exc:
+            capture_error = str(exc)
+    if capture_error is not None:
+        audio_queue.close()
+        print(f"Error: transcription failed: {capture_error}", file=sys.stderr)
+        emit_protocol_message("FINALIZATION_RESULT", "failed")
         return 1
 
-    drain_captured_audio()
     if 'model_thread' in locals():
         model_thread.join()
     if live_transcriber is not None:
-        maybe_transcribe_latest_live_audio(force=True)
+        while not audio_queue.empty() or audio_buffer.shape[0]:
+            drain_captured_audio()
+            maybe_transcribe_latest_live_audio(force=True)
+    audio_queue.close()
 
     if args.capture_only:
         if live_transcriber is not None:

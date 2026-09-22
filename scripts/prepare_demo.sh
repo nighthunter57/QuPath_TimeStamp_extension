@@ -19,22 +19,27 @@ EVENT_JSON="${SESSION_DIR}/events/${SESSION_ID}_event.json"
 CURSOR_JSON="${SESSION_DIR}/cursor/${SESSION_ID}_cursor.json"
 VIDEO_MP4="${SESSION_DIR}/video/${SESSION_ID}_video.mp4"
 TRANSCRIPT_TXT="${SESSION_DIR}/video/${SESSION_ID}_transcript.txt"
+MANIFEST_JSON="${SESSION_DIR}/${SESSION_ID}_recording_manifest.json"
 
 cat > "${SESSION_DIR}/notes/recording-plan.txt" <<EOF
 Demo session: ${SESSION_ID}
 
-During recording (QuPath + screen recorder):
+Command-line helper demo:
 1) Start recording video/audio.
-2) In QuPath TimeStamp Monitor, click Start Recording.
-3) Perform actions: zoom, pan, annotate.
-4) If take is bad: stop video, click Clear Events, restart both.
-5) End take: stop video and export JSON logs.
+2) Start the transcript helper using the command printed below.
+3) Perform actions in QuPath.
+4) Stop the helper to generate the final transcript.
+
+Normal QuPath extension workflow does not require this prepared folder. Click
+Start Recording first, then choose the parent folder and session name only after
+clicking Save Transcript & Timestamps.
 
 Save exports as:
 - Event log JSON: ${EVENT_JSON}
 - Cursor log JSON: ${CURSOR_JSON}
 - Video: ${VIDEO_MP4}
 - Transcript: ${TRANSCRIPT_TXT}
+- Completion manifest: ${MANIFEST_JSON}
 EOF
 
 touch "${EVENT_JSON}" "${CURSOR_JSON}" "${TRANSCRIPT_TXT}"
@@ -48,10 +53,11 @@ Expected outputs:
   Cursor log: ${CURSOR_JSON}
   Video file: ${VIDEO_MP4}
   Transcript: ${TRANSCRIPT_TXT}
+  Manifest  : ${MANIFEST_JSON}
 
 Next:
   1) Run screen recorder and save to the video path above.
   2) Start live transcript with:
-     ./scripts/start_live_transcript.sh "${SESSION_DIR}" small en
-  3) In QuPath, export event log JSON and mouse movement JSON to the paths above.
+     ./scripts/start_live_transcript.sh "${SESSION_DIR}" large-v3 en
+  3) For the extension workflow, open the TimeStamp Monitor and click Start Recording without selecting a folder.
 EOF

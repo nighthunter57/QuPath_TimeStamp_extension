@@ -1,7 +1,11 @@
 import contextlib
+import csv
 import hashlib
 import io
+import json
+import queue
 import sys
+import threading
 import tempfile
 import unittest
 import wave
@@ -16,6 +20,401 @@ from scripts import live_whisper_demo as transcript
 
 
 class TranscriptLogicTest(unittest.TestCase):
+
+    def test_interactive_pause_resume_during_inference_preserves_one_wav_and_clock(self):
+        origin = datetime(2026, 9, 14, tzinfo=timezone.utc)
+        now = [origin]
+        opened = [0]
+        decoding = threading.Event()
+        paused = threading.Event()
+        resumed = threading.Event()
+        model_loads = []
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now[0]
+        class Microphone:
+            active = True
+            def __init__(self, **kwargs):
+                self.callback = kwargs["callback"]
+            def __enter__(self):
+                offset, count = (0, 24) if opened[0] == 0 else (20, 12)
+                opened[0] += 1
+                for index in range(count):
+                    now[0] = origin + timedelta(seconds=offset + (index + 1) * .5)
+                    chunk = np.full((8000, 1), (index + 1 + (24 if offset else 0)) / 100, dtype=np.float32)
+                    self.callback(chunk, 8000, SimpleNamespace(inputBufferAdcTime=index * .5), None)
+                return self
+            def __exit__(self, *args):
+                self.active = False
+        class Commands:
+            def __iter__(self):
+                if not decoding.wait(3):
+                    raise AssertionError("Decoder did not start")
+                yield "PAUSE\n"
+                if not paused.wait(3):
+                    raise AssertionError("Pause blocked on inference")
+                yield "RESUME\n"
+                if not resumed.wait(3):
+                    raise AssertionError("Resume blocked on inference")
+                yield "STOP\n"
+        def decode(audio, **kwargs):
+            decoding.set()
+            if not resumed.wait(4):
+                raise AssertionError("Control path waited for decoder")
+            seconds = len(audio) / transcript.SAMPLE_RATE
+            words = [SimpleNamespace(start=i / transcript.SAMPLE_RATE,
+                end=(i + 8000) / transcript.SAMPLE_RATE,
+                word=f"w{round(float(audio[i]) * 100)}", probability=.9)
+                for i in range(0, len(audio), 8000)]
+            return [SimpleNamespace(start=0, end=seconds, text=" ".join(w.word for w in words),
+                avg_logprob=0, no_speech_prob=0, compression_ratio=1,
+                words=words)], None
+        def model(*args, **kwargs):
+            model_loads.append(1)
+            return SimpleNamespace(transcribe=decode)
+        emit = transcript.emit_protocol_message
+        def announce(kind, *fields):
+            emit(kind, *fields)
+            if kind == "CAPTURE_STATE":
+                (paused if fields[0] == "paused" else resumed).set()
+        fake_sd = SimpleNamespace(InputStream=Microphone, check_input_settings=lambda **kw: None,
+                                  PortAudioError=type("PortAudioError", (Exception,), {}))
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            path = Path(directory) / "interactive.txt"
+            stack.enter_context(patch.dict(sys.modules, {"sounddevice": fake_sd,
+                "faster_whisper": SimpleNamespace(WhisperModel=model)}))
+            stack.enter_context(patch.object(sys, "argv", ["helper", "--output", str(path),
+                "--capture-only", "--interactive-control"]))
+            stack.enter_context(patch.object(sys, "stdin", Commands()))
+            stack.enter_context(patch.object(transcript, "datetime", Clock))
+            stack.enter_context(patch.object(transcript.signal, "signal"))
+            stack.enter_context(patch.object(transcript, "emit_protocol_message", side_effect=announce))
+            stack.enter_context(patch.object(transcript, "LiveAudioConditioner",
+                return_value=SimpleNamespace(process=lambda audio: audio)))
+            stack.enter_context(patch.object(transcript, "resolve_or_fallback_input_device", return_value=None))
+            stack.enter_context(patch.object(transcript, "resolve_live_engine", return_value="whisper"))
+            stack.enter_context(patch.object(transcript, "should_buffer_live_audio", return_value=True))
+            stack.enter_context(patch.object(transcript, "SignalQualityAnalyzer", return_value=SimpleNamespace(update=lambda a: None)))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            errors = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            self.assertEqual(0, transcript.main())
+            self.assertTrue(resumed.is_set(), output.getvalue() + errors.getvalue())
+            self.assertEqual(2, opened[0])
+            self.assertEqual(1, len(model_loads))
+            self.assertEqual(26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
+            self.assertEqual(origin, transcript.read_recording_start(path.with_name("interactive_audio.start.txt")))
+            self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
+            self.assertEqual([f"w{i}" for i in range(1, 37)],
+                [word for word in path.read_text().split() if word.startswith("w")])
+
+    def test_disk_backlog_preserves_original_float_samples_and_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backlog = transcript.DiskAudioQueue(directory)
+            try:
+                origin = datetime.now(timezone.utc)
+                chunks = [np.full((8000, 1), i / 37, dtype=np.float32) for i in range(20)]
+                for index, chunk in enumerate(chunks):
+                    backlog.put((chunk, origin + timedelta(seconds=index * .5)))
+                for index, chunk in enumerate(chunks):
+                    restored, at = backlog.get_nowait()
+                    np.testing.assert_array_equal(chunk, restored)
+                    self.assertEqual(origin + timedelta(seconds=index * .5), at)
+                self.assertTrue(backlog.empty())
+                self.assertEqual(0, backlog.write_offset)
+                backlog.put((chunks[0], origin))
+                np.testing.assert_array_equal(chunks[0], backlog.get_nowait()[0])
+            finally:
+                backlog.close()
+
+    def test_pause_resume_acknowledges_closed_stream_without_decoder(self):
+        events = queue.Queue()
+        stream_open = [False]
+        flushes = []
+        class Stream:
+            def __enter__(self):
+                stream_open[0] = True
+                return self
+            def __exit__(self, *args):
+                stream_open[0] = False
+        def announce(state):
+            events.put((state, stream_open[0]))
+        controller = transcript.CaptureController(Stream, lambda: flushes.append("saved"), lambda: None, announce)
+        worker = threading.Thread(target=controller.run)
+        worker.start()
+        try:
+            self.assertEqual(("ready", True), events.get(timeout=2))
+            for _ in range(10):
+                controller.command("PAUSE")
+                self.assertEqual(("paused", False), events.get(timeout=2))
+                controller.command("RESUME")
+                self.assertEqual(("recording", True), events.get(timeout=2))
+            controller.command("STOP")
+            self.assertTrue(controller.finished.wait(2))
+            self.assertIsNone(controller.error)
+            self.assertFalse(stream_open[0])
+            self.assertEqual(11, len(flushes))
+        finally:
+            controller.command("STOP")
+            worker.join(2)
+
+    def test_closed_control_pipe_stops_capture(self):
+        controller = transcript.CaptureController(None, None, None, None)
+        controller.read_commands(io.StringIO("PAUSE\nRESUME\n"))
+        self.assertEqual(["RESUME", "PAUSE", "RESUME", "STOP"],
+                         [controller.commands.get_nowait() for _ in range(4)])
+
+    def test_controller_closes_microphone_on_writer_failure(self):
+        closed = threading.Event()
+        class Stream:
+            def __enter__(self): return self
+            def __exit__(self, *args): closed.set()
+        def fail(): raise OSError("disk full")
+        controller = transcript.CaptureController(Stream, lambda: None, lambda: None, lambda state: None, fail)
+        worker = threading.Thread(target=controller.run)
+        worker.start()
+        try:
+            self.assertTrue(controller.finished.wait(2))
+            self.assertTrue(closed.is_set())
+            self.assertIn("disk full", str(controller.error))
+        finally:
+            controller.command("STOP")
+            worker.join(2)
+
+    def test_writer_flush_preserves_audio_before_acknowledgement(self):
+        saved = []
+        writer = transcript.AudioCaptureWriter(lambda chunk, at: saved.append(chunk), queue.Queue())
+        try:
+            writer.submit("raw audio", datetime.now(timezone.utc))
+            writer.flush()
+            self.assertEqual(["raw audio"], saved)
+        finally:
+            writer.close()
+
+    def test_capture_shutdown_decodes_all_backlog_and_flushes_original_audio(self):
+        self.assert_captured_turns([True] * 36, [12.0, 6.0])
+
+    def test_capture_backlog_preserves_silence_between_short_turns(self):
+        self.assert_captured_turns([True, False, False, True, False, False, True], [0.5, 0.5, 0.5])
+
+    def assert_captured_turns(self, speech_mask, expected_seconds):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        now = [origin]
+        handlers = {}
+        decoded_seconds = []
+        class ClockDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now[0]
+        class Microphone:
+            def __init__(self, **kwargs):
+                self.callback = kwargs["callback"]
+            def __enter__(self):
+                for index in range(len(speech_mask)):
+                    now[0] = origin + timedelta(seconds=(index + 1) * 0.5)
+                    chunk = (0.1 * np.sin(2 * np.pi * 220 * np.arange(8000) / transcript.SAMPLE_RATE)).astype(np.float32)
+                    self.callback(chunk.reshape(-1, 1), 8000,
+                                  SimpleNamespace(inputBufferAdcTime=index * 0.5), None)
+                handlers[transcript.signal.SIGINT](0, None)
+                return self
+            def __exit__(self, *args):
+                pass
+        def decode(audio, **kwargs):
+            seconds = len(audio) / transcript.SAMPLE_RATE
+            decoded_seconds.append(seconds)
+            return [SimpleNamespace(start=0, end=seconds, text="recorded speech",
+                avg_logprob=0, no_speech_prob=0, compression_ratio=1,
+                words=[SimpleNamespace(start=0, end=seconds, word="recorded speech", probability=0.9)])], None
+        fake_sd = SimpleNamespace(InputStream=Microphone, check_input_settings=lambda **kw: None,
+                                  PortAudioError=type("PortAudioError", (Exception,), {}))
+        fake_fw = SimpleNamespace(WhisperModel=lambda *a, **kw: SimpleNamespace(transcribe=decode))
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
+            path = Path(directory) / "capture.txt"
+            stack.enter_context(patch.dict(sys.modules, {"sounddevice": fake_sd, "faster_whisper": fake_fw}))
+            stack.enter_context(patch.object(sys, "argv", ["helper", "--output", str(path), "--capture-only"]))
+            stack.enter_context(patch.object(transcript, "datetime", ClockDatetime))
+            stack.enter_context(patch.object(transcript.signal, "signal", side_effect=lambda key, fn: handlers.update({key: fn})))
+            stack.enter_context(patch.object(transcript, "resolve_or_fallback_input_device", return_value=None))
+            stack.enter_context(patch.object(transcript, "resolve_live_engine", return_value="whisper"))
+            stack.enter_context(patch.object(transcript, "should_buffer_live_audio", side_effect=speech_mask))
+            stack.enter_context(patch.object(transcript, "SignalQualityAnalyzer", return_value=SimpleNamespace(update=lambda a: None)))
+            output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            self.assertEqual(0, transcript.main())
+            self.assertEqual(expected_seconds, decoded_seconds)
+            self.assertEqual(len(speech_mask) * 0.5, transcript.wave_audio_duration_seconds(path.with_name("capture_audio.wav")))
+            self.assertEqual(len(expected_seconds), path.read_text().count("recorded speech"))
+            self.assertEqual(1, output.getvalue().count("FINALIZATION_RESULT\tpaused"))
+            self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
+            self.assertEqual(origin, transcript.read_recording_start(path.with_name("capture_audio.start.txt")))
+
+    def test_replay_models_slow_decoding_without_losing_backlogged_words(self):
+        from scripts.replay_live_fixture import replay_audio
+        clock = [0.0]
+        windows = []
+        class FakeTranscriber:
+            def __init__(self):
+                self.agreement = transcript.LocalAgreementState()
+            def accept_audio(self, audio, start, force=False, audio_timeline=None, **kwargs):
+                windows.append(len(audio) / transcript.SAMPLE_RATE)
+                clock[0] += 15.0
+                words = []
+                for offset in np.arange(0, len(audio) / transcript.SAMPLE_RATE, 0.5):
+                    begin = audio_timeline.map_offset(float(offset))
+                    end = audio_timeline.map_offset(float(offset + 0.5), prefer_end=True)
+                    index = round((begin - datetime(2026, 1, 1, tzinfo=timezone.utc)).total_seconds() * 2)
+                    words.append((begin, end, f"w{index}"))
+                committed, provisional = self.agreement.update(words, force=force)
+                return transcript.LiveTranscriptionUpdate(tuple(self.agreement.committed_words),
+                    tuple(provisional), committed[-1][1] if committed else None)
+            def force_current(self, end):
+                committed, _ = self.agreement.update([], force=True)
+                return transcript.LiveTranscriptionUpdate(tuple(self.agreement.committed_words), (), end)
+            def reset_turn(self):
+                self.agreement = transcript.LocalAgreementState()
+        result = replay_audio(np.full(transcript.SAMPLE_RATE * 24, 0.1, dtype=np.float32),
+                              FakeTranscriber(), speech_detector=lambda a: True, clock=lambda: clock[0])
+        self.assertLessEqual(result["max_buffer_seconds"], 12)
+        self.assertLessEqual(max(windows), 12)
+        self.assertEqual(48, result["committed_words"])
+        import re
+        self.assertEqual([f"w{i}" for i in range(48)], re.findall(r"\bw\d+\b", result["hypothesis"]))
+        self.assertGreater(result["display_delay_p95_seconds"], 15)
+
+        # A slow decode queues two pauses and sub-minimum utterances. Neither
+        # the drain nor the decode cadence may merge them into the next turn.
+        clock[0] = 0.0
+        windows.clear()
+        audio = np.repeat(np.array([.1, 0, 0, .1, 0, 0, .1], dtype=np.float32),
+                          transcript.SAMPLE_RATE // 2)
+        result = replay_audio(audio, FakeTranscriber(),
+                              speech_detector=lambda a: bool(np.any(a)), clock=lambda: clock[0])
+        self.assertEqual(3, result["committed_words"])
+        self.assertEqual(2, result["endpoint_reasons"]["silence"])
+        self.assertEqual(1, result["endpoint_reasons"]["stop"])
+        self.assertTrue(all(window == .5 for window in windows), windows)
+
+    def test_word_confidence_survives_live_agreement_and_final_export(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        segment = SimpleNamespace(start=0, end=1, text="negative margin", words=[
+            SimpleNamespace(start=0, end=0.5, word="negative", probability=0.35),
+            SimpleNamespace(start=0.5, end=1, word=" margin", probability=0.98)],
+            avg_logprob=0, no_speech_prob=0, compression_ratio=1)
+        model = SimpleNamespace(transcribe=lambda *a, **kw: ([segment], SimpleNamespace(duration=1)))
+        audio = np.full(transcript.SAMPLE_RATE, 0.1, dtype=np.float32)
+        live = transcript.WhisperLiveTranscriber(model, "fake", "en", 2, 2, None)
+        live.accept_audio(audio, origin)
+        update = live.accept_audio(audio, origin)
+        self.assertEqual([0.35, 0.98], [w.confidence for w in update.committed_words])
+        with patch.object(transcript, "decode_saved_audio", return_value=audio):
+            _, _, rows = transcript.transcribe_saved_audio_with_timings(
+                model, Path("unused.wav"), "en", origin, 8, 8, False)
+        self.assertEqual([0.35, 0.98], [r["confidence"] for r in rows])
+        self.assertEqual([True, False], [r["needs_review"] for r in rows])
+
+    def test_uncertain_speech_is_marked_but_non_speech_is_still_rejected(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        audio = np.full(transcript.SAMPLE_RATE, 0.1, dtype=np.float32)
+        segment = SimpleNamespace(start=0, end=1, text="guessed phrase", words=[],
+                                  avg_logprob=-2, no_speech_prob=0.1, compression_ratio=1)
+        model = SimpleNamespace(transcribe=lambda *a, **kw: ([segment], SimpleNamespace(duration=1)))
+        for non_speech in (False, True):
+            segment.no_speech_prob = 0.9 if non_speech else 0.1
+            live = transcript.transcribe_audio_segments(model, audio, "en", origin, 2, 2, False)
+            with patch.object(transcript, "decode_saved_audio", return_value=audio):
+                lines, _, words = transcript.transcribe_saved_audio_with_timings(
+                    model, Path("unused.wav"), "en", origin, 8, 8, False)
+            if non_speech:
+                self.assertEqual(([], [], []), (live, lines, words))
+            else:
+                self.assertEqual(transcript.UNCLEAR_SPEECH_MARKER, live[0][2])
+                self.assertIn(transcript.UNCLEAR_SPEECH_MARKER, lines[0])
+                self.assertTrue(words[0]["needs_review"])
+                self.assertEqual(0, words[0]["start_ms"])
+                self.assertEqual(1000, words[0]["end_ms"])
+
+    def test_review_metadata_maps_repeated_words_and_unicode_and_rejects_stale_text(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        line = transcript.format_transcript_line(origin, "🧪 no no invasion")
+        rows = [{"word": word, "start_ms": i * 500, "end_ms": (i + 1) * 500,
+                 "confidence": 0.4} for i, word in enumerate(("🧪", "no", "no", "invasion"))]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.txt"
+            transcript.write_lines(path, [line])
+            transcript.write_review_metadata(path, [line], rows)
+            document = json.loads(path.with_name("capture_review.json").read_text())
+            encoded = document["transcript"].encode("utf-16-le")
+            for word in document["words"]:
+                self.assertEqual(word["word"], encoded[word["start"] * 2:word["end"] * 2].decode("utf-16-le"))
+            self.assertEqual(4, len(transcript.load_review_rows(path)))
+            transcript.write_lines(path, ["edited"])
+            self.assertEqual([], transcript.load_review_rows(path))
+
+    def test_unknown_confidence_is_never_fabricated(self):
+        for value in (None, "bad", float("nan"), float("inf"), -0.1, 1.1):
+            self.assertIsNone(transcript.word_confidence(value))
+
+    def test_separate_unclear_passages_keep_their_own_review_markers(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        words = [transcript.TimedWord(origin + timedelta(seconds=i), origin + timedelta(seconds=i + 1),
+                                     transcript.UNCLEAR_SPEECH_MARKER) for i in range(6)]
+        entries = transcript.group_committed_words(words)
+        self.assertEqual(6, len(entries))
+        lines = [transcript.format_transcript_line(t, text) for t, text in entries]
+        kept, _, _, dropped = transcript.drop_repeated_final_segments(
+            lines, [{"segment_index": i} for i in range(6)], [])
+        self.assertEqual(lines, kept)
+        self.assertEqual(0, dropped)
+        self.assertEqual("", transcript.local_agreement_prompt(entries, words))
+
+    def test_backlog_boundary_preserves_undecoded_speech_across_silence(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        timeline = transcript.SpeechDecodeTimeline()
+        timeline.append(origin, 10 * transcript.SAMPLE_RATE)
+        timeline.append(origin + timedelta(seconds=15), 8 * transcript.SAMPLE_RATE)
+        count, boundary = transcript.live_decode_boundary(
+            timeline, timeline.frame_count, origin + timedelta(seconds=24))
+        self.assertEqual(12 * transcript.SAMPLE_RATE, count)
+        self.assertEqual(origin + timedelta(seconds=17), boundary)
+        self.assertEqual(count, timeline.trim_through(boundary))
+        self.assertEqual(6 * transcript.SAMPLE_RATE, timeline.frame_count)
+        count, boundary = transcript.live_decode_boundary(
+            timeline, timeline.frame_count, origin + timedelta(seconds=24))
+        self.assertEqual(6 * transcript.SAMPLE_RATE, count)
+        self.assertEqual(count, timeline.trim_through(boundary))
+
+    def test_audio_writer_saves_while_decoder_is_idle_and_drains_on_close(self):
+        origin = datetime(2026, 9, 5, tzinfo=timezone.utc)
+        ready = queue.Queue()
+        persisted = threading.Event()
+        chunks = [np.full((8000, 1), level, dtype=np.float32) for level in (0.1, 0.2)]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "capture.wav"
+            def persist(chunk, started_at):
+                transcript.append_wave_audio(path, chunk)
+                persisted.set()
+            writer = transcript.AudioCaptureWriter(persist, ready)
+            try:
+                writer.submit(chunks[0], origin)
+                self.assertTrue(persisted.wait(2))
+                self.assertEqual(0.5, transcript.wave_audio_duration_seconds(path))
+                writer.submit(chunks[1], origin + timedelta(seconds=0.5))
+            finally:
+                writer.close()
+            self.assertEqual(2, ready.qsize())
+            with wave.open(str(path), "rb") as audio:
+                self.assertEqual(b"".join(transcript.pcm16_audio_bytes(c) for c in chunks),
+                                 audio.readframes(audio.getnframes()))
+
+    def test_audio_writer_reports_disk_failure_without_publishing_unsaved_audio(self):
+        ready = queue.Queue()
+        def fail(*args):
+            raise OSError("disk full")
+        writer = transcript.AudioCaptureWriter(fail, ready)
+        writer.submit(np.zeros((8000, 1)), datetime.now(timezone.utc))
+        with self.assertRaisesRegex(RuntimeError, "disk full"):
+            writer.close()
+        self.assertTrue(ready.empty())
 
     def test_lifecycle_cli_modes_are_mutually_exclusive(self):
         with patch.object(sys, "argv", ["live_whisper_demo.py", "--output", "case.txt", "--capture-only"]):
@@ -55,6 +454,7 @@ class TranscriptLogicTest(unittest.TestCase):
             "AUDIO_SILENT": ("30.0",),
             "AUDIO_RECOVERED": (),
             "TRANSCRIPT_READY": (),
+            "CAPTURE_STATE": ("paused",),
             "RECORDING_ORIGIN": ("2026-08-25T20:00:00.000Z",),
             "LIVE_MODEL_READY": ("small.en",),
             "TRANSCRIPT_UPDATED": (),
@@ -73,6 +473,30 @@ class TranscriptLogicTest(unittest.TestCase):
             transcript.format_protocol_message("AUDIO_LEVEL", "missing-state")
         with self.assertRaises(ValueError):
             transcript.format_protocol_message("NOT_A_MESSAGE")
+
+    def test_protocol_grammar_matches_java_message_enum(self):
+        """The Java enum is the other half of the contract; drift must fail here."""
+        import re
+
+        java_source = (
+            Path(__file__).resolve().parents[2]
+            / "src" / "main" / "java" / "qupath" / "ext" / "timestamp" / "TimeStamp.java"
+        )
+        enum_body = re.search(
+            r"enum TranscriptMessageType \{(.*?)\n\s*private final int",
+            java_source.read_text(encoding="utf-8"),
+            re.S,
+        )
+        self.assertIsNotNone(
+            enum_body, "TranscriptMessageType not found in TimeStamp.java"
+        )
+        # LOG(-1) and MALFORMED(-1) are Java-side sentinels, never sent on the wire.
+        java_fields = {
+            name: int(count)
+            for name, count in re.findall(r"([A-Z_]+)\((-?\d+)\)", enum_body.group(1))
+            if int(count) >= 0
+        }
+        self.assertEqual(transcript.PROTOCOL_FIELDS, java_fields)
 
     def test_utc_timing_export_converts_local_offset(self):
         local_time = datetime(
@@ -436,6 +860,29 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual([0, 1, 5], [row["segment_index"] for row in filtered_segments])
         self.assertEqual([0, 1, 5], [row["segment_index"] for row in filtered_words])
 
+    def test_final_progress_precedes_next_decode_and_preserves_tail_filter(self):
+        events = []
+        segments = [SimpleNamespace(start=i * 2, end=i * 2 + 1,
+                    text="Thank you for watching." if i == 3 else "recorded speech",
+                    words=[], avg_logprob=0, no_speech_prob=0, compression_ratio=1)
+                    for i in range(4)]
+        def decode():
+            for i, segment in enumerate(segments):
+                events.append(("decode", i))
+                yield segment
+        model = SimpleNamespace(transcribe=lambda *a, **kw: (decode(), SimpleNamespace(duration=8)))
+        with patch.object(transcript, "decode_saved_audio", return_value=np.zeros(transcript.SAMPLE_RATE * 8)):
+            lines, rows, _ = transcript.transcribe_saved_audio_with_timings(
+                model, Path("unused.wav"), "en", datetime(2026, 1, 1, tzinfo=timezone.utc), 8, 8, False,
+                progress_callback=lambda done, total: events.append(("progress", done)))
+        self.assertEqual(("progress", 0.0), events[0])
+        for i in range(3):
+            self.assertLess(events.index(("progress", i * 2 + 1)), events.index(("decode", i + 1)))
+        self.assertEqual(("progress", 8.0), events[-1])
+        self.assertEqual(3, len(lines))
+        self.assertEqual([0, 2000, 4000], [row["start_ms"] for row in rows])
+        self.assertEqual(segments[:3], list(transcript.iter_final_segments(segments, None, 8)))
+
     def test_trailing_hallucination_filter_drops_known_final_phrase_after_silence(self):
         segments = [
             SimpleNamespace(start=0.0, end=2.0, text="The margin is negative."),
@@ -567,19 +1014,79 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual([], live_segments)
         self.assertEqual(([], [], []), (final_lines, segment_rows, word_rows))
 
-    def test_final_text_refinement_preserves_matching_live_timestamps(self):
-        live = [
-            "[2026-08-12T12:00:01.000] This is a live transcript test.",
-            "[2026-08-12T12:00:04.000] Three tissue regions are present.",
+    def test_finalization_keeps_audio_times_when_live_phrases_match(self):
+        origin = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
+        cases = {
+            "same phrase at distant time": [(100, "The surgical margin is negative.")],
+            "repeated phrase at different times": [
+                (1, "The surgical margin is negative."), (100, "The surgical margin is negative.")],
+            "same prefix with revised segmentation": [
+                (100, "The surgical margin is negative. No invasion is identified.")],
+        }
+        final_segments = [
+            (2.0, 3.0, "The surgical margin is negative."),
+            (5.0, 6.0, "No invasion is identified."),
         ]
-        final = [
-            "[2026-08-12T12:00:31.000] This is a live transcript test.",
-            "[2026-08-12T12:00:34.000] Three tissue regions are present.",
-        ]
-
-        resolved = transcript.preserve_matching_live_timestamps(final, live)
-
-        self.assertEqual(live, resolved)
+        for name, live_entries in cases.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                output = root / "case_transcript.txt"
+                wave_path = root / "case_transcript_audio.wav"
+                live_text = "".join(transcript.format_transcript_line(
+                    origin + timedelta(seconds=offset), text) + "\n"
+                    for offset, text in live_entries)
+                output.write_text(live_text, encoding="utf-8")
+                transcript.initialize_incremental_wave(wave_path)
+                transcript.append_wave_audio(wave_path, np.full(
+                    (7 * transcript.SAMPLE_RATE, 1), 0.01, dtype=np.float32))
+                original_audio = hashlib.sha256(wave_path.read_bytes()).hexdigest()
+                segments = []
+                for start, end, text in final_segments:
+                    tokens = text.split()
+                    duration = (end - start) / len(tokens)
+                    words = [SimpleNamespace(
+                        start=start + index * duration,
+                        end=start + (index + 1) * duration,
+                        word=" " + token, probability=0.9)
+                        for index, token in enumerate(tokens)]
+                    segments.append(SimpleNamespace(
+                        start=start, end=end, text=text, words=words,
+                        avg_logprob=0.0, no_speech_prob=0.0, compression_ratio=1.0))
+                model = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+                    iter(segments), SimpleNamespace(duration=7.0)))
+                args = SimpleNamespace(model="large-v3", compute_type="int8_float32",
+                                       beam_size=8, best_of=8, hotwords="Gleason")
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    result = transcript.finalize_existing_capture(
+                        lambda *args, **kwargs: model, args, output, wave_path,
+                        origin, "en", True)
+                final_text = output.read_text(encoding="utf-8")
+                expected = "".join(transcript.format_transcript_line(
+                    origin + timedelta(seconds=start), text) + "\n"
+                    for start, _, text in final_segments)
+                self.assertEqual(0, result)
+                self.assertEqual(expected, final_text)
+                self.assertEqual(live_text, root.joinpath(
+                    "case_transcript_live.txt").read_text(encoding="utf-8"))
+                self.assertEqual(original_audio, hashlib.sha256(wave_path.read_bytes()).hexdigest())
+                with root.joinpath("case_transcript_segments.csv").open(newline="") as source:
+                    rows = list(csv.DictReader(source))
+                self.assertEqual([2000, 5000], [int(row["start_ms"]) for row in rows])
+                line_times = [transcript.parse_transcript_line(line)[0]
+                              for line in final_text.splitlines()]
+                self.assertEqual(line_times, [datetime.fromisoformat(
+                    row["start_utc"].replace("Z", "+00:00")) for row in rows])
+                with root.joinpath("case_transcript_words.csv").open(newline="") as source:
+                    word_rows = list(csv.DictReader(source))
+                review = json.loads(root.joinpath("case_transcript_review.json").read_text())
+                self.assertEqual(final_text, review["transcript"])
+                self.assertEqual(len(word_rows), len(review["words"]))
+                self.assertEqual([int(row["start_ms"]) for row in word_rows],
+                                 [word["start_ms"] for word in review["words"]])
+                for word in review["words"]:
+                    self.assertEqual(word["word"], final_text[word["start"]:word["end"]])
+                self.assertIn("FINALIZATION_RESULT\tfinal", stdout.getvalue())
 
     def test_final_pass_keeps_voice_activity_filtering_enabled(self):
         settings = transcript.build_transcribe_kwargs(

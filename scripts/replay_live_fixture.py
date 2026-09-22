@@ -13,6 +13,8 @@ from scripts.live_whisper_demo import (
     ENDPOINT_MAX_TURN_SECONDS,
     DEFAULT_PATHOLOGY_HOTWORDS,
     LIVE_VAD_WINDOW_SECONDS,
+    MIN_FLUSH_SECONDS,
+    FAST_INITIAL_LIVE_WINDOW_SECONDS,
     SAMPLE_RATE,
     LiveAudioConditioner,
     SpeechDecodeTimeline,
@@ -22,6 +24,8 @@ from scripts.live_whisper_demo import (
     format_transcript_line,
     group_committed_words,
     local_agreement_prompt,
+    live_decode_boundary,
+    restore_backlog_endpoint,
     should_buffer_live_audio,
 )
 from scripts.score_transcript import DEFAULT_CONCEPTS, load_concepts, score
@@ -69,6 +73,22 @@ def replay(args: argparse.Namespace) -> dict:
         args.best_of,
         hotwords=None if args.no_hotwords else DEFAULT_PATHOLOGY_HOTWORDS,
     )
+    result = replay_audio(audio, transcriber, args.step_seconds)
+    hypothesis = result["hypothesis"]
+    result["model"] = args.model
+    result["metrics"] = None if args.no_score else score(
+        args.reference.read_text(encoding="utf-8"), hypothesis, load_concepts(DEFAULT_CONCEPTS))
+    if args.output is not None:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(hypothesis + ("\n" if hypothesis else ""), encoding="utf-8")
+    return result
+
+
+def replay_audio(audio, transcriber, step_seconds: float = 1.0,
+                 speech_detector=should_buffer_live_audio, clock=time.monotonic) -> dict:
+    """Simulate microphone arrival during measured decoding, without wall-clock sleeps."""
+    if step_seconds <= 0:
+        raise ValueError("step_seconds must be positive")
     conditioner = LiveAudioConditioner()
     endpoint = SpeechEndpointState()
     origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -83,6 +103,12 @@ def replay(args: argparse.Namespace) -> dict:
     endpoint_counts = {"silence": 0, "word-gap": 0, "hard-cap": 0, "stop": 0}
     turn_durations = []
     decode_seconds = 0.0
+    simulated_seconds = 0.0
+    sample_start = 0
+    last_reported_words = 0
+    display_delays = []
+    max_buffer_seconds = 0.0
+    has_emission = False
 
     def trim_buffer(committed_through):
         nonlocal decode_buffer, buffer_start
@@ -92,30 +118,47 @@ def replay(args: argparse.Namespace) -> dict:
         decode_buffer = decode_buffer[trim_samples:]
         buffer_start = decode_timeline.start_time if decode_buffer.size else None
 
-    for sample_start in range(0, audio.shape[0], chunk_samples):
-        raw_chunk = audio[sample_start:sample_start + chunk_samples]
-        chunk_start = origin + timedelta(seconds=sample_start / SAMPLE_RATE)
-        chunk_end = chunk_start + timedelta(seconds=raw_chunk.shape[0] / SAMPLE_RATE)
-        speech_active = should_buffer_live_audio(raw_chunk)
-        endpoint.observe(chunk_start, raw_chunk.shape[0] / SAMPLE_RATE, speech_active)
-        if speech_active:
-            if buffer_start is None:
-                buffer_start = chunk_start
-            decode_timeline.append(chunk_start, raw_chunk.shape[0])
-            decode_buffer = np.concatenate((decode_buffer, conditioner.process(raw_chunk)))
+    while sample_start < audio.shape[0] or decode_buffer.size:
+        next_chunk_end = min(audio.shape[0], sample_start + chunk_samples) / SAMPLE_RATE
+        simulated_seconds = max(simulated_seconds, next_chunk_end)
+        # The microphone continues producing chunks while the previous decode runs.
+        while sample_start < audio.shape[0] and (
+                min(audio.shape[0], sample_start + chunk_samples) / SAMPLE_RATE <= simulated_seconds):
+            if decode_buffer.size and endpoint.endpoint_reason(last_word_end, include_word_gap=False) is not None:
+                break
+            raw_chunk = audio[sample_start:sample_start + chunk_samples]
+            chunk_start = origin + timedelta(seconds=sample_start / SAMPLE_RATE)
+            speech_active = speech_detector(raw_chunk)
+            endpoint.observe(chunk_start, raw_chunk.shape[0] / SAMPLE_RATE, speech_active)
+            conditioned = conditioner.process(raw_chunk)
+            if speech_active:
+                if buffer_start is None:
+                    buffer_start = chunk_start
+                decode_timeline.append(chunk_start, raw_chunk.shape[0])
+                decode_buffer = np.concatenate((decode_buffer, conditioned))
+            sample_start += raw_chunk.shape[0]
+
+        stopped = sample_start >= audio.shape[0]
+        if not decode_buffer.size:
+            continue
+        max_buffer_seconds = max(max_buffer_seconds, decode_buffer.size / SAMPLE_RATE)
+        decode_samples, chunk_end = live_decode_boundary(
+            decode_timeline, decode_buffer.size, endpoint.latest_audio_end)
 
         endpoint_reason = endpoint.endpoint_reason(last_word_end, include_word_gap=False)
-        enough_audio = decode_buffer.shape[0] >= round(SAMPLE_RATE * 0.5)
+        enough_audio = decode_buffer.shape[0] >= round(SAMPLE_RATE * (
+            MIN_FLUSH_SECONDS if has_emission else FAST_INITIAL_LIVE_WINDOW_SECONDS))
         decode_due = (
             last_decode_end is None
-            or (chunk_end - last_decode_end).total_seconds() >= args.step_seconds
+            or (chunk_end - last_decode_end).total_seconds() >= (
+                step_seconds if has_emission else FAST_INITIAL_LIVE_WINDOW_SECONDS)
         )
-        if not enough_audio or (not decode_due and endpoint_reason is None):
+        if not stopped and endpoint_reason is None and (not enough_audio or not decode_due):
             continue
 
-        window = decode_buffer[: round(SAMPLE_RATE * ENDPOINT_MAX_TURN_SECONDS)]
-        force = endpoint_reason is not None
-        started = time.monotonic()
+        window = decode_buffer[:decode_samples]
+        force = stopped or endpoint_reason is not None
+        started = clock()
         update = transcriber.accept_audio(
             window,
             buffer_start,
@@ -126,11 +169,14 @@ def replay(args: argparse.Namespace) -> dict:
             ),
             audio_timeline=decode_timeline.prefix(window.shape[0]),
         )
-        decode_seconds += time.monotonic() - started
+        elapsed = max(0.0, clock() - started)
+        decode_seconds += elapsed
+        simulated_seconds += elapsed
         last_decode_end = chunk_end
         observed_words = (*update.committed_words, *update.provisional_words)
         if observed_words:
             last_word_end = max(word[1] for word in observed_words)
+            has_emission = True
         if not force:
             endpoint_reason = endpoint.endpoint_reason(
                 last_word_end,
@@ -138,35 +184,30 @@ def replay(args: argparse.Namespace) -> dict:
             if endpoint_reason is not None:
                 update = transcriber.force_current(chunk_end)
                 force = True
+        for word in update.committed_words[last_reported_words:]:
+            display_delays.append(max(0.0, simulated_seconds - (word[1] - origin).total_seconds()))
+        last_reported_words = len(update.committed_words)
         if force:
             completed_words.extend(update.committed_words)
             completed_entries.extend(group_committed_words(update.committed_words))
             endpoint_counts[endpoint_reason or "stop"] += 1
             if endpoint.turn_started_at is not None and endpoint.latest_audio_end is not None:
                 turn_durations.append(
-                    (endpoint.latest_audio_end - endpoint.turn_started_at).total_seconds()
+                    (chunk_end - endpoint.turn_started_at).total_seconds()
                 )
-            decode_buffer = np.empty(0, dtype=np.float32)
-            decode_timeline.spans.clear()
-            buffer_start = None
+            latest_capture_end = endpoint.latest_audio_end
+            trim_buffer(chunk_end)
             last_decode_end = None
             last_word_end = None
-            endpoint.reset()
+            restore_backlog_endpoint(endpoint, decode_timeline, latest_capture_end)
             transcriber.reset_turn()
+            last_reported_words = 0
         else:
             trim_buffer(update.committed_through)
 
-    if decode_buffer.size and buffer_start is not None:
-        started = time.monotonic()
-        update = transcriber.accept_audio(
-            decode_buffer,
-            buffer_start,
-            force=True,
-            audio_timeline=decode_timeline.prefix(decode_buffer.shape[0]),
-        )
-        decode_seconds += time.monotonic() - started
-        completed_words.extend(update.committed_words)
-        completed_entries.extend(group_committed_words(update.committed_words))
+    if transcriber.agreement.committed_words:
+        completed_words.extend(transcriber.agreement.committed_words)
+        completed_entries.extend(group_committed_words(transcriber.agreement.committed_words))
         endpoint_counts["stop"] += 1
 
     transcript_lines = [
@@ -174,25 +215,17 @@ def replay(args: argparse.Namespace) -> dict:
         for timestamp, text in completed_entries
     ]
     hypothesis = "\n".join(transcript_lines)
-    metrics = None
-    if not args.no_score:
-        metrics = score(
-            args.reference.read_text(encoding="utf-8"),
-            hypothesis,
-            load_concepts(DEFAULT_CONCEPTS),
-        )
-    if args.output is not None:
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(hypothesis + ("\n" if hypothesis else ""), encoding="utf-8")
     return {
-        "model": args.model,
         "audio_seconds": audio.shape[0] / SAMPLE_RATE,
         "decode_seconds": decode_seconds,
+        "simulated_finish_seconds": simulated_seconds,
+        "max_buffer_seconds": max_buffer_seconds,
+        "display_delay_p50_seconds": float(np.percentile(display_delays, 50)) if display_delays else None,
+        "display_delay_p95_seconds": float(np.percentile(display_delays, 95)) if display_delays else None,
         "committed_words": len(completed_words),
         "turns": sum(endpoint_counts.values()),
         "endpoint_reasons": endpoint_counts,
         "max_turn_seconds": max(turn_durations, default=0.0),
-        "metrics": metrics,
         "hypothesis": hypothesis,
     }
 
@@ -205,6 +238,8 @@ def main() -> int:
         return 0
     print(f"Model           : {result['model']}")
     print(f"Audio/decode    : {result['audio_seconds']:.1f}s / {result['decode_seconds']:.1f}s")
+    print(f"Finish/backlog  : {result['simulated_finish_seconds']:.1f}s / {result['max_buffer_seconds']:.1f}s buffered")
+    print(f"Display p50/p95 : {result['display_delay_p50_seconds']} / {result['display_delay_p95_seconds']} seconds")
     print(f"Committed words : {result['committed_words']}")
     print(f"Turns           : {result['turns']} {result['endpoint_reasons']}")
     print(f"Longest turn    : {result['max_turn_seconds']:.1f}s")

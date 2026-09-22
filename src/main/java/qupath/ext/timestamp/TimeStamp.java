@@ -1,5 +1,9 @@
 package qupath.ext.timestamp;
 
+import com.google.gson.JsonParser;
+import javax.sound.sampled.AudioSystem;
+import javax.sound.sampled.Clip;
+import javax.sound.sampled.LineEvent;
 import javafx.animation.Animation;
 import javafx.animation.KeyFrame;
 import javafx.animation.PauseTransition;
@@ -32,6 +36,7 @@ import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.Tooltip;
+import javafx.scene.control.ToggleButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.ScrollEvent;
 import javafx.scene.layout.BorderPane;
@@ -123,7 +128,6 @@ public class TimeStamp implements QuPathExtension {
     private static final double DEFAULT_OVERLAY_FONT_SIZE = 14.0;
     private static final double LEGACY_OVERLAY_FONT_SIZE = 24.0;
     private static final long OVERLAY_EVENT_VISIBLE_MILLIS = 4_000L;
-    private static final int MAX_LIVE_MONITOR_EVENTS = 200;
     private static final int TRANSCRIPT_LOOP_NGRAM_SIZE = 3;
     private static final int TRANSCRIPT_LOOP_MIN_WORDS = 12;
     private static final double TRANSCRIPT_LOOP_MAX_SHARE = 0.30;
@@ -216,6 +220,7 @@ public class TimeStamp implements QuPathExtension {
         AUDIO_SILENT(1),
         AUDIO_RECOVERED(0),
         TRANSCRIPT_READY(0),
+        CAPTURE_STATE(1),
         RECORDING_ORIGIN(1),
         LIVE_MODEL_READY(1),
         TRANSCRIPT_UPDATED(0),
@@ -251,6 +256,11 @@ public class TimeStamp implements QuPathExtension {
         }
         try {
             switch (type) {
+                case CAPTURE_STATE -> {
+                    if (!List.of("paused", "recording").contains(fields.getFirst())) {
+                        throw new IllegalArgumentException("Unknown capture state");
+                    }
+                }
                 case AUDIO_LEVEL, AUDIO_CHECK_RESULT, AUDIO_CLIPPING ->
                         Double.parseDouble(fields.get(0));
                 case AUDIO_SILENT -> Double.parseDouble(fields.get(0));
@@ -307,6 +317,20 @@ public class TimeStamp implements QuPathExtension {
     
     private boolean isInstalled = false;
     private static QuPathGUI qupathGui;
+    private static boolean captureControlPending;
+    private static long captureControlRequestedNano;
+    private static final long CAPTURE_CONTROL_WARNING_SECONDS = 15;
+    private record ReviewEdit(String text, List<ReviewWord> words) { }
+    private static final java.util.Deque<ReviewEdit> reviewUndo = new java.util.ArrayDeque<>();
+    private static final java.util.Deque<ReviewEdit> reviewRedo = new java.util.ArrayDeque<>();
+    private static Button reviewUndoButton;
+    private static Button reviewRedoButton;
+    private static Button comparePreviousReviewButton;
+    private static Label previousReviewLabel;
+    private static ReviewRevisionStore.Revision previousReviewRevision;
+    private static boolean previousReviewReadFailed;
+    private static final Object reviewCheckpointLock = new Object();
+    private static volatile long reviewCheckpointGeneration;
     private static final String TIMESTAMP_CATEGORY = "TimeStamp";
     
     // Event logs to store timestamped events
@@ -326,6 +350,29 @@ public class TimeStamp implements QuPathExtension {
     private static final List<Text> provisionalCaptionNodes = new ArrayList<>();
     private static String captionCommittedContents = "";
     private static String captionPartialContents = "";
+    private static List<ReviewWord> transcriptReviewWords = List.of();
+    private static String reviewDisplayContents = "";
+    private static String reviewLoadedDocument = "";
+    private static String reviewSourceContents = "";
+    private static Label transcriptReviewLabel;
+    private static Label recordingContextLabel;
+    private static Label transcriptModeLabel;
+    private static Button nextUncertainButton;
+    private static Button replayWordButton;
+    private static TextField wordCorrectionField;
+    private static Button applyWordCorrectionButton;
+    private static Button markWordCheckedButton;
+    private static Button editTranscriptButton;
+    private static HBox wordCorrectionRow;
+    private static ToggleButton eventsToggleButton;
+    private static VBox eventsContentPane;
+    private static final String CAPTION_SPAN_KEY = "timestamp-source-span";
+    private static ReviewWord selectedReviewWord;
+    private static volatile Clip reviewAudioClip;
+    private static final java.util.concurrent.atomic.AtomicLong reviewPlaybackGeneration =
+            new java.util.concurrent.atomic.AtomicLong();
+    private static final long REVIEW_AUDIO_CONTEXT_MS = 600;
+    private static final long REVIEW_AUDIO_MAX_MS = 6000;
     private static Button recordingPrimaryButton;
     private static Button recordingDoneButton;
     private static Button recordMoreButton;
@@ -549,6 +596,13 @@ public class TimeStamp implements QuPathExtension {
                 newViewer.getCustomOverlayLayers().add(overlay);
                 installEventListeners(newViewer);
             }
+            ViewBounds activatedView = newViewer == null ? null : captureViewBounds(newViewer);
+            LocalDateTime activatedAt = LocalDateTime.now();
+            boolean recording = recordEvents.get();
+            Platform.runLater(() -> {
+                updateRecordingContext();
+                if (recording && activatedView != null) logEventAt(activatedAt, "Image Activated", "Active viewer changed", activatedView, null);
+            });
         });
     }
 
@@ -590,7 +644,10 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static Path getWorkingRecordingRoot() {
-        return Paths.get(System.getProperty("java.io.tmpdir"), "qupath-timestamp-recordings");
+        String configured = PathPrefs.userPathProperty().get();
+        Path userDirectory = configured == null || configured.isBlank()
+                ? PathPrefs.getDefaultQuPathUserDirectory() : Paths.get(configured);
+        return userDirectory.resolve("timestamp").resolve("recordings");
     }
 
     private static Path getRecoverySnapshotPath(File workingDirectory) {
@@ -605,12 +662,23 @@ public class TimeStamp implements QuPathExtension {
                 new ArrayList<>(eventLog), new ArrayList<>(mouseMoveLog),
                 recordingStartedInstant, nextEventSequence);
         File workingDirectory = transcriptSessionDir;
+        String reviewCheckpoint = liveTranscriptTextArea != null && canReviewAudio()
+                ? ReviewRecovery.encode(reviewSourceContents,
+                        reviewedTranscriptJson(liveTranscriptTextArea.getText(), transcriptReviewWords)) : null;
+        long reviewGeneration = reviewCheckpointGeneration;
         recoveryCheckpointInProgress = true;
         Thread checkpointThread = new Thread(() -> {
             Path target = getRecoverySnapshotPath(workingDirectory);
             Path temporary = target.resolveSibling(target.getFileName() + ".tmp");
             try {
                 Files.createDirectories(target.getParent());
+                if (reviewCheckpoint != null) {
+                    synchronized (reviewCheckpointLock) {
+                        if (reviewGeneration == reviewCheckpointGeneration) {
+                            atomicWriteString(workingDirectory.toPath().resolve(".timestamp-review.json"), reviewCheckpoint);
+                        }
+                    }
+                }
                 try (ObjectOutputStream output = new ObjectOutputStream(Files.newOutputStream(
                         temporary, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING))) {
                     output.writeObject(snapshot);
@@ -640,7 +708,7 @@ public class TimeStamp implements QuPathExtension {
             if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
                 event.consume();
                 Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                        "Choose Done and wait for finalization before closing QuPath.");
+                        "Choose Finish & review and wait for finalization before closing QuPath.");
                 return;
             }
             if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
@@ -691,7 +759,13 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static File findLatestRecoverableWorkingSession() {
-        Path root = getWorkingRecordingRoot();
+        File current = findLatestRecoverableWorkingSession(getWorkingRecordingRoot());
+        // Discover existing recordings without moving or deleting the old temporary data.
+        return current != null ? current : findLatestRecoverableWorkingSession(
+                Paths.get(System.getProperty("java.io.tmpdir"), "qupath-timestamp-recordings"));
+    }
+
+    private static File findLatestRecoverableWorkingSession(Path root) {
         if (!Files.isDirectory(root)) {
             return null;
         }
@@ -752,6 +826,23 @@ public class TimeStamp implements QuPathExtension {
         transcriptLastModified = -1L;
         transcriptLastSize = -1L;
         transcriptLastContents = "";
+        loadPreviousReviewRevision();
+        refreshTranscriptContents(true);
+        Path reviewPath = workingDirectory.toPath().resolve(".timestamp-review.json");
+        try {
+            if (Files.isRegularFile(reviewPath)) {
+                String review = ReviewRecovery.matchingReview(Files.readString(reviewPath), transcriptLastContents);
+                if (review != null) {
+                    String reviewedText = JsonParser.parseString(review).getAsJsonObject().get("transcript").getAsString();
+                    liveTranscriptTextArea.setText(reviewedText);
+                    transcriptReviewWords = parseReviewWords(review, reviewedText);
+                    reviewDisplayContents = reviewedText;
+                    selectedReviewWord = null;
+                }
+            }
+        } catch (IOException exception) {
+            logger.warn("Could not restore review checkpoint; original transcript is preserved", exception);
+        }
         updateLiveEventMonitorControls();
         refreshLiveEventMonitor();
         if (transcriptStatusLabel != null) {
@@ -953,6 +1044,13 @@ public class TimeStamp implements QuPathExtension {
             if (newData != null) {
                 newData.getHierarchy().addListener(hierarchyListener);
             }
+            ViewBounds changedView = captureViewBounds(viewer);
+            LocalDateTime changedAt = LocalDateTime.now();
+            boolean recording = recordEvents.get();
+            Platform.runLater(() -> {
+                updateRecordingContext();
+                if (recording) logEventAt(changedAt, "Image Changed", newData == null ? "Image closed" : "Image opened", changedView, null);
+            });
         });
     }
     
@@ -1026,7 +1124,7 @@ public class TimeStamp implements QuPathExtension {
                 viewer.getZPosition(),
                 viewer.getTPosition(),
                 downsample,
-                viewer.getRotation());
+                viewer.getRotation(), RecordedImage.from(qupathGui, viewer));
     }
 
     /**
@@ -1058,11 +1156,9 @@ public class TimeStamp implements QuPathExtension {
         recordingSessionDirty = true;
 
         if ("MouseMove".equals(eventType)) {
-            logger.debug("Mouse event: {} - {}", formatter.format(timestamp), details);
+            logger.debug("Mouse event captured: sequence {}", entry.sequence);
         } else if (logger.isInfoEnabled()) {
-            logger.info("Event: {} - {} - {} - view:[x={}, y={}, w={}, h={}, z={}, t={}]",
-                    formatter.format(timestamp), eventType, details,
-                    view.x, view.y, view.width, view.height, view.z, view.t);
+            logger.info("Event captured: {} (sequence {})", eventType, entry.sequence);
         }
     }
 
@@ -1104,6 +1200,18 @@ public class TimeStamp implements QuPathExtension {
         liveTranscriptTextArea.setStyle("-fx-font-family: 'System'; -fx-font-size: 13px;");
         liveTranscriptTextArea.setPromptText("Click Start Recording to begin live transcription.");
         liveTranscriptTextArea.textProperty().addListener((obs, oldText, newText) -> {
+            if (oldText.equals(reviewDisplayContents)) {
+                transcriptReviewWords = rebaseReviewWords(transcriptReviewWords, oldText, newText);
+                reviewDisplayContents = newText;
+                if (selectedReviewWord != null) {
+                    long selectedStartMs = selectedReviewWord.startMs();
+                    selectedReviewWord = transcriptReviewWords.stream()
+                            .filter(word -> word.startMs() == selectedStartMs).findFirst().orElse(null);
+                }
+                updateWordReviewControls();
+            }
+            updateCaptionCommitted(newText);
+            styleCaptionConfidence();
             if (recordingWorkflowState == RecordingWorkflowState.SAVED &&
                     !String.valueOf(oldText).equals(String.valueOf(newText))) {
                 recordingSessionDirty = true;
@@ -1111,11 +1219,19 @@ public class TimeStamp implements QuPathExtension {
                 updateLiveEventMonitorControls();
             }
         });
-        liveTranscriptTextArea.setOnMouseClicked(event ->
-                Platform.runLater(TimeStamp::selectEventsForTranscriptCaret));
+        liveTranscriptTextArea.setOnMouseClicked(event -> Platform.runLater(() -> {
+            selectEventsForTranscriptCaret();
+            int caret = liveTranscriptTextArea.getCaretPosition();
+            selectedReviewWord = transcriptReviewWords.stream()
+                    .filter(word -> word.start() <= caret && word.end() >= caret).findFirst().orElse(null);
+            updateWordReviewControls();
+        }));
         liveCaptionFlow = new TextFlow();
-        liveCaptionFlow.setLineSpacing(3);
-        liveCaptionFlow.setStyle("-fx-font-family: 'System'; -fx-font-size: 13px;");
+        liveCaptionFlow.setLineSpacing(6);
+        liveCaptionFlow.setStyle("-fx-font-family: 'System'; -fx-font-size: 15px;");
+        liveCaptionFlow.setPadding(new Insets(12));
+        qupath.lib.gui.prefs.QuPathStyleManager.selectedStyleProperty().addListener(
+                (obs, previous, current) -> Platform.runLater(TimeStamp::styleCaptionConfidence));
         liveCaptionScrollPane = new ScrollPane(liveCaptionFlow);
         liveCaptionScrollPane.setFitToWidth(true);
         liveCaptionScrollPane.setHbarPolicy(ScrollPane.ScrollBarPolicy.NEVER);
@@ -1123,13 +1239,22 @@ public class TimeStamp implements QuPathExtension {
         liveCaptionScrollPane.setVisible(false);
         liveCaptionScrollPane.setManaged(false);
         transcriptContentStack = new StackPane(liveTranscriptTextArea, liveCaptionScrollPane);
+        Label emptyCaptionLabel = new Label();
+        emptyCaptionLabel.textProperty().bind(liveTranscriptTextArea.promptTextProperty());
+        emptyCaptionLabel.visibleProperty().bind(javafx.beans.binding.Bindings.isEmpty(liveCaptionFlow.getChildren()));
+        emptyCaptionLabel.setWrapText(true);
+        emptyCaptionLabel.setMouseTransparent(true);
+        emptyCaptionLabel.setStyle("-fx-text-fill: -fx-text-background-color; -fx-opacity: 0.65;");
+        StackPane.setAlignment(emptyCaptionLabel, javafx.geometry.Pos.TOP_LEFT);
+        StackPane.setMargin(emptyCaptionLabel, new Insets(16));
+        transcriptContentStack.getChildren().add(emptyCaptionLabel);
 
         recordingPrimaryButton = new Button("Start Recording");
         recordingPrimaryButton.setOnAction(e -> handleRecordingPrimaryAction());
         configureMonitorButton(recordingPrimaryButton);
         recordingPrimaryButton.setMaxWidth(Double.MAX_VALUE);
 
-        recordingDoneButton = new Button("⏹ Done");
+        recordingDoneButton = new Button("Finish & review");
         recordingDoneButton.setOnAction(e -> finishRecordingSession());
         configureMonitorButton(recordingDoneButton);
         recordingDoneButton.setTooltip(new Tooltip(
@@ -1178,7 +1303,7 @@ public class TimeStamp implements QuPathExtension {
         Label titleLabel = new Label("TimeStamp Recorder");
         titleLabel.setStyle("-fx-font-size: 15px; -fx-font-weight: bold;");
         Label versionLabel = new Label("v" + extensionVersion());
-        versionLabel.setStyle("-fx-text-fill: #666666; -fx-font-size: 11px;");
+        versionLabel.setStyle("-fx-opacity: 0.85; -fx-font-size: 11px;");
         versionLabel.setTooltip(new Tooltip(
                 "TimeStamp extension version " + extensionVersion() + " • QuPath " +
                         EXTENSION_QUPATH_VERSION));
@@ -1194,48 +1319,101 @@ public class TimeStamp implements QuPathExtension {
         HBox.setHgrow(transcriptAudioLevelBar, Priority.ALWAYS);
 
         transcriptSecondaryControls = new FlowPane(8, 4,
-                recordingDoneButton, recordMoreButton,
+                recordMoreButton,
                 transcriptSettingsButton, transcriptMoreButton);
         transcriptSecondaryControls.setPrefWrapLength(300);
 
         VBox statusPane = new VBox(4, statusRow, transcriptMicrophoneRow,
                 transcriptFinalizationProgressLabel, transcriptFinalizationProgressBar);
-        VBox header = new VBox(7, titleRow, statusPane,
-                recordingPrimaryButton, transcriptSecondaryControls);
+        HBox recordingActions = new HBox(8, recordingPrimaryButton, recordingDoneButton);
+        HBox.setHgrow(recordingPrimaryButton, Priority.ALWAYS);
+        HBox.setHgrow(recordingDoneButton, Priority.ALWAYS);
+        recordingDoneButton.setMaxWidth(Double.MAX_VALUE);
+        recordingPrimaryButton.setMinHeight(36);
+        recordingDoneButton.setMinHeight(36);
+        Label captureDisclosure = new Label("Start records microphone audio and QuPath actions, including cursor movement. Stored locally.");
+        captureDisclosure.setWrapText(true);
+        captureDisclosure.setStyle("-fx-font-size: 11px;");
+        recordingContextLabel = new Label();
+        recordingContextLabel.setWrapText(true);
+        recordingContextLabel.setStyle("-fx-font-size: 11px;");
+        captureDisclosure.setTooltip(new Tooltip("Audio and QuPath actions, including cursor movement, are stored locally."));
+        captureDisclosure.setText("Microphone + image actions · stored locally");
+        VBox header = new VBox(5, titleRow, statusPane,
+                recordingActions, recordingContextLabel, transcriptSecondaryControls, captureDisclosure);
         header.setPadding(new Insets(0, 0, 8, 0));
 
         transcriptHelpLabel = new Label(
-                "Live text is a preview. Choose Done to create the final transcript before saving.");
+                "Live text is a preview. Choose Finish & review to create the final transcript before saving.");
         transcriptHelpLabel.setWrapText(true);
-        transcriptHelpLabel.setStyle("-fx-text-fill: #667085; -fx-font-size: 11px;");
+        transcriptHelpLabel.setStyle("-fx-text-fill: -fx-text-base-color; -fx-font-size: 12px;");
         transcriptPartialLabel = new Label();
         transcriptPartialLabel.setVisible(false);
         transcriptPartialLabel.setManaged(false);
         Label transcriptLabel = new Label("Transcript");
         transcriptLabel.setStyle("-fx-font-weight: bold;");
+        eventsToggleButton = new ToggleButton("Events · 0");
+        eventsToggleButton.setOnAction(event -> toggleEventsPane());
+        eventsToggleButton.setTooltip(new Tooltip("Expand all actions or return to the most recent. Hover a row for coordinates."));
+        Region transcriptHeaderSpacer = new Region();
+        HBox.setHgrow(transcriptHeaderSpacer, Priority.ALWAYS);
+        transcriptModeLabel = new Label();
+        transcriptModeLabel.setStyle("-fx-font-size: 11px;");
+        HBox transcriptHeader = new HBox(6, transcriptLabel, transcriptModeLabel, transcriptHeaderSpacer, eventsToggleButton);
+        transcriptReviewLabel = new Label("Amber words need review; confidence is estimated.");
+        transcriptReviewLabel.setWrapText(true);
+        nextUncertainButton = new Button("Next uncertain");
+        nextUncertainButton.setOnAction(event -> selectNextUncertainWord());
+        replayWordButton = new Button("Replay");
+        replayWordButton.setOnAction(event -> replaySelectedWord());
+        markWordCheckedButton = new Button("Mark checked");
+        markWordCheckedButton.setOnAction(event -> markSelectedWordChecked());
+        editTranscriptButton = new Button("Edit transcript…");
+        editTranscriptButton.setOnAction(event -> editWholeTranscript());
+        wordCorrectionField = new TextField();
+        wordCorrectionField.setPromptText("Correct selected word");
+        wordCorrectionField.setOnAction(event -> applySelectedWordCorrection());
+        applyWordCorrectionButton = new Button("Apply correction");
+        applyWordCorrectionButton.setOnAction(event -> applySelectedWordCorrection());
+        wordCorrectionRow = new HBox(6, wordCorrectionField, applyWordCorrectionButton);
+        HBox.setHgrow(wordCorrectionField, Priority.ALWAYS);
+        reviewUndoButton = new Button("Undo");
+        reviewRedoButton = new Button("Redo");
+        reviewUndoButton.setOnAction(event -> restoreReviewEdit(reviewUndo, reviewRedo));
+        reviewRedoButton.setOnAction(event -> restoreReviewEdit(reviewRedo, reviewUndo));
+        comparePreviousReviewButton = new Button("Compare earlier review…");
+        comparePreviousReviewButton.setOnAction(event -> comparePreviousReview());
+        previousReviewLabel = new Label();
+        previousReviewLabel.setWrapText(true);
+        FlowPane wordReviewActions = new FlowPane(6, 4, nextUncertainButton, replayWordButton,
+                markWordCheckedButton, editTranscriptButton, reviewUndoButton, reviewRedoButton,
+                comparePreviousReviewButton);
         VBox transcriptPane = new VBox(
-                5, transcriptLabel, transcriptHelpLabel, transcriptContentStack);
+                8, transcriptHeader, transcriptHelpLabel, previousReviewLabel, transcriptReviewLabel,
+                wordReviewActions, wordCorrectionRow, transcriptContentStack);
         transcriptPane.setPadding(new Insets(4, 0, 4, 0));
         VBox.setVgrow(transcriptContentStack, Priority.ALWAYS);
 
         liveEventTable = createEventTable();
-        Label eventLabel = new Label("Events");
+        Label eventLabel = new Label("Recorded actions");
         eventLabel.setStyle("-fx-font-weight: bold;");
         liveEventCountLabel = new Label("0");
-        liveEventCountLabel.setStyle("-fx-text-fill: #667085; -fx-font-size: 11px;");
+        liveEventCountLabel.setStyle("-fx-font-size: 11px;");
         Region eventHeaderSpacer = new Region();
         HBox.setHgrow(eventHeaderSpacer, Priority.ALWAYS);
         HBox eventHeader = new HBox(6, eventLabel, eventHeaderSpacer, liveEventCountLabel);
         VBox eventPane = new VBox(5, eventHeader, liveEventTable);
+        eventsContentPane = eventPane;
         eventPane.setPadding(new Insets(4, 0, 0, 0));
         VBox.setVgrow(liveEventTable, Priority.ALWAYS);
+        eventPane.setMinHeight(110);
 
         transcriptEventSplitPane = new SplitPane(transcriptPane, eventPane);
         transcriptEventSplitPane.setOrientation(Orientation.VERTICAL);
         transcriptEventSplitPane.setDividerPositions(clampPanelDivider(panelDividerPosition.get()));
         transcriptEventSplitPane.getDividers().get(0).positionProperty().addListener(
                 (obs, oldPosition, newPosition) -> {
-                    if (!updatingPanelDivider) {
+                    if (!updatingPanelDivider && transcriptEventSplitPane.getItems().size() > 1) {
                         panelDividerPosition.set(clampPanelDivider(newPosition.doubleValue()));
                     }
                 });
@@ -1245,6 +1423,21 @@ public class TimeStamp implements QuPathExtension {
         root.setPadding(new Insets(8));
         root.widthProperty().addListener((obs, oldWidth, newWidth) ->
                 updateTranscriptEventSplitOrientation(newWidth.doubleValue()));
+        root.addEventFilter(javafx.scene.input.KeyEvent.KEY_PRESSED, event -> {
+            if (!event.isControlDown() || !event.isAltDown()) return;
+            if (event.getCode() == javafx.scene.input.KeyCode.R &&
+                    !recordingPrimaryButton.isDisabled() &&
+                    (recordingWorkflowState == RecordingWorkflowState.READY ||
+                     recordingWorkflowState == RecordingWorkflowState.RECORDING ||
+                     recordingWorkflowState == RecordingWorkflowState.PAUSED)) {
+                recordingPrimaryButton.fire();
+                event.consume();
+            } else if (event.getCode() == javafx.scene.input.KeyCode.D &&
+                    recordingDoneButton.isVisible() && !recordingDoneButton.isDisabled()) {
+                recordingDoneButton.fire();
+                event.consume();
+            }
+        });
 
         lastPanelWorkflowState = null;
         updateLiveEventMonitorControls();
@@ -1252,6 +1445,11 @@ public class TimeStamp implements QuPathExtension {
         refreshLiveEventMonitorContents();
         ensureTranscriptRefreshStarted();
         return root;
+    }
+
+    private static void toggleEventsPane() {
+        setPanelDividerPosition(eventsToggleButton.isSelected() ? 0.55 : 0.75);
+        refreshEventMonitorContents();
     }
 
     private static TableView<EventEntry> createEventTable() {
@@ -1280,6 +1478,15 @@ public class TimeStamp implements QuPathExtension {
         table.getColumns().add(typeColumn);
         table.getColumns().add(detailsColumn);
         table.setColumnResizePolicy(TableView.CONSTRAINED_RESIZE_POLICY_FLEX_LAST_COLUMN);
+        table.setRowFactory(view -> new javafx.scene.control.TableRow<>() {
+            @Override
+            protected void updateItem(EventEntry entry, boolean empty) {
+                super.updateItem(entry, empty);
+                setTooltip(empty || entry == null ? null : new Tooltip(
+                        (entry.source().view.image == null ? "Image unavailable" : entry.source().view.image.name()) +
+                        "\n" + entry.source().details));
+            }
+        });
         table.getSelectionModel().selectedItemProperty().addListener((obs, oldEntry, newEntry) -> {
             if (!synchronizingTranscriptAndEvents && newEntry != null) {
                 selectTranscriptForEvent(newEntry);
@@ -1308,7 +1515,8 @@ public class TimeStamp implements QuPathExtension {
     }
 
     static List<String> transcriptLifecycleArguments(boolean finalizeExisting) {
-        return List.of(finalizeExisting ? "--finalize-existing" : "--capture-only");
+        return finalizeExisting ? List.of("--finalize-existing")
+                : List.of("--capture-only", "--interactive-control");
     }
 
     static boolean usesHorizontalPanelLayout(double width) {
@@ -1466,6 +1674,7 @@ public class TimeStamp implements QuPathExtension {
         synchronizingTranscriptAndEvents = true;
         try {
             liveTranscriptTextArea.selectRange(window.start(), window.end());
+            scrollCaptionToOffset(window.start());
         } finally {
             synchronizingTranscriptAndEvents = false;
         }
@@ -1541,7 +1750,8 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
-        int maxEvents = Math.min(MAX_LIVE_MONITOR_EVENTS, eventLog.size());
+        int maxEvents = eventsToggleButton != null && eventsToggleButton.isSelected()
+                ? eventLog.size() : Math.min(5, eventLog.size());
         int startIndex = Math.max(0, eventLog.size() - maxEvents);
         long selectedSequence = liveEventTable.getSelectionModel().getSelectedItem() == null
                 ? -1L
@@ -1550,7 +1760,8 @@ public class TimeStamp implements QuPathExtension {
         for (int i = startIndex; i < eventLog.size(); i++) {
             EventRecord entry = eventLog.get(i);
             entries.add(new EventEntry(entry,
-                    formatEventElapsed(derivedElapsedMillis(entry)), entry.eventType, entry.details));
+                    formatEventElapsed(derivedElapsedMillis(entry)), readableEventType(entry.eventType),
+                    entry.view.image == null ? "Audio-only / image unavailable" : entry.view.image.name()));
         }
         liveEventTable.getItems().setAll(entries);
         if (selectedSequence >= 0) {
@@ -1565,6 +1776,9 @@ public class TimeStamp implements QuPathExtension {
         }
         if (liveEventCountLabel != null) {
             liveEventCountLabel.setText(Integer.toString(eventLog.size()));
+        }
+        if (eventsToggleButton != null) {
+            eventsToggleButton.setText(eventsToggleButton.isSelected() ? "Recent actions" : "Actions · " + eventLog.size());
         }
         updateLiveEventMonitorControls();
     }
@@ -1581,8 +1795,8 @@ public class TimeStamp implements QuPathExtension {
             recordingPrimaryButton.setText(switch (recordingWorkflowState) {
                 case READY, SAVED -> "Start Recording";
                 case STARTING -> "Starting microphone…";
-                case RECORDING -> "⏸ Pause";
-                case PAUSED -> "● Resume";
+                case RECORDING -> captureControlPending ? "Pausing…" : "⏸ Pause";
+                case PAUSED -> captureControlPending ? "Resuming…" : "● Resume";
                 case FINALIZING -> "Creating final transcript…";
                 case UNSAVED_REVIEW, ERROR -> "Save Session";
                 case SAVING -> "Saving session…";
@@ -1592,8 +1806,8 @@ public class TimeStamp implements QuPathExtension {
                 case UNSAVED_REVIEW, ERROR -> transcriptSessionDir == null;
                 case READY, SAVED -> transcriptBusy;
                 case STARTING -> transcriptBusy;
-                case RECORDING -> transcriptStopInProgress;
-                case PAUSED -> transcriptBusy;
+                case RECORDING -> transcriptStopInProgress || captureControlPending;
+                case PAUSED -> captureControlPending || transcriptStopInProgress;
             };
             recordingPrimaryButton.setDisable(primaryUnavailable);
             recordingPrimaryButton.setTooltip(new Tooltip(switch (recordingWorkflowState) {
@@ -1608,6 +1822,17 @@ public class TimeStamp implements QuPathExtension {
             }));
         }
         updateRecordingStatusLine();
+        updateRecordingContext();
+        if (transcriptModeLabel != null) {
+            transcriptModeLabel.setText(switch (recordingWorkflowState) {
+                case RECORDING, PAUSED, STARTING -> "Live preview";
+                case UNSAVED_REVIEW -> "Review";
+                case SAVED -> "Saved";
+                case FINALIZING -> "Processing";
+                case ERROR -> "Needs attention";
+                default -> "";
+            });
+        }
         if (liveTranscriptTextArea != null) {
             liveTranscriptTextArea.setEditable(!recording && !transcriptStopInProgress);
             if (liveTranscriptTextArea.getText() == null || liveTranscriptTextArea.getText().isBlank()) {
@@ -1615,18 +1840,19 @@ public class TimeStamp implements QuPathExtension {
             }
         }
         updateCaptionViewMode();
+        updateWordReviewControls();
         if (transcriptHelpLabel != null) {
             transcriptHelpLabel.setText(switch (recordingWorkflowState) {
                 case READY, STARTING ->
-                        "The transcript will appear here as soon as recording begins.";
+                        "Choose your microphone in Settings, then start recording.";
                 case RECORDING ->
-                        "Live text is a preview. Pause is reversible; Done creates the final transcript.";
+                        "Text follows automatically. Finish & review creates the final transcript.";
                 case PAUSED ->
-                        "This take is paused. Resume it, or choose Done to create the final transcript.";
-                case FINALIZING, SAVING ->
-                        "Please wait while the complete saved audio is processed. Your live text remains protected.";
+                        "Resume to continue. Finish & review enables word correction and replay.";
+                case FINALIZING -> "Creating the final transcript from saved audio.";
+                case SAVING -> "Copying and verifying your session files.";
                 case UNSAVED_REVIEW ->
-                        "Review and correct the final transcript if needed, then choose Save Session.";
+                        "Select a word to replay or correct it. Amber words need review.";
                 case SAVED ->
                         "This transcript has been saved with its timestamp events and session manifest.";
                 case ERROR ->
@@ -1708,19 +1934,38 @@ public class TimeStamp implements QuPathExtension {
         }
         if (recordingWorkflowState != lastPanelWorkflowState) {
             if (recordingWorkflowState == RecordingWorkflowState.RECORDING) {
+                followCaptionTail();
                 setPanelDividerPosition(RECORDING_PANEL_DIVIDER_POSITION);
-            } else if (recordingWorkflowState == RecordingWorkflowState.PAUSED ||
-                    recordingWorkflowState == RecordingWorkflowState.UNSAVED_REVIEW) {
-                setPanelDividerPosition(DEFAULT_PANEL_DIVIDER_POSITION);
             }
             lastPanelWorkflowState = recordingWorkflowState;
         }
         updateDevelopmentReloadGuard();
     }
 
+    static String readableEventType(String type) {
+        return switch (type) {
+            case "Pan Start" -> "Moving view";
+            case "Pan End" -> "Moved view";
+            case "Click" -> "Clicked";
+            case "Annotate" -> "Added annotation";
+            default -> type;
+        };
+    }
+
+    private static void updateRecordingContext() {
+        if (recordingContextLabel == null) return;
+        RecordedImage image = RecordedImage.from(qupathGui, qupathGui == null ? null : qupathGui.getViewer());
+        recordingContextLabel.setText((image == null ? "No slide open · audio-only" : image.name()) +
+                "\nMic: " + displayTranscriptDevice(transcriptDevice.get()));
+    }
+
     private static void updateRecordingStatusLine() {
         if (recordingStatusLabel == null || recordingStateDotLabel == null) {
             return;
+        }
+        if (captureControlPending && System.nanoTime() - captureControlRequestedNano >
+                java.util.concurrent.TimeUnit.SECONDS.toNanos(CAPTURE_CONTROL_WARNING_SECONDS)) {
+            transcriptStatusLabel.setText("Warning: recorder has not acknowledged the command. Use Finish & review to preserve this session.");
         }
         String stateText = switch (recordingWorkflowState) {
             case READY -> "Ready";
@@ -1797,6 +2042,11 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void startRecordingSession() {
+        if (recordingWorkflowState == RecordingWorkflowState.PAUSED &&
+                transcriptProcess != null && transcriptProcess.isAlive() && !transcriptStopInProgress) {
+            requestCaptureCommand("RESUME");
+            return;
+        }
         if (isTranscriptProcessBusy()) {
             if (transcriptStatusLabel != null) {
                 transcriptStatusLabel.setText(transcriptStopInProgress
@@ -1806,6 +2056,8 @@ public class TimeStamp implements QuPathExtension {
             updateLiveEventMonitorControls();
             return;
         }
+
+        if (!preserveReviewBeforeRecording()) return;
 
         if (recordingSessionSaved && recordingSessionDirty) {
             javafx.scene.control.ButtonType choice = Dialogs.showYesNoCancelDialog(
@@ -1858,8 +2110,17 @@ public class TimeStamp implements QuPathExtension {
             return true;
         }
         try {
-            Path workingRoot = Paths.get(System.getProperty("java.io.tmpdir"),
-                    "qupath-timestamp-recordings");
+            Path workingRoot = getWorkingRecordingRoot();
+            Files.createDirectories(workingRoot);
+            try {
+                Files.setPosixFilePermissions(workingRoot,
+                        java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+            } catch (UnsupportedOperationException ignored) {
+                // Windows uses the user's directory ACL; POSIX permissions do not apply.
+            }
+            if (Files.getFileStore(workingRoot).getUsableSpace() < 128L * 1024 * 1024) {
+                throw new IOException("Less than 128 MB of storage is available. Free space before recording.");
+            }
             Path workingDirectory = createUniqueArchiveDirectory(workingRoot, LocalDateTime.now());
             transcriptSessionDir = workingDirectory.toFile();
             transcriptFile = buildTranscriptFile(transcriptSessionDir);
@@ -1879,6 +2140,10 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void resetWorkingSessionForNewRecording() {
+        reviewUndo.clear();
+        reviewRedo.clear();
+        previousReviewRevision = null;
+        previousReviewReadFailed = false;
         transcriptSessionDir = null;
         transcriptFile = null;
         transcriptCaptureStarted = false;
@@ -2227,6 +2492,10 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void pauseRecordingSession() {
+        if (transcriptProcess != null && transcriptProcess.isAlive() && !transcriptStopInProgress) {
+            requestCaptureCommand("PAUSE");
+            return;
+        }
         boolean wasRecording = recordEvents.get();
         recordEvents.set(false);
         transcriptStartPending = false;
@@ -2236,6 +2505,21 @@ public class TimeStamp implements QuPathExtension {
             logSessionBoundary("Recording Paused");
         }
         stopTranscriptProcess(TranscriptStopIntent.PAUSE);
+    }
+
+    private static void requestCaptureCommand(String command) {
+        if (captureControlPending || transcriptProcess == null || !transcriptProcess.isAlive()) return;
+        try {
+            captureControlPending = true;
+            captureControlRequestedNano = System.nanoTime();
+            transcriptProcess.getOutputStream().write((command + "\n").getBytes(StandardCharsets.UTF_8));
+            transcriptProcess.getOutputStream().flush();
+        } catch (IOException exception) {
+            captureControlPending = false;
+            transcriptStatusLabel.setText("Warning: recorder command failed; use Finish & review to preserve the session.");
+            logger.warn("Could not send recorder control command", exception);
+        }
+        updateLiveEventMonitorControls();
     }
 
     private static void finishRecordingSession() {
@@ -2527,6 +2811,9 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
         String resolved = contents == null ? "" : contents;
+        if (resolved.equals(captionCommittedContents)) {
+            return;
+        }
         liveCaptionFlow.getChildren().removeAll(provisionalCaptionNodes);
         provisionalCaptionNodes.clear();
         String suffix = appendOnlyCaptionSuffix(captionCommittedContents, resolved);
@@ -2551,58 +2838,579 @@ public class TimeStamp implements QuPathExtension {
         return newText.startsWith(oldText) ? newText.substring(oldText.length()) : null;
     }
 
-    private static void appendCaptionNodes(String contents, boolean provisional) {
-        int start = 0;
-        while (start < contents.length()) {
-            int end = start;
-            boolean whitespace = Character.isWhitespace(contents.charAt(start));
-            while (end < contents.length() &&
-                    Character.isWhitespace(contents.charAt(end)) == whitespace) {
-                end++;
+    record ReviewWord(String word, int start, int end, long startMs, long endMs,
+                      Double confidence, boolean needsReview) { }
+
+    static String reviewedTranscriptJson(String transcript, List<ReviewWord> words) {
+        var document = new com.google.gson.JsonObject();
+        document.addProperty("version", 1);
+        document.addProperty("transcript", transcript);
+        var entries = new com.google.gson.JsonArray();
+        for (ReviewWord word : words) {
+            var entry = new com.google.gson.JsonObject();
+            entry.addProperty("word", word.word());
+            entry.addProperty("start", word.start());
+            entry.addProperty("end", word.end());
+            entry.addProperty("start_ms", word.startMs());
+            entry.addProperty("end_ms", word.endMs());
+            entry.addProperty("confidence", word.confidence());
+            entry.addProperty("needs_review", word.needsReview());
+            entries.add(entry);
+        }
+        document.add("words", entries);
+        return new com.google.gson.GsonBuilder().serializeNulls().setPrettyPrinting().create().toJson(document);
+    }
+
+    static List<ReviewWord> parseReviewWords(String json, String transcript) {
+        try {
+            var document = JsonParser.parseString(json).getAsJsonObject();
+            if (document.get("version").getAsInt() != 1 ||
+                    !transcript.equals(document.get("transcript").getAsString())) {
+                return List.of();
             }
-            Text node = new Text(contents.substring(start, end));
+            List<ReviewWord> words = new ArrayList<>();
+            int previousEnd = 0;
+            for (var entry : document.getAsJsonArray("words")) {
+                var word = entry.getAsJsonObject();
+                int start = word.get("start").getAsInt();
+                int end = word.get("end").getAsInt();
+                String text = word.get("word").getAsString();
+                long startMs = word.get("start_ms").getAsLong();
+                long endMs = word.get("end_ms").getAsLong();
+                Double confidence = word.get("confidence").isJsonNull()
+                        ? null : word.get("confidence").getAsDouble();
+                if (start < previousEnd || end <= start || end > transcript.length() ||
+                        startMs < 0 || endMs < startMs ||
+                        !transcript.substring(start, end).equals(text) ||
+                        (confidence != null && (!Double.isFinite(confidence) || confidence < 0 || confidence > 1))) {
+                    return List.of();
+                }
+                words.add(new ReviewWord(text, start, end, startMs, endMs, confidence,
+                        word.get("needs_review").getAsBoolean()));
+                previousEnd = end;
+            }
+            return List.copyOf(words);
+        } catch (RuntimeException exception) {
+            return List.of();
+        }
+    }
+
+    static List<ReviewWord> rebaseReviewWords(List<ReviewWord> words, String previous, String current) {
+        if (previous.equals(current)) {
+            return words;
+        }
+        int prefix = 0;
+        while (prefix < Math.min(previous.length(), current.length()) &&
+                previous.charAt(prefix) == current.charAt(prefix)) {
+            prefix++;
+        }
+        int oldEnd = previous.length();
+        int newEnd = current.length();
+        while (oldEnd > prefix && newEnd > prefix &&
+                previous.charAt(oldEnd - 1) == current.charAt(newEnd - 1)) {
+            oldEnd--;
+            newEnd--;
+        }
+        int shift = newEnd - oldEnd;
+        List<ReviewWord> adjusted = new ArrayList<>();
+        for (ReviewWord word : words) {
+            if (word.end() <= prefix) {
+                adjusted.add(word);
+            } else if (word.start() >= oldEnd) {
+                adjusted.add(new ReviewWord(word.word(), word.start() + shift, word.end() + shift,
+                        word.startMs(), word.endMs(), word.confidence(), word.needsReview()));
+            }
+            // Edited words have no model confidence. Keep confidence on untouched words only.
+        }
+        return List.copyOf(adjusted);
+    }
+
+    private static void refreshWordReviewMetadata(String contents) {
+        File metadata = transcriptCompanionFile(transcriptFile, "_review.json");
+        try {
+            String json = metadata != null && metadata.isFile() ? Files.readString(metadata.toPath()) : "";
+            if (json.equals(reviewLoadedDocument) && contents.equals(reviewSourceContents) &&
+                    reviewDisplayContents.equals(liveTranscriptTextArea.getText())) {
+                return;
+            }
+            boolean keepCurrentReview = contents.equals(reviewSourceContents) &&
+                    reviewDisplayContents.equals(liveTranscriptTextArea.getText());
+            String display = keepCurrentReview ? reviewDisplayContents : contents;
+            List<ReviewWord> words = keepCurrentReview ? transcriptReviewWords : parseReviewWords(json, contents);
+            if (!keepCurrentReview && hasPreviousReview() && contents.startsWith(previousReviewRevision.source())) {
+                display = previousReviewRevision.project(contents);
+                List<ReviewWord> projected = new ArrayList<>(parseReviewWords(
+                        previousReviewRevision.review(), previousReviewRevision.text()));
+                int prefixLength = previousReviewRevision.source().length();
+                int shift = previousReviewRevision.text().length() - prefixLength;
+                for (ReviewWord word : words) {
+                    if (word.start() >= prefixLength) {
+                        projected.add(new ReviewWord(word.word(), word.start() + shift, word.end() + shift,
+                                word.startMs(), word.endMs(), word.confidence(), word.needsReview()));
+                    }
+                }
+                words = List.copyOf(projected);
+            }
+            updateTranscriptTextArea(display);
+            reviewLoadedDocument = json;
+            reviewSourceContents = contents;
+            transcriptReviewWords = words;
+            reviewDisplayContents = display;
+            selectedReviewWord = null;
+            styleCaptionConfidence();
+            updateWordReviewControls();
+        } catch (IOException exception) {
+            logger.debug("Word review metadata is not yet readable", exception);
+        }
+    }
+
+    private static Path previousReviewPath() {
+        File file = transcriptCompanionFile(transcriptFile, "_previous_review.json");
+        return file == null ? null : file.toPath();
+    }
+
+    private static boolean hasPreviousReview() {
+        return previousReviewRevision != null && !previousReviewRevision.resolved();
+    }
+
+    private static void loadPreviousReviewRevision() {
+        previousReviewRevision = null;
+        previousReviewReadFailed = false;
+        try {
+            Path path = previousReviewPath();
+            if (path != null) previousReviewRevision = ReviewRevisionStore.read(path);
+        } catch (IOException exception) {
+            previousReviewReadFailed = true;
+            logger.warn("Could not load the preserved review revision", exception);
+        }
+    }
+
+    private static boolean preserveReviewBeforeRecording() {
+        if (recordingWorkflowState != RecordingWorkflowState.UNSAVED_REVIEW) return true;
+        if ((previousReviewReadFailed || hasPreviousReview()) && !comparePreviousReview()) return false;
+        String text = liveTranscriptTextArea.getText();
+        boolean edited = !text.equals(reviewSourceContents) || !transcriptReviewWords.equals(
+                parseReviewWords(reviewLoadedDocument, reviewSourceContents));
+        if (!edited) return true;
+        try {
+            previousReviewRevision = ReviewRevisionStore.preserve(previousReviewPath(), reviewSourceContents,
+                    reviewedTranscriptJson(text, transcriptReviewWords));
+            return true;
+        } catch (IOException exception) {
+            Dialogs.showErrorMessage("Review could not be preserved", exception.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean comparePreviousReview() {
+        if (previousReviewReadFailed) {
+            Dialogs.showErrorMessage("Earlier review needs recovery",
+                    "The preserved review file could not be read. It has not been changed. Recover it before saving or recording more.");
+            return false;
+        }
+        if (!hasPreviousReview()) return true;
+        if (!canReviewAudio()) return false;
+        TextArea previous = new TextArea(previousReviewRevision.text());
+        previous.setEditable(false);
+        previous.setWrapText(true);
+        TextArea current = new TextArea(liveTranscriptTextArea.getText());
+        current.setWrapText(true);
+        VBox left = new VBox(6, new Label("Earlier reviewed transcript (preserved)"), previous);
+        VBox right = new VBox(6, new Label("Transcript to keep — edit to carry over corrections"), current);
+        VBox.setVgrow(previous, Priority.ALWAYS);
+        VBox.setVgrow(current, Priority.ALWAYS);
+        SplitPane comparison = new SplitPane(left, right);
+        comparison.setPrefSize(850, 500);
+        Dialog<String> dialog = new Dialog<>();
+        dialog.setTitle("Compare your earlier corrections");
+        if (qupathGui != null) dialog.initOwner(qupathGui.getStage());
+        dialog.setHeaderText("More audio produced a new draft. Check your earlier corrections before keeping this transcript.");
+        dialog.getDialogPane().setContent(comparison);
+        var apply = new javafx.scene.control.ButtonType("Keep this transcript", javafx.scene.control.ButtonBar.ButtonData.OK_DONE);
+        dialog.getDialogPane().getButtonTypes().addAll(apply, javafx.scene.control.ButtonType.CANCEL);
+        dialog.setResultConverter(button -> button == apply ? current.getText() : null);
+        var result = dialog.showAndWait();
+        return result.isPresent() && completeReviewComparison(result.get());
+    }
+
+    private static boolean completeReviewComparison(String text) {
+        List<ReviewWord> words = rebaseReviewWords(transcriptReviewWords, liveTranscriptTextArea.getText(), text);
+        try {
+            // Commit the chosen review before resolving the reminder so crash recovery can restore it.
+            synchronized (reviewCheckpointLock) {
+                reviewCheckpointGeneration++;
+                atomicWriteString(transcriptSessionDir.toPath().resolve(".timestamp-review.json"),
+                        ReviewRecovery.encode(reviewSourceContents, reviewedTranscriptJson(text, words)));
+                previousReviewRevision = ReviewRevisionStore.resolve(previousReviewPath(), previousReviewRevision);
+            }
+            rememberReviewEdit();
+            liveTranscriptTextArea.setText(text);
+            transcriptReviewWords = words;
+            reviewDisplayContents = text;
+            recordingSessionDirty = true;
+            selectedReviewWord = null;
+            styleCaptionConfidence();
+            updateWordReviewControls();
+            return true;
+        } catch (IOException exception) {
+            Dialogs.showErrorMessage("Review could not be saved", exception.getMessage());
+            return false;
+        }
+    }
+
+    private static boolean canReviewAudio() {
+        return !recordEvents.get() && !transcriptStartPending && !isTranscriptProcessBusy() &&
+                recordingWorkflowState != RecordingWorkflowState.PAUSED;
+    }
+
+    private static void updateWordReviewControls() {
+        if (transcriptReviewLabel == null) {
+            return;
+        }
+        boolean previousPending = hasPreviousReview() || previousReviewReadFailed;
+        previousReviewLabel.setText(previousReviewReadFailed
+                ? "Earlier review needs recovery before saving."
+                : "Earlier corrections are preserved. Compare them with the new draft before saving.");
+        previousReviewLabel.setVisible(previousPending);
+        previousReviewLabel.setManaged(previousPending);
+        comparePreviousReviewButton.setVisible(previousPending && canReviewAudio());
+        comparePreviousReviewButton.setManaged(comparePreviousReviewButton.isVisible());
+        long uncertain = transcriptReviewWords.stream().filter(ReviewWord::needsReview).count();
+        transcriptReviewLabel.setText(transcriptReviewWords.isEmpty()
+                ? "Select any word to correct it."
+                : uncertain + " to review · confidence is estimated");
+        if (selectedReviewWord != null) {
+            transcriptReviewLabel.setText(transcriptReviewLabel.getText() + "\n" +
+                    selectedReviewWord.word() + (selectedReviewWord.confidence() == null
+                    ? " · confidence unavailable"
+                    : String.format(Locale.ROOT, " · estimated confidence %.0f%%",
+                            selectedReviewWord.confidence() * 100)));
+        }
+        nextUncertainButton.setDisable(!canReviewAudio() || uncertain == 0);
+        boolean hasText = liveTranscriptTextArea != null && !liveTranscriptTextArea.getText().isBlank();
+        boolean review = canReviewAudio() && (hasText || recordingWorkflowState == RecordingWorkflowState.UNSAVED_REVIEW);
+        transcriptReviewLabel.setVisible(review && hasText && !transcriptReviewWords.isEmpty());
+        transcriptReviewLabel.setManaged(transcriptReviewLabel.isVisible());
+        for (var control : List.of(nextUncertainButton, replayWordButton, markWordCheckedButton,
+                editTranscriptButton, reviewUndoButton, reviewRedoButton)) {
+            control.setVisible(review);
+            control.setManaged(review);
+        }
+        boolean selected = review && selectedReviewWord != null;
+        reviewUndoButton.setDisable(!review || reviewUndo.isEmpty());
+        reviewRedoButton.setDisable(!review || reviewRedo.isEmpty());
+        wordCorrectionRow.setVisible(selected);
+        wordCorrectionRow.setManaged(selected);
+        markWordCheckedButton.setDisable(!selected || !selectedReviewWord.needsReview());
+        File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
+        replayWordButton.setDisable(!canReviewAudio() || selectedReviewWord == null ||
+                selectedReviewWord.startMs() < 0 || audio == null || !audio.isFile());
+        if (!canReviewAudio()) {
+            stopReviewAudio();
+        }
+    }
+
+    private static void selectNextUncertainWord() {
+        int after = selectedReviewWord == null ? -1 : selectedReviewWord.start();
+        List<ReviewWord> uncertain = transcriptReviewWords.stream().filter(ReviewWord::needsReview).toList();
+        if (uncertain.isEmpty()) {
+            return;
+        }
+        selectReviewWord(uncertain.stream().filter(word -> word.start() > after)
+                .findFirst().orElse(uncertain.getFirst()));
+        scrollCaptionToOffset(selectedReviewWord.start());
+    }
+
+    private static void selectReviewWord(ReviewWord word) {
+        selectedReviewWord = word;
+        if (word != null) {
+            wordCorrectionField.setText(word.word());
+            liveTranscriptTextArea.selectRange(word.start(), word.end());
+            selectEventsForTranscriptCaret();
+        }
+        updateWordReviewControls();
+        styleCaptionConfidence();
+    }
+
+    private static void applySelectedWordCorrection() {
+        if (!canReviewAudio() || selectedReviewWord == null) {
+            return;
+        }
+        ReviewWord word = selectedReviewWord;
+        String text = liveTranscriptTextArea.getText();
+        if (word.end() > text.length() || !text.substring(word.start(), word.end()).equals(word.word())) {
+            return;
+        }
+        rememberReviewEdit();
+        liveTranscriptTextArea.replaceText(word.start(), word.end(), wordCorrectionField.getText());
+        selectedReviewWord = null;
+        recordingSessionDirty = true;
+        updateWordReviewControls();
+        styleCaptionConfidence();
+    }
+
+    private static void markSelectedWordChecked() {
+        if (!canReviewAudio() || selectedReviewWord == null) {
+            return;
+        }
+        rememberReviewEdit();
+        ReviewWord selected = selectedReviewWord;
+        transcriptReviewWords = transcriptReviewWords.stream().map(word -> word.equals(selected)
+                ? new ReviewWord(word.word(), word.start(), word.end(), word.startMs(), word.endMs(), word.confidence(), false)
+                : word).toList();
+        selectedReviewWord = transcriptReviewWords.stream().filter(word -> word.start() == selected.start()).findFirst().orElse(null);
+        recordingSessionDirty = true;
+        if (recordingWorkflowState == RecordingWorkflowState.SAVED) {
+            recordingWorkflowState = RecordingWorkflowState.UNSAVED_REVIEW;
+            updateLiveEventMonitorControls();
+        }
+        updateWordReviewControls();
+        styleCaptionConfidence();
+    }
+
+    private static void editWholeTranscript() {
+        if (!canReviewAudio()) {
+            return;
+        }
+        Dialog<String> dialog = new Dialog<>();
+        dialog.setTitle("Edit transcript");
+        TextArea editor = new TextArea(liveTranscriptTextArea.getText());
+        editor.setWrapText(true);
+        editor.setPrefSize(600, 400);
+        var apply = new javafx.scene.control.ButtonType("Apply changes", javafx.scene.control.ButtonBar.ButtonData.OK_DONE);
+        dialog.getDialogPane().getButtonTypes().addAll(apply, javafx.scene.control.ButtonType.CANCEL);
+        dialog.getDialogPane().setContent(editor);
+        if (qupathGui != null) dialog.initOwner(qupathGui.getStage());
+        dialog.setResultConverter(button -> button == apply ? editor.getText() : null);
+        dialog.showAndWait().ifPresent(text -> {
+            rememberReviewEdit();
+            liveTranscriptTextArea.setText(text);
+            recordingSessionDirty = true;
+            updateWordReviewControls();
+        });
+    }
+
+    private static void rememberReviewEdit() {
+        invalidateSavedReviewMarker();
+        reviewUndo.addLast(new ReviewEdit(liveTranscriptTextArea.getText(), List.copyOf(transcriptReviewWords)));
+        while (reviewUndo.size() > 100) reviewUndo.removeFirst();
+        reviewRedo.clear();
+    }
+
+    private static void restoreReviewEdit(java.util.Deque<ReviewEdit> from, java.util.Deque<ReviewEdit> to) {
+        if (!canReviewAudio() || from.isEmpty()) return;
+        invalidateSavedReviewMarker();
+        to.addLast(new ReviewEdit(liveTranscriptTextArea.getText(), List.copyOf(transcriptReviewWords)));
+        ReviewEdit edit = from.removeLast();
+        liveTranscriptTextArea.setText(edit.text());
+        transcriptReviewWords = edit.words();
+        reviewDisplayContents = edit.text();
+        selectedReviewWord = null;
+        recordingSessionDirty = true;
+        recordingWorkflowState = RecordingWorkflowState.UNSAVED_REVIEW;
+        updateLiveEventMonitorControls();
+    }
+
+    private static void invalidateSavedReviewMarker() {
+        if (transcriptSessionDir == null) return;
+        try {
+            Files.deleteIfExists(transcriptSessionDir.toPath().resolve(".saved"));
+        } catch (IOException exception) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "Could not enable recovery for these edits. Save Session before closing.");
+        }
+    }
+
+    private static void stopReviewAudio() {
+        reviewPlaybackGeneration.incrementAndGet();
+        Clip clip = reviewAudioClip;
+        reviewAudioClip = null;
+        if (clip != null) {
+            clip.stop();
+            clip.close();
+        }
+    }
+
+    private static void replaySelectedWord() {
+        if (!canReviewAudio() || selectedReviewWord == null) {
+            return;
+        }
+        stopReviewAudio();
+        long generation = reviewPlaybackGeneration.get();
+        ReviewWord word = selectedReviewWord;
+        File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
+        Thread player = new Thread(() -> {
+            Clip clip = null;
+            try (var stream = AudioSystem.getAudioInputStream(audio)) {
+                var format = stream.getFormat();
+                long startMs = Math.max(0, word.startMs() - REVIEW_AUDIO_CONTEXT_MS);
+                long durationMs = Math.min(REVIEW_AUDIO_MAX_MS, word.endMs() + REVIEW_AUDIO_CONTEXT_MS - startMs);
+                long firstFrame = (long) (startMs * format.getFrameRate() / 1000);
+                int bytes = (int) (durationMs * format.getFrameRate() / 1000) * format.getFrameSize();
+                stream.skipNBytes(firstFrame * format.getFrameSize());
+                byte[] excerpt = stream.readNBytes(bytes);
+                clip = AudioSystem.getClip();
+                clip.open(format, excerpt, 0, excerpt.length);
+                Clip opened = clip;
+                clip.addLineListener(event -> {
+                    if (event.getType() == LineEvent.Type.STOP) {
+                        opened.close();
+                    }
+                });
+                Platform.runLater(() -> {
+                    if (generation != reviewPlaybackGeneration.get() || !canReviewAudio()) {
+                        opened.close();
+                        return;
+                    }
+                    reviewAudioClip = opened;
+                    opened.start();
+                });
+            } catch (Exception exception) {
+                if (clip != null) {
+                    clip.close();
+                }
+                Platform.runLater(() -> Dialogs.showErrorMessage("Audio replay", exception.getMessage()));
+            }
+        }, "timestamp-word-replay");
+        player.setDaemon(true);
+        player.start();
+    }
+
+    private static void styleCaptionConfidence() {
+        if (liveCaptionFlow == null) {
+            return;
+        }
+        int wordIndex = 0;
+        for (var child : liveCaptionFlow.getChildren()) {
+            if (!(child instanceof Text node) || provisionalCaptionNodes.contains(node)) {
+                continue;
+            }
+            if (!(node.getProperties().get(CAPTION_SPAN_KEY) instanceof CaptionToken span)) {
+                continue;
+            }
+            int start = span.start();
+            int end = span.end();
+            if (span.timestamp()) {
+                node.setStyle("-fx-fill: -fx-text-base-color; -fx-opacity: 0.9; -fx-font-size: 12px;");
+                node.setOnMouseClicked(event -> {
+                    liveTranscriptTextArea.positionCaret(start);
+                    selectEventsForTranscriptCaret();
+                });
+                continue;
+            }
+            while (wordIndex < transcriptReviewWords.size() && transcriptReviewWords.get(wordIndex).end() <= start) {
+                wordIndex++;
+            }
+            ReviewWord word = wordIndex < transcriptReviewWords.size() &&
+                    transcriptReviewWords.get(wordIndex).start() < end ? transcriptReviewWords.get(wordIndex) : null;
+            boolean selected = selectedReviewWord != null && selectedReviewWord.start() < end && selectedReviewWord.end() > start;
+            boolean dark = qupath.lib.gui.prefs.QuPathStyleManager.getStyleColorScheme() == javafx.application.ColorScheme.DARK;
+            node.setStyle(selected ? "-fx-font-weight: bold; -fx-fill: " + (dark ? "#93c5fd" : "#1d4ed8") + ";"
+                    : word != null && word.needsReview() ? "-fx-fill: " + (dark ? "#ffd166" : "#805100") + ";"
+                    : "-fx-fill: -fx-text-base-color;");
+            node.setUnderline(word != null && word.needsReview());
+            node.setOnMouseClicked(node.getText().isBlank() ? null : event -> {
+                if (!canReviewAudio()) return;
+                String raw = liveTranscriptTextArea.getText();
+                if (end > raw.length()) return;
+                selectReviewWord(word != null ? word : new ReviewWord(raw.substring(start, end), start, end,
+                        -1, -1, null, false));
+            });
+        }
+    }
+
+    record CaptionToken(String text, int start, int end, boolean timestamp) { }
+
+    static String compactCaptionTimestamp(String raw, Instant origin) {
+        try {
+            LocalDateTime local = LocalDateTime.parse(raw.substring(1, raw.length() - 1), formatter);
+            if (origin == null) return local.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            return formatEventElapsed(java.time.Duration.between(origin, local.atZone(ZoneId.systemDefault()).toInstant()).toMillis());
+        } catch (RuntimeException exception) {
+            return raw;
+        }
+    }
+
+    static List<CaptionToken> captionTokens(String contents, int sourceOffset, Instant origin) {
+        var matcher = java.util.regex.Pattern.compile("(?m)^\\[[^\\]\\n]+\\]|\\s+|\\S+").matcher(contents);
+        List<CaptionToken> tokens = new ArrayList<>();
+        while (matcher.find()) {
+            String raw = matcher.group();
+            String display = raw.startsWith("[") ? compactCaptionTimestamp(raw, origin) : raw;
+            tokens.add(new CaptionToken(display, sourceOffset + matcher.start(), sourceOffset + matcher.end(), !display.equals(raw)));
+        }
+        return tokens;
+    }
+
+    private static void appendCaptionNodes(String contents, boolean provisional) {
+        for (CaptionToken token : captionTokens(contents, captionCommittedContents.length(), recordingStartedInstant)) {
+            Text node = new Text(token.text());
+            node.getProperties().put(CAPTION_SPAN_KEY, token);
+            if (token.timestamp()) {
+                Tooltip.install(node, new Tooltip(contents.substring(
+                        token.start() - captionCommittedContents.length(), token.end() - captionCommittedContents.length())));
+            }
             if (provisional) {
                 node.setOpacity(0.55);
                 node.setStyle("-fx-font-style: italic;");
                 provisionalCaptionNodes.add(node);
             }
             liveCaptionFlow.getChildren().add(node);
-            start = end;
         }
     }
 
     private static void followCaptionTail() {
-        if (liveCaptionScrollPane == null) {
+        if (liveCaptionScrollPane == null || !recordEvents.get()) {
             return;
         }
-        Platform.runLater(() -> liveCaptionScrollPane.setVvalue(1.0));
+        Platform.runLater(() -> {
+            if (!recordEvents.get()) return;
+            // Lay out new words before scrolling so the bottom includes this update.
+            if (liveCaptionScrollPane.getScene() != null) {
+                var root = liveCaptionScrollPane.getScene().getRoot();
+                root.applyCss();
+                root.layout();
+            }
+            liveCaptionScrollPane.setVvalue(liveCaptionScrollPane.getVmax());
+        });
+    }
+
+    private static void scrollCaptionToOffset(int offset) {
+        Platform.runLater(() -> {
+            liveCaptionFlow.applyCss();
+            liveCaptionFlow.layout();
+            for (var child : liveCaptionFlow.getChildren()) {
+                if (child.getProperties().get(CAPTION_SPAN_KEY) instanceof CaptionToken span &&
+                        span.start() <= offset && span.end() > offset) {
+                    double height = liveCaptionFlow.getBoundsInLocal().getHeight() - liveCaptionScrollPane.getViewportBounds().getHeight();
+                    if (height > 0) liveCaptionScrollPane.setVvalue(Math.max(0, Math.min(1,
+                            (child.getBoundsInParent().getMinY() - 24) / height)));
+                    break;
+                }
+            }
+        });
     }
 
     private static void updateCaptionViewMode() {
         if (liveCaptionScrollPane == null || liveTranscriptTextArea == null) {
             return;
         }
-        boolean showCaption = switch (recordingWorkflowState) {
-            case STARTING, RECORDING, PAUSED, FINALIZING -> true;
-            default -> false;
-        };
-        liveCaptionScrollPane.setVisible(showCaption);
-        liveCaptionScrollPane.setManaged(showCaption);
-        liveTranscriptTextArea.setVisible(!showCaption);
-        liveTranscriptTextArea.setManaged(!showCaption);
-        if (showCaption) {
-            updateCaptionCommitted(liveTranscriptTextArea.getText());
-        }
+        liveCaptionScrollPane.setVisible(true);
+        liveCaptionScrollPane.setManaged(true);
+        liveTranscriptTextArea.setVisible(false);
+        liveTranscriptTextArea.setManaged(false);
+        updateCaptionCommitted(liveTranscriptTextArea.getText());
+        styleCaptionConfidence();
     }
 
     private static String emptyTranscriptPrompt() {
         return switch (recordingWorkflowState) {
             case READY, STARTING -> "Transcript text will appear when recording begins.";
             case RECORDING -> "Listening for speech…";
-            case PAUSED -> "Recording is paused; Resume or choose Done.";
+            case PAUSED -> "Recording is paused; Resume or choose Finish & review.";
             case FINALIZING, SAVING -> "Processing the complete audio…";
             case UNSAVED_REVIEW, SAVED ->
-                    "No speech was transcribed. You may enter a note here before saving.";
+                    "No speech was transcribed. Use Edit transcript to add a note before saving.";
             case ERROR -> "No transcript text is available yet; recoverable session data can still be saved.";
         };
     }
@@ -2658,6 +3466,7 @@ public class TimeStamp implements QuPathExtension {
         long lastModified = transcriptFile.lastModified();
         long lastSize = transcriptFile.length();
         if (!force && lastModified == transcriptLastModified && lastSize == transcriptLastSize) {
+            refreshWordReviewMetadata(transcriptLastContents);
             if (transcriptStopInProgress) {
                 transcriptStatusLabel.setText("Transcript: finalizing transcript");
                 return;
@@ -2678,7 +3487,7 @@ public class TimeStamp implements QuPathExtension {
             transcriptLastModified = lastModified;
             transcriptLastSize = lastSize;
             transcriptLastContents = suppressRunawayTranscriptLines(contents);
-            updateTranscriptTextArea(transcriptLastContents);
+            refreshWordReviewMetadata(transcriptLastContents);
             if (transcriptStopInProgress) {
                 transcriptStatusLabel.setText("Transcript: finalizing transcript");
                 return;
@@ -2693,7 +3502,6 @@ public class TimeStamp implements QuPathExtension {
             }
         } catch (IOException e) {
             logger.warn("Failed to read transcript file {}", transcriptFile, e);
-            updateTranscriptTextArea(transcriptLastContents);
             transcriptStatusLabel.setText("Transcript: read failed for " + transcriptFile.getName());
         }
     }
@@ -3160,7 +3968,7 @@ public class TimeStamp implements QuPathExtension {
         hotwordsArea.setPrefRowCount(3);
         hotwordsArea.setWrapText(true);
         var accuracyLabel = new Label(
-                "Clinical High Accuracy — fast live preview, then large-v3 for the final saved transcript");
+                "Live preview while recording; a full-audio transcript after Finish & review. Review before saving.");
         accuracyLabel.setWrapText(true);
         var settingsHint = new Label(
                 "The recognition model and decoding strength are managed automatically. " +
@@ -3174,11 +3982,13 @@ public class TimeStamp implements QuPathExtension {
         grid.setVgap(8);
         grid.setPadding(new Insets(10));
         grid.addRow(0, new Label("Accuracy"), accuracyLabel);
-        grid.addRow(1, new Label("Live engine"), liveEngineCombo);
-        grid.addRow(2, new Label("Language"), languageCombo);
-        grid.addRow(3, new Label("Input device"), deviceBox);
-        grid.addRow(4, new Label("Pathology terms"), hotwordsArea);
-        grid.add(settingsHint, 0, 5, 2, 1);
+        grid.addRow(1, new Label("Language"), languageCombo);
+        grid.addRow(2, new Label("Input device"), deviceBox);
+        grid.addRow(3, new Label("Pathology terms"), hotwordsArea);
+        VBox advancedContent = new VBox(8, new Label("Live engine"), liveEngineCombo, settingsHint);
+        var advanced = new javafx.scene.control.TitledPane("Advanced transcription settings", advancedContent);
+        advanced.setExpanded(false);
+        grid.add(advanced, 0, 4, 2, 1);
 
         dialog.getDialogPane().setContent(grid);
         dialog.getDialogPane().getButtonTypes().addAll(javafx.scene.control.ButtonType.OK,
@@ -3193,6 +4003,7 @@ public class TimeStamp implements QuPathExtension {
         transcriptDevice.set(selectedTranscriptInputDevice(deviceCombo));
         transcriptHotwords.set(defaultIfBlank(hotwordsArea.getText(), DEFAULT_TRANSCRIPT_HOTWORDS));
         updateTranscriptSettingsSummary();
+        updateRecordingContext();
     }
 
     private static File buildTranscriptFile(File sessionDir) {
@@ -3230,9 +4041,10 @@ public class TimeStamp implements QuPathExtension {
     private static void exportTranscript() {
         if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Choose Done and wait for the final transcript before exporting.");
+                    "Choose Finish & review and wait for the final transcript before exporting.");
             return;
         }
+        if (!canReviewAudio() || !comparePreviousReview()) return;
         String transcriptText = liveTranscriptTextArea == null ? "" : liveTranscriptTextArea.getText();
         if (transcriptText == null || transcriptText.isBlank()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY, "Transcript is empty. Nothing to export.");
@@ -3247,8 +4059,13 @@ public class TimeStamp implements QuPathExtension {
         }
 
         try {
-            Files.writeString(file.toPath(), transcriptText,
-                    StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            if (transcriptSessionDir != null) {
+                ExportSafety.requireSeparateDestination(transcriptSessionDir.toPath(), file.toPath());
+            }
+            if (transcriptFile != null) {
+                ExportSafety.requireDifferentFiles(transcriptFile.toPath(), file.toPath());
+            }
+            atomicWriteString(file.toPath(), transcriptText);
             Dialogs.showInfoNotification(TIMESTAMP_CATEGORY,
                     String.format("Transcript exported to:%n%s", file.getName()));
             logger.info("Transcript exported to {}", file.getAbsolutePath());
@@ -3262,12 +4079,12 @@ public class TimeStamp implements QuPathExtension {
     private static boolean saveTranscriptAndTimestamps() {
         if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Choose Done and wait for the final transcript before saving.");
+                    "Choose Finish & review and wait for the final transcript before saving.");
             return false;
         }
         if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Pause recording and wait for transcript finalization before saving.");
+                    "Choose Finish & review and wait for the final transcript before saving.");
             return false;
         }
 
@@ -3290,11 +4107,18 @@ public class TimeStamp implements QuPathExtension {
             return false;
         }
 
+        if (!comparePreviousReview()) return false;
         SaveOptions saveOptions = chooseRecordingSaveOptions();
         if (saveOptions == null) {
             return false;
         }
         File destinationDirectory = saveOptions.sessionDirectory();
+        try {
+            ExportSafety.requireSeparateDestination(transcriptSessionDir.toPath(), destinationDirectory.toPath());
+        } catch (IOException exception) {
+            Dialogs.showErrorMessage("Choose another save location", exception.getMessage());
+            return false;
+        }
         File destinationTranscript = buildTranscriptFile(destinationDirectory);
         if (destinationTranscript == null) {
             Dialogs.showErrorMessage("Recording Save Failed",
@@ -3322,8 +4146,9 @@ public class TimeStamp implements QuPathExtension {
             validateExactTextFile(destinationTranscript.toPath(), transcriptText,
                     "displayed transcript");
             copyWorkingRecordingFiles(transcriptFile, destinationTranscript, saveOptions.includeRawAudio());
+            atomicWriteString(transcriptCompanionFile(destinationTranscript, "_reviewed.json").toPath(),
+                    reviewedTranscriptJson(transcriptText, transcriptReviewWords));
             validateTranscriptTimingFiles(destinationTranscript, transcriptFinalizationResult);
-            transcriptLastContents = transcriptText;
             boolean saved = saveSessionArtifacts(destinationDirectory, destinationTranscript,
                     transcriptFinalizationResult, transcriptLastExitCode);
             if (!saved) {
@@ -3481,9 +4306,11 @@ public class TimeStamp implements QuPathExtension {
         if (sourceTranscript == null || destinationTranscript == null) {
             return;
         }
+        ExportSafety.requireSeparateDestination(sourceTranscript.getParentFile().toPath(),
+                destinationTranscript.getParentFile().toPath());
         copyOrRemoveManagedFile(sourceTranscript,
                 transcriptCompanionFile(destinationTranscript, "_timed.txt"), true);
-        for (String suffix : List.of("_live.txt", "_segments.csv", "_words.csv")) {
+        for (String suffix : List.of("_live.txt", "_segments.csv", "_words.csv", "_review.json", "_previous_review.json")) {
             copyOrRemoveManagedCompanion(sourceTranscript, destinationTranscript, suffix, true);
         }
         for (String suffix : List.of("_audio.raw", "_audio.wav", "_audio.start.txt")) {
@@ -3504,6 +4331,9 @@ public class TimeStamp implements QuPathExtension {
                                                 boolean include) throws IOException {
         if (destination == null) {
             return;
+        }
+        if (source != null) {
+            ExportSafety.requireDifferentFiles(source.toPath(), destination.toPath());
         }
         if (include && source != null && source.isFile()) {
             copyFileAtomically(source, destination);
@@ -3575,11 +4405,11 @@ public class TimeStamp implements QuPathExtension {
                         transcriptFinalizationResult = message.fields().get(0).trim();
                     }
                     if (message.type() == TranscriptMessageType.AUDIO_LEVEL) {
-                        logger.debug("Transcript process: {}", outputLine);
+                        logger.debug("Transcript process: audio level updated");
                     } else if (message.type() == TranscriptMessageType.MALFORMED) {
-                        logger.warn("Ignored malformed transcript protocol message: {}", outputLine);
+                        logger.warn("Ignored malformed transcript protocol message");
                     } else {
-                        logger.info("Transcript process: {}", outputLine);
+                        logger.debug("Transcript process message: {}", message.type());
                     }
                     Platform.runLater(() -> {
                         if (transcriptProcess != process) {
@@ -3591,7 +4421,7 @@ public class TimeStamp implements QuPathExtension {
                                 refreshTranscriptContents(true);
                                 if (transcriptStatusLabel != null && !transcriptClippingWarningActive) {
                                     transcriptStatusLabel.setText(
-                                            "Transcript: receiving fast preview; final accuracy after Done");
+                                            "Transcript: receiving fast preview; final pass after Finish & review");
                                 }
                             }
                             case TRANSCRIPT_PARTIAL ->
@@ -3610,6 +4440,7 @@ public class TimeStamp implements QuPathExtension {
                                 transcriptStartPending = false;
                                 transcriptResumePending = false;
                                 transcriptCaptureStarted = true;
+                                captureControlPending = false;
                                 recordingWorkflowState = RecordingWorkflowState.RECORDING;
                                 recordingSessionDirty = true;
                                 recordEvents.set(true);
@@ -3620,6 +4451,20 @@ public class TimeStamp implements QuPathExtension {
                                 logSessionBoundary(resumedCapture ? "Recording Resumed" : "Recording Started");
                                 updateLiveEventMonitorControls();
                                 refreshLiveEventMonitor();
+                            }
+                            case CAPTURE_STATE -> {
+                                if (transcriptStopInProgress) return;
+                                boolean capturing = "recording".equals(message.fields().getFirst());
+                                captureControlPending = false;
+                                recordEvents.set(capturing);
+                                recordingWorkflowState = capturing
+                                        ? RecordingWorkflowState.RECORDING : RecordingWorkflowState.PAUSED;
+                                recordingSessionDirty = true;
+                                logSessionBoundary(capturing ? "Recording Resumed" : "Recording Paused");
+                                transcriptStatusLabel.setText(capturing
+                                        ? "Audio and actions recording · live text may catch up"
+                                        : "Capture paused · Resume continues this session; Finish & review finishes it");
+                                updateLiveEventMonitorControls();
                             }
                             case RECORDING_ORIGIN -> {
                                 Instant origin = Instant.parse(message.fields().get(0));
@@ -3710,8 +4555,10 @@ public class TimeStamp implements QuPathExtension {
                     boolean unexpectedStop = transcriptProcessPurpose == TranscriptProcessPurpose.CAPTURE &&
                             transcriptStopIntent == TranscriptStopIntent.NONE &&
                             !transcriptStopInProgress &&
-                            (recordEvents.get() || transcriptStartPending);
+                            (recordEvents.get() || transcriptStartPending ||
+                                    recordingWorkflowState == RecordingWorkflowState.PAUSED);
                     if (unexpectedStop) {
+                        captureControlPending = false;
                         recordEvents.set(false);
                         transcriptStartPending = false;
                         transcriptResumePending = false;
@@ -3805,7 +4652,12 @@ public class TimeStamp implements QuPathExtension {
                     ? "Transcript: pausing capture"
                     : "Transcript: stopping capture before finalization");
         }
-        process.destroy();
+        try {
+            process.getOutputStream().write("STOP\n".getBytes(StandardCharsets.UTF_8));
+            process.getOutputStream().flush();
+        } catch (IOException exception) {
+            process.destroy();
+        }
 
         Thread waitThread = new Thread(() -> {
             final boolean[] timedOut = {false};
@@ -3831,6 +4683,7 @@ public class TimeStamp implements QuPathExtension {
                         transcriptProcess = null;
                     }
                     transcriptStopInProgress = false;
+                    captureControlPending = false;
                     transcriptLastExitCode = exitCode[0];
                     transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
                     transcriptStopIntent = TranscriptStopIntent.NONE;
@@ -3850,7 +4703,7 @@ public class TimeStamp implements QuPathExtension {
                         transcriptFinalizationResult = "paused";
                         recordingWorkflowState = RecordingWorkflowState.PAUSED;
                         if (transcriptStatusLabel != null) {
-                            transcriptStatusLabel.setText("Transcript: paused; Resume or choose Done");
+                            transcriptStatusLabel.setText("Transcript: paused; Resume or choose Finish & review");
                         }
                     } else {
                         startTranscriptFinalizationProcess();
@@ -4022,8 +4875,10 @@ public class TimeStamp implements QuPathExtension {
                     paths, destinationDirectory, destinationTranscript,
                     finalizationResult, transcriptExitCode,
                     eventSnapshot.size(), mouseSnapshot.size());
+            completedManifest = SessionIntegrity.addChecksums(completedManifest, destinationDirectory.toPath());
             atomicWriteString(paths.manifest(), completedManifest);
             validateExactTextFile(paths.manifest(), completedManifest, "recording manifest");
+            SessionIntegrity.verify(Files.readString(paths.manifest()), destinationDirectory.toPath());
             logger.info("Saved recording session artifacts: transcript={}, events={}, cursor={}, manifest={}",
                     destinationTranscript, paths.eventJson(), paths.cursorJson(), paths.manifest());
             return true;
@@ -4065,7 +4920,7 @@ public class TimeStamp implements QuPathExtension {
         output.append("Session_ID,Sequence,Timestamp,Recorded_At_UTC,Elapsed_ms,Event_Type,Details,")
                 .append("View_X,View_Y,View_Width,View_Height,")
                 .append("View_CenterX,View_CenterY,View_Z,View_T,Downsample,Rotation,")
-                .append("ROI_Type,ROI_BoundsX,ROI_BoundsY,ROI_BoundsWidth,ROI_BoundsHeight,ROI_NumPoints,ROI_Points\n");
+                .append("ROI_Type,ROI_BoundsX,ROI_BoundsY,ROI_BoundsWidth,ROI_BoundsHeight,ROI_NumPoints,ROI_Points,Image_ID,Image_Name,Image_Source\n");
         for (EventRecord entry : records) {
             List<String> columns = eventCsvColumns(entry, savedSessionId);
             output.append(String.join(",", columns)).append('\n');
@@ -4086,6 +4941,7 @@ public class TimeStamp implements QuPathExtension {
                 formatDecimal("%.4f", entry.view.downsample), formatDecimal("%.4f", entry.view.rotation)));
         if (entry.annotation == null) {
             columns.addAll(List.of("", "", "", "", "", "", ""));
+            appendImageCsv(columns, entry.view.image);
             return columns;
         }
         StringBuilder points = new StringBuilder();
@@ -4101,7 +4957,19 @@ public class TimeStamp implements QuPathExtension {
         columns.add(formatDecimal("%.1f", entry.annotation.boundsHeight));
         columns.add(Integer.toString(entry.annotation.numPoints));
         columns.add(csvEscape(points.toString()));
+        appendImageCsv(columns, entry.view.image);
         return columns;
+    }
+
+    private static void appendImageCsv(List<String> columns, RecordedImage image) {
+        columns.addAll(image == null ? List.of("", "", "")
+                : List.of(csvEscape(image.id()), csvEscape(image.name()), csvEscape(image.source())));
+    }
+
+    static String recordedImageJson(RecordedImage image) {
+        if (image == null) return "null";
+        return "{\"id\":\"" + escapeJson(image.id()) + "\",\"name\":\"" + escapeJson(image.name()) +
+                "\",\"source\":\"" + escapeJson(image.source()) + "\"}";
     }
 
     private static String serializeEventJson(List<EventRecord> records, String collectionName,
@@ -4122,6 +4990,7 @@ public class TimeStamp implements QuPathExtension {
     private static void appendEventJson(StringBuilder output, EventRecord entry, String savedSessionId) {
         output.append("    {\n")
                 .append("      \"sessionId\": \"").append(escapeJson(savedSessionId)).append("\",\n")
+                .append("      \"image\": ").append(recordedImageJson(entry.view.image)).append(",\n")
                 .append("      \"sequence\": ").append(entry.sequence).append(",\n")
                 .append("      \"timestamp\": \"").append(escapeJson(formatter.format(entry.timestamp))).append("\",\n")
                 .append("      \"recordedAtUtc\": \"").append(escapeJson(entry.recordedAtUtc.toString())).append("\",\n")
@@ -4206,6 +5075,12 @@ public class TimeStamp implements QuPathExtension {
                 "  \"liveTranscript\": " + fileManifestJson(destinationDirectory, liveTranscript) + ",\n" +
                 "  \"transcriptSegments\": " + fileManifestJson(destinationDirectory, segmentTimings) + ",\n" +
                 "  \"transcriptWords\": " + fileManifestJson(destinationDirectory, wordTimings) + ",\n" +
+                "  \"wordReview\": " + fileManifestJson(destinationDirectory,
+                        transcriptCompanionFile(destinationTranscript, "_review.json")) + ",\n" +
+                "  \"reviewedWords\": " + fileManifestJson(destinationDirectory,
+                        transcriptCompanionFile(destinationTranscript, "_reviewed.json")) + ",\n" +
+                "  \"previousReview\": " + fileManifestJson(destinationDirectory,
+                        transcriptCompanionFile(destinationTranscript, "_previous_review.json")) + ",\n" +
                 "  \"audio\": {\n" +
                 "    \"raw\": " + fileManifestJson(destinationDirectory, rawAudio) + ",\n" +
                 "    \"wav\": " + fileManifestJson(destinationDirectory, waveAudio) + ",\n" +
@@ -4262,7 +5137,7 @@ public class TimeStamp implements QuPathExtension {
     private static void clearLogsStatic() {
         if (recordEvents.get() || transcriptStartPending || transcriptStopInProgress) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Pause recording and wait for transcript finalization before clearing event logs.");
+                    "Choose Finish & review and wait for the final transcript before clearing event logs.");
             return;
         }
         if (eventLog.isEmpty() && mouseMoveLog.isEmpty()) {
@@ -4303,45 +5178,8 @@ public class TimeStamp implements QuPathExtension {
         
         try (PrintWriter writer = new PrintWriter(new FileWriter(file, StandardCharsets.UTF_8))) {
             // Write CSV header
-            writer.println("Session_ID,Timestamp,Event_Type,Details,View_X,View_Y,View_Width,View_Height,View_CenterX,View_CenterY,View_Z,View_T,Downsample,Rotation,ROI_Type,ROI_BoundsX,ROI_BoundsY,ROI_BoundsWidth,ROI_BoundsHeight,ROI_NumPoints,ROI_Points");
-            
-            // Write all events
-            for (EventRecord entry : eventLog) {
-                List<String> columns = new ArrayList<>(List.of(
-                        csvEscape(entry.sessionId),
-                        csvEscape(formatter.format(entry.timestamp)),
-                        csvEscape(entry.eventType),
-                        csvEscape(entry.details),
-                        formatDecimal("%.1f", entry.view.x),
-                        formatDecimal("%.1f", entry.view.y),
-                        formatDecimal("%.1f", entry.view.width),
-                        formatDecimal("%.1f", entry.view.height),
-                        formatDecimal("%.1f", entry.view.centerX),
-                        formatDecimal("%.1f", entry.view.centerY),
-                        Integer.toString(entry.view.z),
-                        Integer.toString(entry.view.t),
-                        formatDecimal("%.4f", entry.view.downsample),
-                        formatDecimal("%.4f", entry.view.rotation)));
-                if (entry.annotation != null) {
-                    StringBuilder pts = new StringBuilder();
-                    for (int j = 0; j < entry.annotation.points.size(); j++) {
-                        double[] pt = entry.annotation.points.get(j);
-                        if (j > 0) pts.append(';');
-                        pts.append(String.format(Locale.ROOT, "(%.2f %.2f)", pt[0], pt[1]));
-                    }
-                    columns.add(csvEscape(entry.annotation.roiType));
-                    columns.add(formatDecimal("%.1f", entry.annotation.boundsX));
-                    columns.add(formatDecimal("%.1f", entry.annotation.boundsY));
-                    columns.add(formatDecimal("%.1f", entry.annotation.boundsWidth));
-                    columns.add(formatDecimal("%.1f", entry.annotation.boundsHeight));
-                    columns.add(Integer.toString(entry.annotation.numPoints));
-                    columns.add(csvEscape(pts.toString()));
-                } else {
-                    columns.addAll(List.of("", "", "", "", "", "", ""));
-                }
-                writer.println(String.join(",", columns));
-            }
-            
+            writer.print(serializeEventCsv(eventLog, transcriptSessionDir == null ? "" : transcriptSessionDir.getName()));
+
             logger.info("Event log exported to: {}", file.getAbsolutePath());
             Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, 
                 String.format("Event log exported successfully!%n%d events saved to:%n%s", 
@@ -4380,6 +5218,7 @@ public class TimeStamp implements QuPathExtension {
                 writer.println("    {");
                 writer.println("      \"sessionId\": \"" + escapeJson(entry.sessionId) + "\",");
                 writer.println("      \"timestamp\": \"" + escapeJson(formatter.format(entry.timestamp)) + "\",");
+                writer.println("      \"image\": " + recordedImageJson(entry.view.image) + ",");
                 writer.println("      \"eventType\": \"" + escapeJson(entry.eventType) + "\",");
                 writer.println("      \"details\": \"" + escapeJson(entry.details) + "\",");
                 writer.println("      \"zoom_view\": {");
@@ -4470,6 +5309,7 @@ public class TimeStamp implements QuPathExtension {
                 writer.println("    {");
                 writer.println("      \"sessionId\": \"" + escapeJson(entry.sessionId) + "\",");
                 writer.println("      \"timestamp\": \"" + escapeJson(formatter.format(entry.timestamp)) + "\",");
+                writer.println("      \"image\": " + recordedImageJson(entry.view.image) + ",");
                 writer.println("      \"eventType\": \"" + escapeJson(entry.eventType) + "\",");
                 writer.println("      \"details\": \"" + escapeJson(entry.details) + "\",");
                 writer.println("      \"zoom_view\": {");
@@ -4581,10 +5421,18 @@ public class TimeStamp implements QuPathExtension {
         final int t;
         final double downsample;
         final double rotation;
+        final RecordedImage image;
 
         ViewBounds(double x, double y, double width, double height,
                    double centerX, double centerY,
                    int z, int t, double downsample, double rotation) {
+            this(x, y, width, height, centerX, centerY, z, t, downsample, rotation, null);
+        }
+
+        ViewBounds(double x, double y, double width, double height,
+                   double centerX, double centerY, int z, int t,
+                   double downsample, double rotation, RecordedImage image) {
+            this.image = image;
             this.x = x;
             this.y = y;
             this.width = width;

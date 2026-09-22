@@ -14,6 +14,7 @@ import java.lang.reflect.Method;
 import java.io.ObjectInputStream;
 import java.nio.file.Path;
 import java.nio.file.Files;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Locale;
 
@@ -21,6 +22,215 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TimeStampTest {
+
+    @Test
+    void imageIdentitySurvivesEventExportAndRecovery(@TempDir Path directory) throws Exception {
+        RecordedImage first = RecordedImage.identify("project:file:///case.qpproj#1", "Slide A");
+        RecordedImage second = RecordedImage.identify("project:file:///case.qpproj#2", "Slide B");
+        assertFalse(first.id().equals(second.id()));
+        assertEquals(first.id(), RecordedImage.identify(first.source(), "Renamed slide").id());
+        assertEquals("null", TimeStamp.recordedImageJson(null));
+        Class<?> viewClass = Class.forName("qupath.ext.timestamp.TimeStamp$ViewBounds");
+        var viewConstructor = viewClass.getDeclaredConstructor(double.class, double.class,
+                double.class, double.class, double.class, double.class, int.class, int.class,
+                double.class, double.class, RecordedImage.class);
+        viewConstructor.setAccessible(true);
+        Class<?> eventClass = Class.forName("qupath.ext.timestamp.TimeStamp$EventRecord");
+        Class<?> annotationClass = Class.forName("qupath.ext.timestamp.TimeStamp$AnnotationGeometry");
+        var eventConstructor = eventClass.getDeclaredConstructor(long.class, LocalDateTime.class,
+                Instant.class, String.class, String.class, viewClass, annotationClass, String.class);
+        eventConstructor.setAccessible(true);
+        var events = new java.util.ArrayList<>();
+        for (RecordedImage image : List.of(first, second)) {
+            Object view = viewConstructor.newInstance(10., 20., 300., 200., 160., 120., 0, 0, 2., 0., image);
+            events.add(eventConstructor.newInstance((long) events.size() + 1, LocalDateTime.now(),
+                    Instant.now(), "Click", "same coordinates", view, null, "case"));
+        }
+        Path checkpoint = directory.resolve("events.bin");
+        try (var output = new java.io.ObjectOutputStream(Files.newOutputStream(checkpoint))) {
+            output.writeObject(events);
+        }
+        try (var input = new ObjectInputStream(Files.newInputStream(checkpoint))) {
+            var recovered = (List<?>) input.readObject();
+            var json = TimeStamp.class.getDeclaredMethod("serializeEventJson", List.class, String.class, String.class);
+            json.setAccessible(true);
+            String contents = (String) json.invoke(null, recovered, "events", "case");
+            assertTrue(contents.contains(first.id()));
+            assertTrue(contents.contains(second.id()));
+            var csv = TimeStamp.class.getDeclaredMethod("serializeEventCsv", List.class, String.class);
+            csv.setAccessible(true);
+            String rows = (String) csv.invoke(null, recovered, "case");
+            assertTrue(rows.contains("Image_ID,Image_Name,Image_Source"));
+            assertTrue(rows.contains(first.id()));
+            assertTrue(rows.contains(second.id()));
+        }
+    }
+
+    @Test
+    void reviewRevisionsSurviveResumeAndRequireExplicitResolution(@TempDir Path directory) throws Exception {
+        Path file = directory.resolve("take_previous_review.json");
+        String machine = "negative\n";
+        String edited = "clear\n";
+        String review = TimeStamp.reviewedTranscriptJson(edited, List.of());
+        var revision = ReviewRevisionStore.preserve(file, machine, review);
+        assertEquals(edited, ReviewRevisionStore.read(file).text());
+        assertEquals("clear\nnew speech\n", revision.project("negative\nnew speech\n"));
+        assertEquals("different final draft", revision.project("different final draft"));
+        org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> ReviewRevisionStore.preserve(file, "new", review));
+        ReviewRevisionStore.resolve(file, revision);
+        assertTrue(ReviewRevisionStore.read(file).resolved());
+        assertEquals(edited, ReviewRevisionStore.read(file).text());
+        ReviewRevisionStore.preserve(file, "new", review);
+        try (var history = Files.list(directory.resolve("review-history"))) {
+            assertEquals(2, history.count());
+        }
+        Files.writeString(file, "broken revision");
+        org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> ReviewRevisionStore.read(file));
+        assertEquals("broken revision", Files.readString(file));
+    }
+
+    @Test
+    void exportsRejectWorkingFoldersAndFileAliases(@TempDir Path directory) throws Exception {
+        Path working = Files.createDirectory(directory.resolve("working"));
+        Path source = Files.writeString(working.resolve("audio.wav"), "original audio");
+        for (Path target : List.of(working, working.resolve("export"), directory)) {
+            org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                    () -> ExportSafety.requireSeparateDestination(working, target));
+        }
+        ExportSafety.requireSeparateDestination(working, directory.resolve("exports/session"));
+        org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> ExportSafety.requireDifferentFiles(source, source));
+        Path alias = directory.resolve("alias");
+        try {
+            Files.createSymbolicLink(alias, working);
+            org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                    () -> ExportSafety.requireSeparateDestination(working, alias.resolve("export")));
+        } catch (UnsupportedOperationException | java.nio.file.FileSystemException ignored) {
+            // Symbolic links may be unavailable without developer privileges on Windows.
+        }
+        Path hardLink = directory.resolve("audio-link.wav");
+        try {
+            Files.createLink(hardLink, source);
+            org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                    () -> ExportSafety.requireDifferentFiles(source, hardLink));
+        } catch (UnsupportedOperationException | java.nio.file.FileSystemException ignored) {
+            // Some filesystems do not implement hard links.
+        }
+        assertEquals("original audio", Files.readString(source));
+    }
+
+    @Test
+    void excludingAudioNeverDeletesAnAliasedSource(@TempDir Path directory) throws Exception {
+        Path transcript = Files.writeString(directory.resolve("take.txt"), "machine text");
+        Path audio = Files.writeString(directory.resolve("take_audio.wav"), "original audio");
+        var copy = TimeStamp.class.getDeclaredMethod("copyWorkingRecordingFiles",
+                java.io.File.class, java.io.File.class, boolean.class);
+        copy.setAccessible(true);
+        for (boolean include : List.of(false, true)) {
+            var failure = org.junit.jupiter.api.Assertions.assertThrows(java.lang.reflect.InvocationTargetException.class,
+                    () -> copy.invoke(null, transcript.toFile(), transcript.toFile(), include));
+            assertTrue(failure.getCause() instanceof java.io.IOException);
+            assertEquals("original audio", Files.readString(audio));
+            assertEquals("machine text", Files.readString(transcript));
+        }
+        var managed = TimeStamp.class.getDeclaredMethod("copyOrRemoveManagedFile",
+                java.io.File.class, java.io.File.class, boolean.class);
+        managed.setAccessible(true);
+        org.junit.jupiter.api.Assertions.assertThrows(java.lang.reflect.InvocationTargetException.class,
+                () -> managed.invoke(null, audio.toFile(), audio.toFile(), false));
+        assertEquals("original audio", Files.readString(audio));
+    }
+
+    @Test
+    void savedSessionChecksumsDetectCorruptionAndRejectOutsidePaths(@TempDir Path directory) throws Exception {
+        Files.writeString(directory.resolve("transcript.txt"), "negative");
+        String manifest = "{\"schemaVersion\":2,\"transcript\":{\"path\":\"transcript.txt\",\"exists\":true,\"bytes\":8}}";
+        String checked = SessionIntegrity.addChecksums(manifest, directory);
+        SessionIntegrity.verify(checked, directory);
+        Files.writeString(directory.resolve("transcript.txt"), "positive");
+        org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> SessionIntegrity.verify(checked, directory));
+        org.junit.jupiter.api.Assertions.assertThrows(java.io.IOException.class,
+                () -> SessionIntegrity.addChecksums(manifest.replace("transcript.txt", "../outside.txt"), directory));
+    }
+
+    @Test
+    void reviewRecoveryRequiresExactSourceAndPreservesCheckedWords() {
+        var checked = List.of(new TimeStamp.ReviewWord("negative", 0, 8, 0, 500, .35, false));
+        String review = TimeStamp.reviewedTranscriptJson("negative", checked);
+        String checkpoint = ReviewRecovery.encode("machine source", review);
+        assertEquals(review, ReviewRecovery.matchingReview(checkpoint, "machine source"));
+        assertEquals(checked, TimeStamp.parseReviewWords(
+                ReviewRecovery.matchingReview(checkpoint, "machine source"), "negative"));
+        assertNull(ReviewRecovery.matchingReview(checkpoint, "new recording"));
+        assertNull(ReviewRecovery.matchingReview("broken", "machine source"));
+    }
+
+    @Test
+    void compactTimestampsPreserveTheRecordingClock() {
+        var local = LocalDateTime.parse("2026-09-09T10:00:00");
+        var origin = local.atZone(java.time.ZoneId.systemDefault()).toInstant();
+        assertEquals("00:03", TimeStamp.compactCaptionTimestamp("[2026-09-09T10:00:03.250]", origin));
+        assertEquals("10:00:03", TimeStamp.compactCaptionTimestamp("[2026-09-09T10:00:03.250]", null));
+        assertEquals("[unclear speech - review]", TimeStamp.compactCaptionTimestamp("[unclear speech - review]", origin));
+    }
+
+    @Test
+    void captionTokensKeepRawUtf16OffsetsAfterShorteningTimestamps() {
+        String raw = "[2026-09-09T10:00:03.250] 🙂 negative.\n";
+        var tokens = TimeStamp.captionTokens(raw, 7, null);
+        assertEquals("10:00:03", tokens.getFirst().text());
+        assertTrue(tokens.getFirst().timestamp());
+        for (var token : tokens) {
+            if (!token.timestamp()) assertEquals(token.text(), raw.substring(token.start() - 7, token.end() - 7));
+        }
+        assertEquals(raw.length() + 7, tokens.getLast().end());
+    }
+
+    @Test
+    void reviewedSnapshotRetainsCheckedDecisionsAndNullableConfidence() {
+        var words = List.of(new TimeStamp.ReviewWord("no", 0, 2, 0, 500, .35, false),
+                new TimeStamp.ReviewWord("invasion", 3, 11, 500, 1000, null, true));
+        String json = TimeStamp.reviewedTranscriptJson("no invasion", words);
+        assertEquals(words, TimeStamp.parseReviewWords(json, "no invasion"));
+        assertTrue(TimeStamp.parseReviewWords(json, "edited").isEmpty());
+    }
+
+    @Test
+    void reviewMetadataRequiresExactTextAndValidOffsets() {
+        String json = """
+                {"version":1,"transcript":"no invasion","words":[
+                  {"word":"no","start":0,"end":2,"start_ms":0,"end_ms":500,
+                   "confidence":0.35,"needs_review":true},
+                  {"word":"invasion","start":3,"end":11,"start_ms":500,"end_ms":1000,
+                   "confidence":null,"needs_review":false}]}
+                """;
+        var words = TimeStamp.parseReviewWords(json, "no invasion");
+        assertEquals(2, words.size());
+        assertTrue(words.getFirst().needsReview());
+        assertNull(words.getLast().confidence());
+        assertTrue(TimeStamp.parseReviewWords(json, "invasion").isEmpty());
+        assertTrue(TimeStamp.parseReviewWords(json.replace("\"end\":11", "\"end\":100"), "no invasion").isEmpty());
+        assertTrue(TimeStamp.parseReviewWords(json.replace("0.35", "1.5"), "no invasion").isEmpty());
+        assertTrue(TimeStamp.parseReviewWords("broken", "no invasion").isEmpty());
+    }
+
+    @Test
+    void correctingOneWordKeepsOtherWordConfidenceAndAudioTiming() {
+        var words = List.of(
+                new TimeStamp.ReviewWord("no", 0, 2, 0, 500, 0.3, true),
+                new TimeStamp.ReviewWord("invasion", 3, 11, 500, 1000, 0.4, true));
+        var rebased = TimeStamp.rebaseReviewWords(words, "no invasion", "negative invasion");
+        assertEquals(1, rebased.size());
+        assertEquals("invasion", rebased.getFirst().word());
+        assertEquals(9, rebased.getFirst().start());
+        assertEquals(17, rebased.getFirst().end());
+        assertEquals(500, rebased.getFirst().startMs());
+        assertEquals(0.4, rebased.getFirst().confidence());
+        assertTrue(TimeStamp.rebaseReviewWords(words, "no invasion", "").isEmpty());
+    }
 
     @Test
     void exposesExtensionVersionForPanel() {
@@ -120,6 +330,7 @@ class TimeStampTest {
                 "AUDIO_SILENT\t30.0",
                 "AUDIO_RECOVERED",
                 "TRANSCRIPT_READY",
+                "CAPTURE_STATE\tpaused",
                 "RECORDING_ORIGIN\t2026-08-25T20:00:00.000Z",
                 "LIVE_MODEL_READY\tsmall.en",
                 "TRANSCRIPT_UPDATED",
@@ -127,11 +338,19 @@ class TimeStampTest {
                 "TURN_ENDED\t2026-08-25T20:00:04.000Z",
                 "FINALIZE_PROGRESS\t12.0\t60.0",
                 "FINALIZATION_RESULT\tfinal");
+        var covered = EnumSet.noneOf(TimeStamp.TranscriptMessageType.class);
         for (String message : messages) {
             TimeStamp.TranscriptMessage parsed = TimeStamp.parseTranscriptMessage(message);
             assertFalse(parsed.type() == TimeStamp.TranscriptMessageType.MALFORMED, message);
             assertFalse(parsed.type() == TimeStamp.TranscriptMessageType.LOG, message);
+            covered.add(parsed.type());
         }
+        // LOG and MALFORMED are local sentinels, never sent on the wire.
+        var wireMessages = EnumSet.allOf(TimeStamp.TranscriptMessageType.class);
+        wireMessages.remove(TimeStamp.TranscriptMessageType.LOG);
+        wireMessages.remove(TimeStamp.TranscriptMessageType.MALFORMED);
+        assertEquals(wireMessages, covered,
+                "every protocol message needs an example in this test");
         assertEquals(TimeStamp.TranscriptMessageType.MALFORMED,
                 TimeStamp.parseTranscriptMessage("AUDIO_LEVEL\tnot-a-number\thearing").type());
         assertEquals(TimeStamp.TranscriptMessageType.MALFORMED,
@@ -213,7 +432,7 @@ class TimeStampTest {
 
     @Test
     void usesSeparateCaptureAndFinalizationHelperModes() {
-        assertEquals(List.of("--capture-only"),
+        assertEquals(List.of("--capture-only", "--interactive-control"),
                 TimeStamp.transcriptLifecycleArguments(false));
         assertEquals(List.of("--finalize-existing"),
                 TimeStamp.transcriptLifecycleArguments(true));
@@ -221,6 +440,12 @@ class TimeStampTest {
 
     @Test
     void mapsPauseResumeDoneWorkflowActionsWithoutEndingTheTake() {
+        assertEquals(TimeStamp.TranscriptMessageType.CAPTURE_STATE,
+                TimeStamp.parseTranscriptMessage("CAPTURE_STATE\tpaused").type());
+        assertEquals(TimeStamp.TranscriptMessageType.CAPTURE_STATE,
+                TimeStamp.parseTranscriptMessage("CAPTURE_STATE\trecording").type());
+        assertEquals(TimeStamp.TranscriptMessageType.MALFORMED,
+                TimeStamp.parseTranscriptMessage("CAPTURE_STATE\tunknown").type());
         assertEquals(TimeStamp.RecordingPrimaryAction.START,
                 TimeStamp.recordingPrimaryAction(TimeStamp.RecordingWorkflowState.READY));
         assertEquals(TimeStamp.RecordingPrimaryAction.PAUSE,
@@ -392,6 +617,7 @@ class TimeStampTest {
         Files.writeString(source.resolveSibling("working_transcript_live.txt"), "live transcript");
         Files.writeString(source.resolveSibling("working_transcript_segments.csv"), "segment header\n");
         Files.writeString(source.resolveSibling("working_transcript_words.csv"), "word header\n");
+        Files.writeString(source.resolveSibling("working_transcript_review.json"), "review metadata");
         Files.writeString(source.resolveSibling("working_transcript_audio.raw"), "raw audio");
         Files.writeString(source.resolveSibling("working_transcript_audio.wav"), "wave audio");
         Files.writeString(source.resolveSibling("working_transcript_audio.start.txt"), "start time");
@@ -408,6 +634,8 @@ class TimeStampTest {
                 Files.readString(destination.resolveSibling("saved_transcript_timed.txt")));
         assertEquals("segment header\n",
                 Files.readString(destination.resolveSibling("saved_transcript_segments.csv")));
+        assertEquals("review metadata",
+                Files.readString(destination.resolveSibling("saved_transcript_review.json")));
 
         copyWorkingFiles.invoke(null, source.toFile(), destination.toFile(), true);
         assertEquals("raw audio", Files.readString(savedRaw));
