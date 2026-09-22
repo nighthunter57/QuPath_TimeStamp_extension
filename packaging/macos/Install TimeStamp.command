@@ -130,12 +130,19 @@ fi
 
 echo "Verifying microphone and transcription support..."
 "$PYTHON_BIN" -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
-echo "Testing the microphone for 3 seconds. Speak normally now..."
-if ! "$PYTHON_BIN" "$HELPER_FILE" --check-audio --check-seconds 3; then
-  echo "Warning: the microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking macOS permissions."
+if [[ "${TIMESTAMP_SKIP_AUDIO_CHECK:-0}" != "1" ]]; then
+  echo "Testing the microphone for 3 seconds. Speak normally now..."
+  if ! "$PYTHON_BIN" "$HELPER_FILE" --check-audio --check-seconds 3; then
+    echo "Warning: the microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking macOS permissions."
+  fi
 fi
 
 INSTALL_TARGET="${EXTENSIONS_DIR}/$(basename "$JAR_FILE")"
+BACKUP_DIR="${SUPPORT_DIR}/extension-backups/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+mkdir -p "$BACKUP_DIR"
+for old_jar in "${EXTENSIONS_DIR}"/TimeStamp-*.jar; do
+  if [[ -f "$old_jar" ]]; then cp "$old_jar" "$BACKUP_DIR/"; fi
+done
 cp "$JAR_FILE" "${INSTALL_TARGET}.new"
 for old_jar in "${EXTENSIONS_DIR}"/TimeStamp-*.jar; do
   if [[ -f "$old_jar" && "$old_jar" != "$INSTALL_TARGET" ]]; then

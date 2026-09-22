@@ -104,13 +104,20 @@ if ($env:TIMESTAMP_SKIP_MODEL_DOWNLOAD -ne "1") {
 Write-Host "Verifying microphone and transcription support..."
 & $PythonBin -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
 if ($LASTEXITCODE -ne 0) { throw "Recorder verification failed." }
-Write-Host "Testing the microphone for 3 seconds. Speak normally now..."
-& $PythonBin $HelperFile --check-audio --check-seconds 3
-if ($LASTEXITCODE -ne 0) {
-    Write-Warning "The microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking Windows privacy permissions."
+if ($env:TIMESTAMP_SKIP_AUDIO_CHECK -ne "1") {
+    Write-Host "Testing the microphone for 3 seconds. Speak normally now..."
+    & $PythonBin $HelperFile --check-audio --check-seconds 3
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking Windows privacy permissions."
+    }
 }
 
 $InstallTarget = Join-Path $ExtensionsDir $JarFile.Name
+$BackupDir = Join-Path $SupportDir ("extension-backups\" + [DateTime]::UtcNow.ToString("yyyyMMddTHHmmss") + "-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $BackupDir -Force | Out-Null
+Get-ChildItem -LiteralPath $ExtensionsDir -Filter "TimeStamp-*.jar" -File | ForEach-Object {
+    Copy-Item -LiteralPath $_.FullName -Destination $BackupDir
+}
 Copy-Item -LiteralPath $JarFile.FullName -Destination "$InstallTarget.new" -Force
 Get-ChildItem -LiteralPath $ExtensionsDir -Filter "TimeStamp-*.jar" -File | ForEach-Object {
     if ($_.FullName -ne $InstallTarget) { Remove-Item -LiteralPath $_.FullName -Force }

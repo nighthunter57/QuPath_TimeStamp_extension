@@ -1,10 +1,64 @@
-name: Make draft release
+name: Build draft extension release
 
 on:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Semantic version without the v prefix, for example 0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    permissions:
-      contents: write
-    uses: qupath/actions/.github/workflows/github-release.yml@main
+  release:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate version
+        shell: bash
+        run: |
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid semantic version: $VERSION" >&2
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and test release
+        run: ./scripts/build_doctor_package.sh "$VERSION"
+
+      - name: Verify release files
+        shell: bash
+        run: |
+          test -f "build/libs/TimeStamp-${VERSION}.jar"
+          test -f "build/libs/TimeStamp-${VERSION}-javadoc.jar"
+          test -f "build/libs/TimeStamp-${VERSION}-sources.jar"
+          test -f "build/distributions/TimeStamp-Doctor-${VERSION}.zip"
+
+      - name: Create draft GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "v${VERSION}" \
+            "build/libs/TimeStamp-${VERSION}.jar" \
+            "build/libs/TimeStamp-${VERSION}-javadoc.jar" \
+            "build/libs/TimeStamp-${VERSION}-sources.jar" \
+            "build/distributions/TimeStamp-Doctor-${VERSION}.zip" \
+            --draft \
+            --generate-notes \
+            --target "$GITHUB_SHA" \
+            --title "TimeStamp v${VERSION}"

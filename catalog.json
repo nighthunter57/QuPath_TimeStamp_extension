@@ -1,0 +1,14 @@
+{
+  "name": "TimeStamp Extension Catalog",
+  "description": "Releases of the TimeStamp live event and transcript capture extension for QuPath.",
+  "extensions": [
+    {
+      "name": "TimeStamp Extension",
+      "description": "Record timestamped QuPath viewer events together with a synchronized live microphone transcript.",
+      "author": "HULA Lab",
+      "homepage": "https://github.com/nighthunter57/QuPath_TimeStamp_extension",
+      "starred": false,
+      "releases": []
+    }
+  ]
+}

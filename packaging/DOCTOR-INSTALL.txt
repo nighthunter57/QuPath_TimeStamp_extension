@@ -32,14 +32,27 @@ microphone access if the operating system asks.
 Use:
 Extensions > TimeStamp Extension > Open Clinical Session Recorder
 
-Click Start Recording. When finished, click Stop & Review, review the text, and
-click Save Session. The folder choice appears only after Save.
+Click Start Recording. Pause/Resume keeps the same session open. Done stops
+capture and prepares the final transcript. Review the text, then click Save Session.
+The folder choice appears only after Save. Recent actions remain visible while
+recording; View all actions expands the list.
 
 Privacy:
 Recording and transcription run locally after installation. Audio is not sent
 to a transcription service. The installer uses the internet only to download
 the private runtime, Python libraries, and speech-to-text models.
+Working audio is retained under your QuPath user folder in timestamp/recordings,
+even when you exclude audio from the exported session. Review changes are
+checkpointed every two seconds. Undo history itself is only kept while open.
+No automatic deletion or application-level encryption is configured. Protect this
+computer and its QuPath folder using your organization's storage policy. To remove
+a working recording deliberately, close QuPath and remove only its identified
+session folder after verifying your saved copy. Discard marks a session as ignored;
+it does not erase the audio. Avoid patient details in session names.
 
 Updates:
 Normal TimeStamp JAR updates preserve the private runtime and downloaded models.
 Restart QuPath after updating the extension.
+Previous extension JARs are backed up under timestamp/extension-backups. To roll
+back, close QuPath, move the current TimeStamp JAR out of extensions, and restore
+the previous JAR from that backup. Keep only one TimeStamp JAR in extensions.
