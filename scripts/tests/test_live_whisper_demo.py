@@ -1502,8 +1502,9 @@ class TranscriptLogicTest(unittest.TestCase):
         )
 
     def test_stdio_is_utf8_even_when_the_platform_pipe_is_cp1252(self):
-        out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
-        err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        # Fixed newlines: Windows would otherwise write \r\n, which Java readLine also accepts.
+        out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="\n")
+        err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="\n")
         with patch.object(transcript.sys, "stdout", out), patch.object(transcript.sys, "stderr", err):
             transcript.use_utf8_stdio()
             transcript.emit_protocol_message("TRANSCRIPT_PARTIAL", "Ki-67 ≥ 20% — 🧪")
