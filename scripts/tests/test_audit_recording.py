@@ -25,7 +25,7 @@ class AuditRecordingTest(unittest.TestCase):
         text.write_text("[2026-09-17T10:00:00] private phrase\n", encoding="utf-8")
         rows = words if words is not None else [{"word": "private", "start_ms": 0, "end_ms": 500}]
         metadata = root / "test_review.json"
-        metadata.write_text(json.dumps({"version": 1, "transcript": text.read_text(), "words": rows}), encoding="utf-8")
+        metadata.write_text(json.dumps({"version": 1, "transcript": text.read_text(encoding="utf-8"), "words": rows}), encoding="utf-8")
         return audio, text, metadata
 
     def test_gaps_keep_capture_clock_and_do_not_change_inputs_or_leak_text(self):

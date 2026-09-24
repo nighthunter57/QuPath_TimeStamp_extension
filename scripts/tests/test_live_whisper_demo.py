@@ -106,7 +106,7 @@ class TranscriptLogicTest(unittest.TestCase):
             self.assertEqual(origin, transcript.read_recording_start(path.with_name("interactive_audio.start.txt")))
             self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
             self.assertEqual([f"w{i}" for i in range(1, 37)],
-                [word for word in path.read_text().split() if word.startswith("w")])
+                [word for word in path.read_text(encoding="utf-8").split() if word.startswith("w")])
 
     def test_disk_backlog_preserves_original_float_samples_and_order(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -243,7 +243,7 @@ class TranscriptLogicTest(unittest.TestCase):
             self.assertEqual(0, transcript.main())
             self.assertEqual(expected_seconds, decoded_seconds)
             self.assertEqual(len(speech_mask) * 0.5, transcript.wave_audio_duration_seconds(path.with_name("capture_audio.wav")))
-            self.assertEqual(len(expected_seconds), path.read_text().count("recorded speech"))
+            self.assertEqual(len(expected_seconds), path.read_text(encoding="utf-8").count("recorded speech"))
             self.assertEqual(1, output.getvalue().count("FINALIZATION_RESULT\tpaused"))
             self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
             self.assertEqual(origin, transcript.read_recording_start(path.with_name("capture_audio.start.txt")))
@@ -342,7 +342,7 @@ class TranscriptLogicTest(unittest.TestCase):
             path = Path(directory) / "capture.txt"
             transcript.write_lines(path, [line])
             transcript.write_review_metadata(path, [line], rows)
-            document = json.loads(path.with_name("capture_review.json").read_text())
+            document = json.loads(path.with_name("capture_review.json").read_text(encoding="utf-8"))
             encoded = document["transcript"].encode("utf-16-le")
             for word in document["words"]:
                 self.assertEqual(word["word"], encoded[word["start"] * 2:word["end"] * 2].decode("utf-16-le"))
@@ -1070,16 +1070,16 @@ class TranscriptLogicTest(unittest.TestCase):
                 self.assertEqual(live_text, root.joinpath(
                     "case_transcript_live.txt").read_text(encoding="utf-8"))
                 self.assertEqual(original_audio, hashlib.sha256(wave_path.read_bytes()).hexdigest())
-                with root.joinpath("case_transcript_segments.csv").open(newline="") as source:
+                with root.joinpath("case_transcript_segments.csv").open(newline="", encoding="utf-8") as source:
                     rows = list(csv.DictReader(source))
                 self.assertEqual([2000, 5000], [int(row["start_ms"]) for row in rows])
                 line_times = [transcript.parse_transcript_line(line)[0]
                               for line in final_text.splitlines()]
                 self.assertEqual(line_times, [datetime.fromisoformat(
                     row["start_utc"].replace("Z", "+00:00")) for row in rows])
-                with root.joinpath("case_transcript_words.csv").open(newline="") as source:
+                with root.joinpath("case_transcript_words.csv").open(newline="", encoding="utf-8") as source:
                     word_rows = list(csv.DictReader(source))
-                review = json.loads(root.joinpath("case_transcript_review.json").read_text())
+                review = json.loads(root.joinpath("case_transcript_review.json").read_text(encoding="utf-8"))
                 self.assertEqual(final_text, review["transcript"])
                 self.assertEqual(len(word_rows), len(review["words"]))
                 self.assertEqual([int(row["start_ms"]) for row in word_rows],
