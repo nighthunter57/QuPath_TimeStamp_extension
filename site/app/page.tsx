@@ -25,7 +25,7 @@ function RecorderPreview() {
         </div>
         <div className="preview-panel">
           <div className="preview-recording"><span className="record-dot" /> Recording <span>00:24</span></div>
-          <div className="preview-controls" aria-label="Illustrated recorder controls, not interactive"><span><Pause size={13} aria-hidden="true" /> Pause</span><span>Done</span></div>
+          <div className="preview-controls" aria-label="Illustrated recorder controls, not interactive"><span><Pause size={13} aria-hidden="true" /> Pause</span><span>Finish &amp; review</span></div>
           <div className="preview-transcript"><p className="mini-label">Transcript · live preview</p><p>Let’s take a closer look at this area.</p><p className="preview-pending">Moving to the next field…</p></div>
           <div className="preview-events"><p className="mini-label">Recorded actions</p><p><span>00:18</span> Zoom changed</p><p><span>00:22</span> View moved</p></div>
         </div>
@@ -72,7 +72,7 @@ export default function Home() {
               <div className="before-icon"><Laptop size={27} aria-hidden="true" /></div>
               <h3>Before you begin</h3>
               <ul className="checklist">
-                <li><Check size={18} aria-hidden="true" /><span><strong>Internet for setup</strong>The speech models are large downloads. Leave time for them to finish.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>Internet for setup</strong>About 3.6 GB of speech models download once. Ideally, IT or a colleague completes setup and a test recording before your first session.</span></li>
                 <li><Check size={18} aria-hidden="true" /><span><strong>A working microphone</strong>A built-in or connected microphone is fine. Test it before recording.</span></li>
                 <li><Check size={18} aria-hidden="true" /><span><strong>Permission to install</strong>On a hospital computer, check with IT first.</span></li>
               </ul>
@@ -108,9 +108,9 @@ export default function Home() {
         <section id="first-recording" className="recording-section">
           <div className="site-container section">
             <div className="section-heading"><div><p className="eyebrow">02 / Your first recording</p><h2>Try it once. Then make it your routine.</h2><p>Use a short test with no patient information before your first real session.</p></div></div>
-            <div className="workflow-summary" aria-label="Recording workflow"><span>Start</span><ArrowRight aria-hidden="true" /><span>Pause / Resume</span><ArrowRight aria-hidden="true" /><span>Done</span><ArrowRight aria-hidden="true" /><span>Review</span><ArrowRight aria-hidden="true" /><span>Save</span></div>
+            <div className="workflow-summary" aria-label="Recording workflow"><span>Start</span><ArrowRight aria-hidden="true" /><span>Pause / Resume</span><ArrowRight aria-hidden="true" /><span>Finish &amp; review</span><ArrowRight aria-hidden="true" /><span>Save</span></div>
             <ol className="recording-grid">{recorderSteps.map((step, index) => <li key={step.title}><span className="recording-number">0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol>
-            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Done finishes the recording.</strong><br />Use Resume to continue the same session. Choose Done only when you are ready for the final transcript.</p></div>
+            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Finish &amp; review ends the recording.</strong><br />Use Resume to continue the same session. Choose Finish &amp; review only when you are ready for the final transcript. Need to add more afterwards? Record more continues the same take.</p></div>
           </div>
         </section>
 
@@ -118,8 +118,8 @@ export default function Home() {
           <div><p className="eyebrow">03 / Know where your data goes</p><h2>Local recording.<br />Thoughtful review.</h2><p className="section-intro">TimeStamp helps you capture your work. You stay responsible for checking the text and protecting the recording.</p></div>
           <div className="privacy-items">
             <article><ShieldCheck aria-hidden="true" /><div><h3>Your audio stays on this computer</h3><p>Transcription runs locally after the required models are installed. Audio is not sent to a transcription service.</p></div></article>
-            <article><Headphones aria-hidden="true" /><div><h3>Live text is a preview—not a clinical record</h3><p>Words can change or be missed. After Done, review the final text against the audio before using or sharing it.</p></div></article>
-            <article><FileText aria-hidden="true" /><div><h3>Saving and deleting are different</h3><p>Working audio stays in your QuPath user folder under <code>timestamp/recordings</code>, even when you exclude it from an export. Discard does not erase it. No automatic deletion or application-level encryption is configured.</p></div></article>
+            <article><Headphones aria-hidden="true" /><div><h3>Live text is a preview—not a clinical record</h3><p>Words can change or be missed. After Finish &amp; review, check the final text against the audio before using or sharing it.</p></div></article>
+            <article><FileText aria-hidden="true" /><div><h3>Saving and deleting are different</h3><p>Working audio stays in your QuPath user folder under <code>timestamp/recordings</code>, even when you exclude it from an export. Declining to save when you close QuPath does not erase it. No automatic deletion or application-level encryption is configured.</p></div></article>
           </div>
         </section>
 

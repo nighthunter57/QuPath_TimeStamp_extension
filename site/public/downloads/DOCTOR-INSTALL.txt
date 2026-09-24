@@ -1,5 +1,18 @@
 TIMESTAMP FOR QUPATH 0.6 — DOCTOR INSTALLATION
 
+FASTEST HANDOFF
+Have the person preparing the computer complete the setup and a test recording
+before the doctor's session. The doctor then only opens QuPath and Start Recording.
+No separate Python installation, terminal commands, or model selection is needed
+on Windows or macOS: the installer handles the private recorder runtime.
+
+First setup needs internet and large model downloads (about 3.6 GB of model
+weights, plus the runtime and libraries). Do this ahead of the appointment.
+This ZIP does not contain the models. Installation time depends on the network
+and computer; setup is not complete until all four stages finish.
+The standard package installs only the Whisper engine used by automatic mode.
+The experimental Parakeet engine is not part of the standard doctor install.
+
 Supported systems:
 - Windows 10/11: x64 or ARM64
 - macOS: Apple Silicon or Intel
@@ -13,9 +26,11 @@ Before installation:
 4. Close QuPath completely.
 
 Windows:
+Extract the downloaded ZIP first; do not run the installer inside the ZIP viewer.
 Double-click "Install TimeStamp on Windows.bat".
 
 macOS:
+Extract the downloaded ZIP first.
 Double-click "Install TimeStamp.command". If macOS blocks it, Control-click the
 file, choose Open, then choose Open again.
 
@@ -32,10 +47,13 @@ microphone access if the operating system asks.
 Use:
 Extensions > TimeStamp Extension > Open Clinical Session Recorder
 
-Click Start Recording. Pause/Resume keeps the same session open. Done stops
+Click Start Recording. Pause/Resume keeps the same session open. Finish & review stops
 capture and prepares the final transcript. Review the text, then click Save Session.
 The folder choice appears only after Save. Recent actions remain visible while
 recording; View all actions expands the list.
+More > Open saved session reopens a saved session folder for review. Include
+audio when saving if you want word replay after reopening. If you correct text
+then Record more, Compare earlier review preserves and reconciles your corrections.
 
 Privacy:
 Recording and transcription run locally after installation. Audio is not sent
@@ -47,10 +65,15 @@ checkpointed every two seconds. Undo history itself is only kept while open.
 No automatic deletion or application-level encryption is configured. Protect this
 computer and its QuPath folder using your organization's storage policy. To remove
 a working recording deliberately, close QuPath and remove only its identified
-session folder after verifying your saved copy. Discard marks a session as ignored;
-it does not erase the audio. Avoid patient details in session names.
+session folder after verifying your saved copy. Answering No to "Save the
+transcript and timestamps before closing QuPath?" only stops TimeStamp offering to
+recover that recording; it does not erase the audio. Avoid patient details in
+session names.
 
 Updates:
+Complete cached model files are reused without contacting the model download
+service during setup. Interrupted downloads can be resumed by running the same
+installer again. A rerun still checks the runtime and recorder libraries.
 Normal TimeStamp JAR updates preserve the private runtime and downloaded models.
 Restart QuPath after updating the extension.
 Previous extension JARs are backed up under timestamp/extension-backups. To roll

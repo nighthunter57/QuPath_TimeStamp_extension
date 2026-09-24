@@ -2,7 +2,7 @@ export type Computer = "windows" | "mac" | "linux";
 
 export const doctorPackage = {
   version: "0.1.0-SNAPSHOT",
-  date: "September 15, 2026",
+  date: "September 23, 2026",
   href: "./downloads/TimeStamp-Doctor-0.1.0-SNAPSHOT.zip",
   instructions: "./downloads/DOCTOR-INSTALL.txt",
 };
@@ -50,16 +50,17 @@ export const recorderSteps = [
   { title: "Check your microphone", text: "Open Settings, choose your microphone, and use Test microphone. Allow microphone access when asked. You do not need to set up Python yourself." },
   { title: "Start a short test", text: "Choose Start Recording. Wait for Recording, then say a few test sentences. Check the signal indicator, transcript, and recorded actions. Do not use patient information for this test." },
   { title: "Pause, then resume", text: "Choose Pause for a break. Choose Resume to continue the same recording. Pause does not finish the session or create the final transcript." },
-  { title: "Choose Done and review", text: "Done stops recording and prepares the final transcript. This can take time. Replay uncertain words and correct the text, including numbers and negations. A confidence highlight is not a guarantee of correctness." },
-  { title: "Save Session", text: "Choose Save Session and select the destination folder and export options. Check the saved files. The folder choice appears here, not before you start recording." },
+  { title: "Choose Finish & review", text: "Finish & review stops recording and prepares the final transcript. This can take time. Replay uncertain words and correct the text, including numbers and negations. A confidence highlight is not a guarantee of correctness." },
+  { title: "Save Session", text: "Choose Save Session and select the destination folder and export options. Include audio if you want to replay words after reopening. The folder choice appears here, not before you start recording." },
 ];
 
 export const helpItems = [
-  { question: "The installer is taking a long time. Is it stuck?", answer: "The first setup downloads a private Python runtime and large speech models. Time depends on your internet connection and computer; it is not a five-minute installation guarantee. Keep the setup window open. If it reports an error, save the error text without patient information and ask for help." },
+  { question: "The installer is taking a long time. Is it stuck?", answer: "The first setup downloads a private Python runtime and about 3.6 GB of speech models. Time depends on your internet connection and computer; it is not a five-minute installation guarantee. Keep the setup window open. If the download is interrupted, run the same installer again; completed model files are reused. If it reports an error, save the error text without patient information and ask for help." },
   { question: "The computer blocks the installer.", answer: "Hospital-managed computers may need IT approval. Ask IT to review the download and installation steps. Do not turn off security protections or bypass your organization’s policy." },
   { question: "TimeStamp does not appear in QuPath.", answer: "Close QuPath completely and reopen it. Check that you are using QuPath 0.6 and completed its first-time setup before installing TimeStamp. If you chose a custom QuPath user folder, ask your administrator to install TimeStamp in that folder; the installer assumes the default folder." },
   { question: "The installer finished, but the microphone does not work.", answer: "Installation can finish even if its microphone test fails. Connect a microphone, check your computer’s microphone permissions, and select the correct input in TimeStamp Settings. Run Test microphone inside QuPath before starting a session." },
   { question: "Do I need internet every time?", answer: "The normal installer downloads the default English live model and final transcription model. With those models installed, recording and transcription run locally. Changing to an uncached model or another language may require another download." },
+  { question: "Can I reopen a saved session or add more to it?", answer: "Yes. In the recorder, choose More → Open saved session… and select the folder created by Save Session. Word replay and Record more need audio included in that save. If you corrected text and then Record more, TimeStamp asks you to compare your earlier corrections with the new transcript before keeping it." },
   { question: "Is this ready for routine clinical use?", answer: "This is a preview for supervised evaluation, not a clinically validated transcription system. The macOS runtime installation and upgrade have been checked; full model-download, real-microphone, long-session, and Windows/Linux acceptance tests remain. Follow your organization’s approval process and review every transcript." },
-  { question: "Does Discard delete the recording?", answer: "No. Discard hides a session from recovery; it does not erase its audio. Working recordings remain in the QuPath user folder under timestamp/recordings, even if you exclude audio when exporting. Automatic deletion and application-level encryption are not configured. Follow your organization’s retention policy." },
+  { question: "If I close QuPath without saving, is the recording deleted?", answer: "No. Answering No to “Save the transcript and timestamps before closing QuPath?” only stops TimeStamp offering to recover that recording; it does not erase its audio. Working recordings remain in the QuPath user folder under timestamp/recordings, even if you exclude audio when exporting. Automatic deletion and application-level encryption are not configured. Follow your organization’s retention policy." },
 ];
