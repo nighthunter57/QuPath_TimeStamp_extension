@@ -54,6 +54,14 @@ export const recorderSteps = [
   { title: "Save Session", text: "Choose Save Session and select the destination folder and export options. Include audio if you want to replay words after reopening. The folder choice appears here, not before you start recording." },
 ];
 
+export const savedContents = [
+  { title: "Reviewed transcript", text: "Your corrected text, kept alongside the original machine transcript so changes can be checked." },
+  { title: "Word and phrase timings", text: "A timed transcript plus spreadsheet (CSV) files giving the time of every phrase and word." },
+  { title: "Image actions", text: "Zoom, view, click and annotation actions with timestamps, as CSV and JSON." },
+  { title: "Audio, if you include it", text: "Needed to replay words or Record more after reopening. Leave it out only if you do not need either." },
+  { title: "A verification manifest", text: "Checksums that let TimeStamp confirm the folder is complete when you reopen it with Open saved session." },
+];
+
 export const helpItems = [
   { question: "The installer is taking a long time. Is it stuck?", answer: "The first setup downloads a private Python runtime and about 3.6 GB of speech models. Time depends on your internet connection and computer; it is not a five-minute installation guarantee. Keep the setup window open. If the download is interrupted, run the same installer again; completed model files are reused. If it reports an error, save the error text without patient information and ask for help." },
   { question: "The computer blocks the installer.", answer: "Hospital-managed computers may need IT approval. Ask IT to review the download and installation steps. Do not turn off security protections or bypass your organization’s policy." },

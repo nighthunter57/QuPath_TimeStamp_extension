@@ -8,7 +8,7 @@ import {
   Pause, Printer, ShieldCheck,
 } from "lucide-react";
 import histologyBanner from "@/assets/histology-support-banner.jpg";
-import { computers, doctorPackage, helpItems, recorderSteps, type Computer } from "@/data/install-guide";
+import { computers, doctorPackage, helpItems, recorderSteps, savedContents, type Computer } from "@/data/install-guide";
 
 const repository = "https://github.com/nighthunter57/QuPath_TimeStamp_extension";
 const qupathDownload = "https://github.com/qupath/qupath/releases/tag/v0.6.0";
@@ -111,6 +111,7 @@ export default function Home() {
             <div className="workflow-summary" aria-label="Recording workflow"><span>Start</span><ArrowRight aria-hidden="true" /><span>Pause / Resume</span><ArrowRight aria-hidden="true" /><span>Finish &amp; review</span><ArrowRight aria-hidden="true" /><span>Save</span></div>
             <ol className="recording-grid">{recorderSteps.map((step, index) => <li key={step.title}><span className="recording-number">0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol>
             <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Finish &amp; review ends the recording.</strong><br />Use Resume to continue the same session. Choose Finish &amp; review only when you are ready for the final transcript. Need to add more afterwards? Record more continues the same take.</p></div>
+            <div className="saved-contents"><div><h3>What Save Session gives you</h3><p>One folder you choose, containing:</p></div><ul>{savedContents.map(item => <li key={item.title}><Check size={17} aria-hidden="true" /><span><strong>{item.title}</strong>{item.text}</span></li>)}</ul></div>
           </div>
         </section>
 

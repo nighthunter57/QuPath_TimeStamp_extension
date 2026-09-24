@@ -115,7 +115,7 @@ h2 { margin-top: 12px; font-size: clamp(29px, 3vw, 38px); font-weight: 650; line
 .print-button { display: inline-flex; align-items: center; flex-shrink: 0; gap: 8px; min-height: 44px; font-size: 13px; color: #145c50; font-weight: 600; }
 .print-button:hover { text-decoration: underline; }
 .installation-layout { display: grid; grid-template-columns: 290px 1fr; gap: 42px; align-items: start; }
-.before-panel { background: #edf2e9; padding: 26px; border-radius: 12px; }
+.before-panel { background: #edf2e9; padding: 26px; border-radius: 12px; position: sticky; top: 112px; align-self: start; }
 .before-icon { margin-bottom: 20px; color: #145c50; }
 h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px; }
 .checklist { margin-top: 24px; display: grid; gap: 23px; }
@@ -171,6 +171,12 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .recording-grid p { margin-top: 10px; color: #58665d; font-size: 14px; line-height: 1.8; }
 .important-difference { display: flex; align-items: center; gap: 17px; padding: 20px 24px; margin-top: 4px; background: #f0f4ec; color: #40583f; border-radius: 8px; font-size: 13px; line-height: 1.8; }
 .important-difference svg { flex-shrink: 0; }
+.saved-contents { display: grid; grid-template-columns: .8fr 2.2fr; gap: 32px; margin-top: 40px; padding-top: 32px; border-top: 1px solid #dce3dc; }
+.saved-contents > div p { margin-top: 8px; color: #58665d; font-size: 14px; }
+.saved-contents ul { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px 32px; }
+.saved-contents li { display: flex; align-items: flex-start; gap: 10px; color: #58665d; font-size: 14px; line-height: 1.7; }
+.saved-contents li svg { flex-shrink: 0; margin-top: 4px; color: #145c50; }
+.saved-contents strong { display: block; color: #253a2c; font-weight: 650; }
 .privacy-layout { display: grid; grid-template-columns: .8fr 1.2fr; gap: 90px; }
 .privacy-items { display: grid; gap: 26px; }
 .privacy-items article { display: flex; align-items: flex-start; gap: 17px; }
@@ -220,7 +226,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
   .section { padding-block: 48px; scroll-margin-top: 130px; }
   .section-heading { align-items: flex-start; gap: 16px; flex-direction: column; margin-bottom: 24px; }
   .installation-layout { grid-template-columns: 1fr; gap: 28px; }
-  .before-panel { padding: 24px; }
+  .before-panel { padding: 24px; position: static; }
   .before-icon { display: none; }
   .checklist { gap: 14px; margin-top: 18px; }
   .before-note { margin-top: 20px; padding-top: 16px; }
@@ -237,6 +243,11 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
   .workflow-summary svg { width: 12px; }
   .privacy-layout, .help-layout { grid-template-columns: 1fr; gap: 28px; }
   .preview-notice, .important-difference { padding: 18px; }
+  .important-difference { align-items: flex-start; }
+  .saved-contents, .saved-contents ul { grid-template-columns: 1fr; gap: 18px; }
+}
+@media (max-width: 560px) {
+  .recording-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 380px) {
   .site-container { width: calc(100% - 32px); }
@@ -261,7 +272,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
   .section { padding-block: 18px; }
   .section-heading { margin-bottom: 20px; }
   .installation-layout, .privacy-layout, .help-layout { display: block; }
-  .before-panel { background: none; padding: 0 0 20px; }
+  .before-panel { background: none; padding: 0 0 20px; position: static; }
   .before-panel > a, .computer-option:not(.selected) { display: none; }
   .computer-options { display: block; }
   .computer-option.selected { border: 0; padding: 0; min-height: 0; box-shadow: none; background: none; }
