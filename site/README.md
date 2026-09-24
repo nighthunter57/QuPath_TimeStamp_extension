@@ -9,7 +9,7 @@ This update has not been published automatically.
   tutorial, privacy notes, and keyboard-accessible troubleshooting disclosures.
 - `data/install-guide.ts`: exact installer names, instructions, and current download.
 - `public/downloads/TimeStamp-Doctor-0.1.0-SNAPSHOT.zip`: copy of the tested local
-  doctor package built September 23, 2026. Old downloads are preserved but not linked
+  doctor package built September 24, 2026. Old downloads are preserved but not linked
   by the new guide.
 - `public/downloads/DOCTOR-INSTALL.txt`: downloadable written instructions.
 - `app/globals.css`: desktop/mobile layout, keyboard focus, reduced motion, and print

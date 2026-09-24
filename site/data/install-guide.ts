@@ -2,7 +2,7 @@ export type Computer = "windows" | "mac" | "linux";
 
 export const doctorPackage = {
   version: "0.1.0-SNAPSHOT",
-  date: "September 23, 2026",
+  date: "September 24, 2026",
   href: "./downloads/TimeStamp-Doctor-0.1.0-SNAPSHOT.zip",
   instructions: "./downloads/DOCTOR-INSTALL.txt",
 };
