@@ -1534,7 +1534,10 @@ class TranscriptLogicTest(unittest.TestCase):
                 previous_text=True,
             )
 
-        self.assertEqual("[2026-08-20T12:00:01.250] lymph node negative", lines[0])
+        # Transcript lines use the machine's local zone; derive it so CI zones pass.
+        local_start = (recording_start + timedelta(seconds=1.25)).astimezone()
+        self.assertEqual(
+            f"[{local_start:%Y-%m-%dT%H:%M:%S}.250] lymph node negative", lines[0])
         self.assertEqual(1250, segment_rows[0]["start_ms"])
         self.assertEqual(2750, segment_rows[0]["end_ms"])
         self.assertTrue(segment_rows[0]["start_utc"].endswith("Z"))
