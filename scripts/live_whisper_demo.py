@@ -2514,7 +2514,15 @@ def finalize_existing_capture(
     return 1 if finalization_failed else 0
 
 
+def use_utf8_stdio() -> None:
+    """Keep protocol output UTF-8 even when Windows defaults pipes to cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main() -> int:
+    use_utf8_stdio()
     args = parse_args()
 
     if not args.list_devices and not args.check_audio and not args.output:

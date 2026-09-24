@@ -679,6 +679,14 @@ class TimeStampTest {
     }
 
     @Test
+    void helperProcessesUseUtf8Io() {
+        var environment = new java.util.HashMap<String, String>();
+        TimeStamp.useUtf8PythonIo(environment);
+        assertEquals("1", environment.get("PYTHONUTF8"));
+        assertEquals("utf-8", environment.get("PYTHONIOENCODING"));
+    }
+
+    @Test
     void eventsOrderByInstantAcrossDaylightSavingFallBack() {
         // 01:30 CDT then 01:10 CST: later instant, earlier local wall time.
         Instant firstPass = Instant.parse("2026-11-01T06:30:00Z");

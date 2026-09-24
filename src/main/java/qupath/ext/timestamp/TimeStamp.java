@@ -3582,6 +3582,12 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 
+    // The protocol is UTF-8; Windows Python otherwise writes pipes in the ANSI code page.
+    static void useUtf8PythonIo(java.util.Map<String, String> environment) {
+        environment.put("PYTHONUTF8", "1");
+        environment.put("PYTHONIOENCODING", "utf-8");
+    }
+
     private static String findTranscriptPythonExecutable() {
         String configured = defaultIfBlank(transcriptPythonExecutable.get(), "");
         if (!configured.isBlank()) {
@@ -3632,6 +3638,7 @@ public class TimeStamp implements QuPathExtension {
 
     private static void configureTranscriptProcessEnvironment(
             ProcessBuilder processBuilder, String pythonExecutable) {
+        useUtf8PythonIo(processBuilder.environment());
         Path doctorPython = doctorRuntimePython(getQuPathUserDirectory(), isWindows())
                 .toAbsolutePath().normalize();
         try {
@@ -3672,7 +3679,7 @@ public class TimeStamp implements QuPathExtension {
             }
 
             List<String> outputLines = new ArrayList<>();
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     outputLines.add(line);
@@ -4399,7 +4406,7 @@ public class TimeStamp implements QuPathExtension {
 
     private static void consumeTranscriptProcessOutput(Process process) {
         Thread thread = new Thread(() -> {
-            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream()))) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
                 String line;
                 while ((line = reader.readLine()) != null) {
                     TranscriptMessage message = parseTranscriptMessage(line);

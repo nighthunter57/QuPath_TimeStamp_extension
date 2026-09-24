@@ -1501,6 +1501,16 @@ class TranscriptLogicTest(unittest.TestCase):
             attempts,
         )
 
+    def test_stdio_is_utf8_even_when_the_platform_pipe_is_cp1252(self):
+        out = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        err = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with patch.object(transcript.sys, "stdout", out), patch.object(transcript.sys, "stderr", err):
+            transcript.use_utf8_stdio()
+            transcript.emit_protocol_message("TRANSCRIPT_PARTIAL", "Ki-67 ≥ 20% — 🧪")
+            out.flush()
+        self.assertEqual("TRANSCRIPT_PARTIAL\tKi-67 ≥ 20% — 🧪\n",
+                         out.buffer.getvalue().decode("utf-8"))
+
     def test_final_transcript_exports_segment_and_word_timing_rows(self):
         recording_start = datetime(
             2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))
