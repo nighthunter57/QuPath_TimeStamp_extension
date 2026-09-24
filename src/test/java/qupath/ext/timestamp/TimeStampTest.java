@@ -677,4 +677,14 @@ class TimeStampTest {
             dirtyField.setBoolean(null, previousDirty);
         }
     }
+
+    @Test
+    void eventsOrderByInstantAcrossDaylightSavingFallBack() {
+        // 01:30 CDT then 01:10 CST: later instant, earlier local wall time.
+        Instant firstPass = Instant.parse("2026-11-01T06:30:00Z");
+        Instant repeatedHour = Instant.parse("2026-11-01T07:10:00Z");
+        List<Instant> log = new java.util.ArrayList<>(List.of(firstPass));
+        assertEquals(1, TimeStamp.chronologicalInsertionIndex(log, repeatedHour, t -> t));
+        assertEquals(0, TimeStamp.chronologicalInsertionIndex(log, firstPass.minusSeconds(1), t -> t));
+    }
 }

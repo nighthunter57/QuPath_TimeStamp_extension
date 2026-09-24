@@ -597,7 +597,7 @@ public class TimeStamp implements QuPathExtension {
                 installEventListeners(newViewer);
             }
             ViewBounds activatedView = newViewer == null ? null : captureViewBounds(newViewer);
-            LocalDateTime activatedAt = LocalDateTime.now();
+            Instant activatedAt = Instant.now();
             boolean recording = recordEvents.get();
             Platform.runLater(() -> {
                 updateRecordingContext();
@@ -928,7 +928,7 @@ public class TimeStamp implements QuPathExtension {
             if (recordEvents.get() && event.getDeltaY() != 0) {
                 if (!interactionState.zoomInProgress) {
                     interactionState.zoomInProgress = true;
-                    interactionState.zoomStartTime = LocalDateTime.now();
+                    interactionState.zoomStartTime = Instant.now();
                     interactionState.zoomStartView = captureViewBounds(viewer);
                 }
                 interactionState.zoomEndDelay.playFromStart();
@@ -941,7 +941,7 @@ public class TimeStamp implements QuPathExtension {
             if (recordEvents.get() && event.isPrimaryButtonDown()) {
                 interactionState.panCandidate = true;
                 interactionState.panDragged = false;
-                interactionState.panStartTime = LocalDateTime.now();
+                interactionState.panStartTime = Instant.now();
                 interactionState.panStartView = captureViewBounds(viewer);
                 interactionState.panStartComponentX = event.getX();
                 interactionState.panStartComponentY = event.getY();
@@ -1045,7 +1045,7 @@ public class TimeStamp implements QuPathExtension {
                 newData.getHierarchy().addListener(hierarchyListener);
             }
             ViewBounds changedView = captureViewBounds(viewer);
-            LocalDateTime changedAt = LocalDateTime.now();
+            Instant changedAt = Instant.now();
             boolean recording = recordEvents.get();
             Platform.runLater(() -> {
                 updateRecordingContext();
@@ -1132,12 +1132,13 @@ public class TimeStamp implements QuPathExtension {
      */
     private static void logEvent(String eventType, String details,
                                  QuPathViewer viewer, AnnotationGeometry annotation) {
-        logEventAt(LocalDateTime.now(), eventType, details, captureViewBounds(viewer), annotation);
+        logEventAt(Instant.now(), eventType, details, captureViewBounds(viewer), annotation);
     }
 
-    private static void logEventAt(LocalDateTime timestamp, String eventType, String details,
+    private static void logEventAt(Instant recordedAtUtc, String eventType, String details,
                                    ViewBounds view, AnnotationGeometry annotation) {
-        Instant recordedAtUtc = timestamp.atZone(ZoneId.systemDefault()).toInstant();
+        // Capture the instant first: local wall time is ambiguous across DST changes.
+        LocalDateTime timestamp = LocalDateTime.ofInstant(recordedAtUtc, ZoneId.systemDefault());
         EventRecord entry = new EventRecord(
                 nextEventSequence++,
                 timestamp,
@@ -1174,12 +1175,15 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void insertEventRecordChronologically(EventRecord entry) {
-        int insertionIndex = eventLog.size();
-        while (insertionIndex > 0 &&
-                eventLog.get(insertionIndex - 1).timestamp.isAfter(entry.timestamp)) {
+        eventLog.add(chronologicalInsertionIndex(eventLog, entry.recordedAtUtc, e -> e.recordedAtUtc), entry);
+    }
+
+    static <T> int chronologicalInsertionIndex(List<T> log, Instant time, java.util.function.Function<T, Instant> timeOf) {
+        int insertionIndex = log.size();
+        while (insertionIndex > 0 && timeOf.apply(log.get(insertionIndex - 1)).isAfter(time)) {
             insertionIndex--;
         }
-        eventLog.add(insertionIndex, entry);
+        return insertionIndex;
     }
 
     private static void logSessionBoundary(String eventType) {
@@ -5507,11 +5511,11 @@ public class TimeStamp implements QuPathExtension {
      */
     private static class ViewerInteractionState {
         boolean zoomInProgress = false;
-        LocalDateTime zoomStartTime;
+        Instant zoomStartTime;
         ViewBounds zoomStartView;
         boolean panCandidate = false;
         boolean panDragged = false;
-        LocalDateTime panStartTime;
+        Instant panStartTime;
         ViewBounds panStartView;
         double panStartComponentX;
         double panStartComponentY;
