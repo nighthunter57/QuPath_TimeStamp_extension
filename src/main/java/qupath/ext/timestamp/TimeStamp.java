@@ -1590,10 +1590,10 @@ public class TimeStamp implements QuPathExtension {
             int closeBracket = resolved.indexOf(']', lineStart);
             if (resolved.charAt(lineStart) == '[' && closeBracket > lineStart && closeBracket <= lineEnd) {
                 try {
-                    LocalDateTime timestamp = LocalDateTime.parse(
-                            resolved.substring(lineStart + 1, closeBracket), formatter);
+                    Instant timestamp = transcriptLineInstant(
+                            resolved.substring(lineStart + 1, closeBracket), ZoneId.systemDefault());
                     starts.add(lineStart);
-                    timestamps.add(timestamp.atZone(ZoneId.systemDefault()).toInstant());
+                    timestamps.add(timestamp);
                 } catch (RuntimeException ignored) {
                     // Edited transcript lines without a valid timestamp are not link targets.
                 }
@@ -3327,11 +3327,32 @@ public class TimeStamp implements QuPathExtension {
 
     static String compactCaptionTimestamp(String raw, Instant origin) {
         try {
-            LocalDateTime local = LocalDateTime.parse(raw.substring(1, raw.length() - 1), formatter);
-            if (origin == null) return local.format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-            return formatEventElapsed(java.time.Duration.between(origin, local.atZone(ZoneId.systemDefault()).toInstant()).toMillis());
+            String stamp = raw.substring(1, raw.length() - 1);
+            if (origin == null) return transcriptLineWallTime(stamp).format(DateTimeFormatter.ofPattern("HH:mm:ss"));
+            return formatEventElapsed(java.time.Duration.between(
+                    origin, transcriptLineInstant(stamp, ZoneId.systemDefault())).toMillis());
         } catch (RuntimeException exception) {
             return raw;
+        }
+    }
+
+    /**
+     * Transcript lines carry a UTC offset ("2026-09-24T10:15:00.000-05:00"). Lines written before
+     * offsets were added have none and are interpreted in the session's recorded time zone.
+     */
+    static Instant transcriptLineInstant(String stamp, ZoneId legacyZone) {
+        try {
+            return java.time.OffsetDateTime.parse(stamp).toInstant();
+        } catch (java.time.format.DateTimeParseException legacyFormat) {
+            return LocalDateTime.parse(stamp, formatter).atZone(legacyZone).toInstant();
+        }
+    }
+
+    static LocalDateTime transcriptLineWallTime(String stamp) {
+        try {
+            return java.time.OffsetDateTime.parse(stamp).toLocalDateTime();
+        } catch (java.time.format.DateTimeParseException legacyFormat) {
+            return LocalDateTime.parse(stamp, formatter);
         }
     }
 

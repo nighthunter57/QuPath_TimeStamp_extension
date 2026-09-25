@@ -1512,6 +1512,18 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual("TRANSCRIPT_PARTIAL\tKi-67 ≥ 20% — 🧪\n",
                          out.buffer.getvalue().decode("utf-8"))
 
+    def test_transcript_line_offsets_are_unambiguous_and_legacy_lines_still_parse(self):
+        # 01:30 CDT and 01:30 CST on the fall-back night are an hour apart.
+        first = transcript.parse_transcript_line("[2026-11-01T01:30:00.000-05:00] first pass")
+        repeated = transcript.parse_transcript_line("[2026-11-01T01:30:00.000-06:00] repeated hour")
+        self.assertEqual(datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc), first[0])
+        self.assertEqual(timedelta(hours=1), repeated[0] - first[0])
+        self.assertEqual(datetime(2026, 11, 1, 6, 30, tzinfo=timezone.utc),
+                         transcript.parse_transcript_line("[2026-11-01T06:30:00.000Z] utc")[0])
+        legacy = transcript.parse_transcript_line("[2026-08-20T12:00:01.250] old format")
+        self.assertEqual(datetime(2026, 8, 20, 12, 0, 1, 250000).astimezone(), legacy[0])
+        self.assertEqual("old format", legacy[1])
+
     def test_final_transcript_exports_segment_and_word_timing_rows(self):
         recording_start = datetime(
             2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))
@@ -1545,10 +1557,12 @@ class TranscriptLogicTest(unittest.TestCase):
                 previous_text=True,
             )
 
-        # Transcript lines use the machine's local zone; derive it so CI zones pass.
+        # Lines show the machine's local time with its offset, so every zone round-trips.
         local_start = (recording_start + timedelta(seconds=1.25)).astimezone()
         self.assertEqual(
-            f"[{local_start:%Y-%m-%dT%H:%M:%S}.250] lymph node negative", lines[0])
+            f"[{local_start.isoformat(timespec='milliseconds')}] lymph node negative", lines[0])
+        self.assertEqual(recording_start + timedelta(seconds=1.25),
+                         transcript.parse_transcript_line(lines[0])[0])
         self.assertEqual(1250, segment_rows[0]["start_ms"])
         self.assertEqual(2750, segment_rows[0]["end_ms"])
         self.assertTrue(segment_rows[0]["start_utc"].endswith("Z"))

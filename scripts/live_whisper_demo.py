@@ -299,8 +299,8 @@ def print_input_devices(sd) -> None:
 
 
 def format_timestamp(timestamp: datetime) -> str:
-    local_timestamp = timestamp.astimezone() if timestamp.tzinfo is not None else timestamp
-    return local_timestamp.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    # Local wall time plus its UTC offset: readable, and unambiguous across zones and DST.
+    return timestamp.astimezone().isoformat(timespec="milliseconds")
 
 
 def format_utc_timestamp(timestamp: datetime) -> str:
@@ -314,12 +314,13 @@ def format_transcript_line(timestamp: datetime, text: str) -> str:
 
 def parse_transcript_line(line: str) -> Optional[tuple[datetime, str]]:
     match = re.match(
-        r"^\[((?:\d{4}-\d{2}-\d{2}T)?\d{2}:\d{2}:\d{2}\.\d{3})\]\s+(.*)$",
+        r"^\[((?:\d{4}-\d{2}-\d{2}T)?\d{2}:\d{2}:\d{2}\.\d{3}(?:Z|[+-]\d{2}:\d{2})?)\]\s+(.*)$",
         line.strip(),
     )
     if not match:
         return None
     timestamp_text, text = match.groups()
+    timestamp_text = timestamp_text.replace("Z", "+00:00")
     try:
         if "T" in timestamp_text:
             parsed_timestamp = datetime.fromisoformat(timestamp_text)

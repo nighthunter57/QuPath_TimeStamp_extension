@@ -679,6 +679,23 @@ class TimeStampTest {
     }
 
     @Test
+    void transcriptLineOffsetsOverrideTheSessionZone() {
+        java.time.ZoneId chicago = java.time.ZoneId.of("America/Chicago");
+        java.time.ZoneId tokyo = java.time.ZoneId.of("Asia/Tokyo");
+        // Offset lines mean the same instant whichever zone the session is opened in.
+        assertEquals(Instant.parse("2026-11-01T06:30:00Z"),
+                TimeStamp.transcriptLineInstant("2026-11-01T01:30:00.000-05:00", tokyo));
+        assertEquals(Instant.parse("2026-11-01T07:30:00Z"),
+                TimeStamp.transcriptLineInstant("2026-11-01T01:30:00.000-06:00", chicago));
+        assertEquals(Instant.parse("2026-11-01T06:30:00Z"),
+                TimeStamp.transcriptLineInstant("2026-11-01T06:30:00.000Z", chicago));
+        // Legacy lines keep using the supplied session zone.
+        assertEquals(Instant.parse("2026-08-20T17:00:01.250Z"),
+                TimeStamp.transcriptLineInstant("2026-08-20T12:00:01.250", chicago));
+        assertEquals("01:30:00", TimeStamp.compactCaptionTimestamp("[2026-11-01T01:30:00.000-05:00]", null));
+    }
+
+    @Test
     void helperProcessesUseUtf8Io() {
         var environment = new java.util.HashMap<String, String>();
         TimeStamp.useUtf8PythonIo(environment);
