@@ -22,12 +22,38 @@ from scripts import live_whisper_demo as transcript
 class TranscriptLogicTest(unittest.TestCase):
 
     def test_interactive_pause_resume_during_inference_preserves_one_wav_and_clock(self):
+        self.assert_interactive_capture()
+
+    def test_finish_saves_audio_before_blocked_model_load_or_decode_completes(self):
+        for loading in (False, True):
+            with self.subTest(blocked_loading=loading):
+                self.assert_interactive_capture(finish=True, block_loading=loading)
+
+    def test_finish_does_not_acknowledge_failed_audio_persistence(self):
+        calls = []
+        class Stream:
+            def __enter__(self):
+                controller.command("FINISH")
+                return self
+            def __exit__(self, *args):
+                calls.append("closed")
+        def fail():
+            raise OSError("disk full")
+        controller = transcript.CaptureController(Stream, fail, lambda: None, lambda state: None,
+                                                  finish_capture=lambda: calls.append("saved"))
+        controller.run()
+        self.assertEqual(["closed"], calls)
+        self.assertIsInstance(controller.error, OSError)
+        self.assertTrue(controller.finished.is_set())
+
+    def assert_interactive_capture(self, finish=False, block_loading=False):
         origin = datetime(2026, 9, 14, tzinfo=timezone.utc)
         now = [origin]
         opened = [0]
         decoding = threading.Event()
         paused = threading.Event()
         resumed = threading.Event()
+        saved = threading.Event()
         model_loads = []
         class Clock(datetime):
             @classmethod
@@ -57,11 +83,13 @@ class TranscriptLogicTest(unittest.TestCase):
                 yield "RESUME\n"
                 if not resumed.wait(3):
                     raise AssertionError("Resume blocked on inference")
-                yield "STOP\n"
+                yield "FINISH\n" if finish else "STOP\n"
         def decode(audio, **kwargs):
             decoding.set()
             if not resumed.wait(4):
                 raise AssertionError("Control path waited for decoder")
+            if finish and not saved.wait(4):
+                raise AssertionError("Finish acknowledgement waited for inference")
             seconds = len(audio) / transcript.SAMPLE_RATE
             words = [SimpleNamespace(start=i / transcript.SAMPLE_RATE,
                 end=(i + 8000) / transcript.SAMPLE_RATE,
@@ -72,12 +100,19 @@ class TranscriptLogicTest(unittest.TestCase):
                 words=words)], None
         def model(*args, **kwargs):
             model_loads.append(1)
+            if block_loading:
+                decoding.set()
+                if not saved.wait(4):
+                    raise AssertionError("Finish acknowledgement waited for model loading")
             return SimpleNamespace(transcribe=decode)
         emit = transcript.emit_protocol_message
         def announce(kind, *fields):
             emit(kind, *fields)
             if kind == "CAPTURE_STATE":
                 (paused if fields[0] == "paused" else resumed).set()
+            if kind == "CAPTURE_SAVED":
+                self.assertEqual(26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
+                saved.set()
         fake_sd = SimpleNamespace(InputStream=Microphone, check_input_settings=lambda **kw: None,
                                   PortAudioError=type("PortAudioError", (Exception,), {}))
         with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as stack:
@@ -105,6 +140,7 @@ class TranscriptLogicTest(unittest.TestCase):
             self.assertEqual(26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
             self.assertEqual(origin, transcript.read_recording_start(path.with_name("interactive_audio.start.txt")))
             self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
+            self.assertEqual(int(finish), output.getvalue().count("CAPTURE_SAVED\n"))
             self.assertEqual([f"w{i}" for i in range(1, 37)],
                 [word for word in path.read_text(encoding="utf-8").split() if word.startswith("w")])
 
@@ -455,6 +491,7 @@ class TranscriptLogicTest(unittest.TestCase):
             "AUDIO_RECOVERED": (),
             "TRANSCRIPT_READY": (),
             "CAPTURE_STATE": ("paused",),
+            "CAPTURE_SAVED": (),
             "RECORDING_ORIGIN": ("2026-08-25T20:00:00.000Z",),
             "LIVE_MODEL_READY": ("small.en",),
             "TRANSCRIPT_UPDATED": (),

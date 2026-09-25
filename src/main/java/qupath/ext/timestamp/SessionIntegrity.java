@@ -68,6 +68,12 @@ public final class SessionIntegrity {
         }
     }
 
+    static void verifyCopy(Path file, JsonObject descriptor) throws IOException {
+        if (!descriptor.has("sha256") || !sha256(file).equals(descriptor.get("sha256").getAsString())) {
+            throw new IOException("Copied session artifact did not match its saved checksum");
+        }
+    }
+
     /** Read-only integrity check of an exported session; never opens a microphone. */
     public static void main(String[] args) throws IOException {
         if (args.length != 1) throw new IllegalArgumentException("Pass a saved recording manifest path");

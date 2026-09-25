@@ -1,5 +1,7 @@
 package qupath.ext.timestamp;
 
+import static org.junit.jupiter.api.Assertions.assertThrows;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -22,6 +24,109 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 class TimeStampTest {
+
+    @Test
+    void previewShutdownRequiresSavedAcknowledgementAndConfirmedExit() throws Exception {
+        class Preview extends Process {
+            boolean alive = true;
+            int waits;
+            public java.io.OutputStream getOutputStream() { return java.io.OutputStream.nullOutputStream(); }
+            public java.io.InputStream getInputStream() { return java.io.InputStream.nullInputStream(); }
+            public java.io.InputStream getErrorStream() { return java.io.InputStream.nullInputStream(); }
+            public int waitFor() { alive = false; return 137; }
+            public boolean waitFor(long timeout, java.util.concurrent.TimeUnit unit) { waits++; return !alive; }
+            public int exitValue() { if (alive) throw new IllegalThreadStateException(); return 137; }
+            public void destroy() { alive = false; }
+            public Process destroyForcibly() { alive = false; return this; }
+            public boolean isAlive() { return alive; }
+        }
+        Preview saved = new Preview();
+        var result = TimeStamp.awaitCaptureShutdown(saved, () -> saved.waits >= 1, 1000);
+        assertTrue(result.audioSaved());
+        assertFalse(result.timedOut());
+        assertFalse(saved.isAlive());
+        assertEquals(137, result.exitCode());
+        Preview unsafe = new Preview();
+        var timeout = TimeStamp.awaitCaptureShutdown(unsafe, () -> false, 0);
+        assertFalse(timeout.audioSaved());
+        assertTrue(timeout.timedOut());
+        assertFalse(unsafe.isAlive());
+        assertEquals(TimeStamp.TranscriptMessageType.MALFORMED,
+                TimeStamp.parseTranscriptMessage("CAPTURE_SAVED\tunexpected").type());
+    }
+
+    @Test
+    void captionTimeUsesRecordedTimeZoneInsteadOfViewingComputer() {
+        assertEquals("00:02", TimeStamp.compactCaptionTimestamp("[2026-09-23T08:00:02.000]",
+                Instant.parse("2026-09-23T12:00:00Z"), java.time.ZoneId.of("America/New_York")));
+    }
+
+    @Test
+    void sessionSaveUsesFrozenTextEventsAndOrigin(@TempDir Path root) throws Exception {
+        Path working = root.resolve("working");
+        Path source = working.resolve("video/working_transcript.txt");
+        TimeStamp.atomicWriteString(source, "machine\n");
+        Path destination = root.resolve("saved");
+        Path target = destination.resolve("video/saved_transcript.txt");
+        var artifacts = new TimeStamp.ArtifactSnapshot("header\n", "{\"schemaVersion\":2,\"events\":[]}",
+                "{\"schemaVersion\":2,\"cursorEvents\":[]}", Instant.parse("2026-09-23T12:00:00Z"), 1234L, 0, 0);
+        var snapshot = new TimeStamp.SaveSnapshot(working.toFile(), source.toFile(), destination.toFile(),
+                target.toFile(), "reviewed\n", TimeStamp.reviewedTranscriptJson("reviewed\n", List.of()),
+                false, "no-audio", 0, artifacts);
+        TimeStamp.writeSessionSnapshot(snapshot);
+        String manifest = Files.readString(destination.resolve("saved_recording_manifest.json"));
+        SessionIntegrity.verify(manifest, destination);
+        assertEquals("reviewed\n", Files.readString(target));
+        assertEquals("machine\n", Files.readString(source));
+        assertEquals("header\n", Files.readString(destination.resolve("events/saved_event.csv")));
+        assertTrue(manifest.contains("2026-09-23T12:00:00Z"));
+        assertTrue(manifest.contains("1234"));
+        assertTrue(Files.exists(working.resolve(".saved")));
+        Path manifestPath = destination.resolve("saved_recording_manifest.json");
+        assertEquals(manifestPath, TimeStamp.findSavedManifest(destination));
+        var reopened = TimeStamp.importSavedSession(manifestPath, root.resolve("imports"));
+        assertEquals("machine\n", Files.readString(reopened.transcript()));
+        assertEquals("reviewed\n", com.google.gson.JsonParser.parseString(reopened.review())
+                .getAsJsonObject().get("transcript").getAsString());
+        assertEquals(artifacts.origin(), reopened.origin());
+        assertFalse(reopened.hasAudio());
+        assertTrue(Files.exists(reopened.directory().resolve(".imported-review-only")));
+        assertEquals(manifest, Files.readString(manifestPath));
+        byte[] audio = new byte[]{1, 2, 3, 4};
+        Files.write(source.resolveSibling("working_transcript_audio.wav"), audio);
+        TimeStamp.writeSessionSnapshot(new TimeStamp.SaveSnapshot(working.toFile(), source.toFile(),
+                destination.toFile(), target.toFile(), snapshot.text(), snapshot.review(), true,
+                snapshot.finalizationResult(), snapshot.exitCode(), artifacts));
+        var withAudio = TimeStamp.importSavedSession(manifestPath, root.resolve("imports"));
+        assertTrue(withAudio.hasAudio());
+        assertTrue(withAudio.canResume());
+        assertFalse(Files.exists(withAudio.directory().resolve(".discarded")));
+        assertEquals(artifacts.origin().toString(), Files.readString(withAudio.transcript()
+                .resolveSibling(withAudio.transcript().getFileName().toString().replace(".txt", "_audio.start.txt"))));
+        org.junit.jupiter.api.Assertions.assertArrayEquals(audio, Files.readAllBytes(withAudio.transcript()
+                .resolveSibling(withAudio.transcript().getFileName().toString().replace(".txt", "_audio.wav"))));
+        String verifiedManifest = Files.readString(manifestPath);
+        var differentZone = com.google.gson.JsonParser.parseString(verifiedManifest).getAsJsonObject();
+        String zone = java.time.ZoneId.systemDefault().getId().equals("Asia/Tokyo") ? "Europe/London" : "Asia/Tokyo";
+        differentZone.addProperty("transcriptTimeZone", zone);
+        Files.writeString(manifestPath, differentZone.toString());
+        var foreignSession = TimeStamp.importSavedSession(manifestPath, root.resolve("imports"));
+        assertEquals(java.time.ZoneId.of(zone), foreignSession.timeZone());
+        assertFalse(foreignSession.canResume());
+        assertTrue(foreignSession.hasAudio());
+        var invalid = com.google.gson.JsonParser.parseString(verifiedManifest).getAsJsonObject();
+        invalid.addProperty("workflowState", "incomplete");
+        Files.writeString(manifestPath, invalid.toString());
+        assertThrows(java.io.IOException.class, () -> TimeStamp.importSavedSession(manifestPath, root.resolve("imports")));
+        invalid = com.google.gson.JsonParser.parseString(verifiedManifest).getAsJsonObject();
+        invalid.getAsJsonObject("transcript").addProperty("path", "../working/video/working_transcript.txt");
+        Files.writeString(manifestPath, invalid.toString());
+        assertThrows(java.io.IOException.class, () -> TimeStamp.importSavedSession(manifestPath, root.resolve("imports")));
+        Files.writeString(manifestPath, verifiedManifest);
+        Files.writeString(target, "corruption");
+        assertThrows(java.io.IOException.class, () -> SessionIntegrity.verify(manifest, destination));
+        assertThrows(java.io.IOException.class, () -> TimeStamp.importSavedSession(manifestPath, root.resolve("imports")));
+    }
 
     @Test
     void imageIdentitySurvivesEventExportAndRecovery(@TempDir Path directory) throws Exception {
@@ -57,6 +162,14 @@ class TimeStampTest {
             String contents = (String) json.invoke(null, recovered, "events", "case");
             assertTrue(contents.contains(first.id()));
             assertTrue(contents.contains(second.id()));
+            Path exportedEvents = directory.resolve("events.json");
+            Files.writeString(exportedEvents, contents);
+            var readEvents = TimeStamp.class.getDeclaredMethod("readSavedEvents", Path.class, String.class);
+            readEvents.setAccessible(true);
+            var reopenedEvents = (List<?>) readEvents.invoke(null, exportedEvents, "events");
+            String reopenedJson = (String) json.invoke(null, reopenedEvents, "events", "case");
+            assertEquals(com.google.gson.JsonParser.parseString(contents).getAsJsonObject().get("events"),
+                    com.google.gson.JsonParser.parseString(reopenedJson).getAsJsonObject().get("events"));
             var csv = TimeStamp.class.getDeclaredMethod("serializeEventCsv", List.class, String.class);
             csv.setAccessible(true);
             String rows = (String) csv.invoke(null, recovered, "case");
@@ -331,6 +444,7 @@ class TimeStampTest {
                 "AUDIO_RECOVERED",
                 "TRANSCRIPT_READY",
                 "CAPTURE_STATE\tpaused",
+                "CAPTURE_SAVED",
                 "RECORDING_ORIGIN\t2026-08-25T20:00:00.000Z",
                 "LIVE_MODEL_READY\tsmall.en",
                 "TRANSCRIPT_UPDATED",
@@ -689,10 +803,13 @@ class TimeStampTest {
                 TimeStamp.transcriptLineInstant("2026-11-01T01:30:00.000-06:00", chicago));
         assertEquals(Instant.parse("2026-11-01T06:30:00Z"),
                 TimeStamp.transcriptLineInstant("2026-11-01T06:30:00.000Z", chicago));
-        // Legacy lines keep using the supplied session zone.
+        // Legacy lines keep using the recorded session zone.
         assertEquals(Instant.parse("2026-08-20T17:00:01.250Z"),
                 TimeStamp.transcriptLineInstant("2026-08-20T12:00:01.250", chicago));
-        assertEquals("01:30:00", TimeStamp.compactCaptionTimestamp("[2026-11-01T01:30:00.000-05:00]", null));
+        Instant origin = Instant.parse("2026-11-01T06:29:50Z");
+        assertEquals(TimeStamp.compactCaptionTimestamp("[2026-11-01T01:30:00.000-05:00]", origin, tokyo),
+                TimeStamp.compactCaptionTimestamp("[2026-11-01T01:30:00.000]", origin, chicago));
+        assertEquals("01:30:00", TimeStamp.compactCaptionTimestamp("[2026-11-01T01:30:00.000-05:00]", null, tokyo));
     }
 
     @Test

@@ -140,6 +140,7 @@ PROTOCOL_FIELDS = {
     "AUDIO_RECOVERED": 0,
     "TRANSCRIPT_READY": 0,
     "CAPTURE_STATE": 1,
+    "CAPTURE_SAVED": 0,
     "RECORDING_ORIGIN": 1,
     "LIVE_MODEL_READY": 1,
     "TRANSCRIPT_UPDATED": 0,
@@ -894,19 +895,21 @@ class AudioCaptureWriter:
 class CaptureController:
     """Own microphone lifecycle independently of model inference; acknowledge actual state."""
 
-    def __init__(self, open_stream, flush, before_resume, announce, check_writer=lambda: None):
+    def __init__(self, open_stream, flush, before_resume, announce, check_writer=lambda: None,
+                 finish_capture: Optional[Callable[[], None]] = None):
         self.open_stream = open_stream
         self.flush = flush
         self.before_resume = before_resume
         self.announce = announce
         self.check_writer = check_writer
+        self.finish_capture = finish_capture
         self.commands = queue.Queue()
         self.commands.put("RESUME")
         self.finished = threading.Event()
         self.error = None
 
     def command(self, command):
-        if command not in {"PAUSE", "RESUME", "STOP"}:
+        if command not in {"PAUSE", "RESUME", "STOP", "FINISH"}:
             raise ValueError("Unknown capture command")
         self.commands.put(command)
 
@@ -914,9 +917,9 @@ class CaptureController:
         try:
             for line in source:
                 command = line.strip()
-                if command in {"PAUSE", "RESUME", "STOP"}:
+                if command in {"PAUSE", "RESUME", "STOP", "FINISH"}:
                     self.command(command)
-                    if command == "STOP":
+                    if command in {"STOP", "FINISH"}:
                         return
         except Exception as exc:
             self.error = RuntimeError(f"Recorder control pipe failed: {exc}")
@@ -929,7 +932,9 @@ class CaptureController:
         try:
             while True:
                 command = self.commands.get()
-                if command == "STOP":
+                if command in {"STOP", "FINISH"}:
+                    if command == "FINISH" and self.finish_capture is not None:
+                        self.finish_capture()
                     return
                 if command != "RESUME":
                     continue
@@ -945,11 +950,13 @@ class CaptureController:
                             if not getattr(stream, "active", True):
                                 raise RuntimeError("Microphone disconnected; captured audio is preserved")
                             continue
-                        if command in {"PAUSE", "STOP"}:
+                        if command in {"PAUSE", "STOP", "FINISH"}:
                             break
                 # Closing the stream joins its callback before acknowledging Pause.
                 self.flush()
-                if command == "STOP":
+                if command in {"STOP", "FINISH"}:
+                    if command == "FINISH" and self.finish_capture is not None:
+                        self.finish_capture()
                     return
                 self.announce("paused")
         except Exception as exc:
@@ -3060,11 +3067,18 @@ def main() -> int:
         stream_time_anchor = None
         stream_wall_anchor = None
 
+    def finish_capture() -> None:
+        # The controller has closed the microphone. Acknowledgement means no
+        # thread can append more raw audio, even if model loading/decoding hangs.
+        capture_writer.close()
+        emit_protocol_message("CAPTURE_SAVED")
+
     try:
         if args.interactive_control:
             capture_controller = CaptureController(open_capture_stream, capture_writer.flush, prepare_resume,
                 lambda state: emit_protocol_message("TRANSCRIPT_READY") if state == "ready"
-                else emit_protocol_message("CAPTURE_STATE", state), capture_writer.check)
+                else emit_protocol_message("CAPTURE_STATE", state), capture_writer.check,
+                finish_capture=finish_capture)
             capture_thread = threading.Thread(target=capture_controller.run, name="microphone-controller", daemon=True)
             capture_thread.start()
             threading.Thread(target=capture_controller.read_commands, args=(sys.stdin,),

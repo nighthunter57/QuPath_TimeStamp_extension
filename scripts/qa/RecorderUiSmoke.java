@@ -190,7 +190,78 @@ public class RecorderUiSmoke {
                         "Review position moved while recording was stopped");
                 return null;
             });
-            System.out.println("UI layouts, visible actions, corrections, Undo/Redo, recovery, resident Pause/Resume and automatic live scrolling passed.");
+            var ioStarted = new CountDownLatch(1);
+            var releaseIo = new CountDownLatch(1);
+            var ioCompleted = new CountDownLatch(1);
+            fx(() -> {
+                var method = TimeStamp.class.getDeclaredMethod("runSessionIo", String.class,
+                        TimeStamp.SessionIoTask.class, Runnable.class);
+                method.setAccessible(true);
+                method.invoke(null, "Testing slow session storage", (TimeStamp.SessionIoTask) () -> {
+                    check(!Platform.isFxApplicationThread(), "File work ran on FX thread");
+                    ioStarted.countDown();
+                    check(releaseIo.await(10, TimeUnit.SECONDS), "Test did not release storage");
+                }, (Runnable) () -> {
+                    check(Platform.isFxApplicationThread(), "Completion did not run on FX");
+                    ioCompleted.countDown();
+                });
+                return null;
+            });
+            check(ioStarted.await(5, TimeUnit.SECONDS), "Background save did not start");
+            fx(() -> {
+                check((boolean) get("sessionIoBusy"), "Busy guard missing");
+                check(((Button) get("recordingPrimaryButton")).isDisabled(), "Recording enabled during storage");
+                check(!(boolean) call("canReviewAudio"), "Review editing enabled during storage");
+                releaseIo.countDown();
+                return null;
+            });
+            check(ioCompleted.await(5, TimeUnit.SECONDS), "Storage completion did not reach FX");
+            fx(() -> { check(!(boolean) get("sessionIoBusy"), "Busy guard stayed set"); return null; });
+            Path reopenSource = directory.resolve("reopen-source/video/source_transcript.txt");
+            String localTimestamp = java.time.Instant.parse("2026-09-23T12:00:00Z")
+                    .atZone(java.time.ZoneId.systemDefault()).format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS"));
+            String machine = "[" + localTimestamp + "] The margin is negative.\n";
+            String reviewed = machine.replace("negative", "clear");
+            TimeStamp.atomicWriteString(reopenSource, machine);
+            int reviewedStart = reviewed.indexOf("clear");
+            String reviewedJson = TimeStamp.reviewedTranscriptJson(reviewed, List.of(
+                    new TimeStamp.ReviewWord("clear", reviewedStart, reviewedStart + 5, 1000, 1500, null, false)));
+            Path savedDirectory = directory.resolve("saved-for-reopen");
+            var frozenArtifacts = new TimeStamp.ArtifactSnapshot("header\n", "{\"schemaVersion\":2,\"events\":[]}",
+                    "{\"schemaVersion\":2,\"cursorEvents\":[]}", java.time.Instant.parse("2026-09-23T12:00:00Z"), null, 0, 0);
+            var saveSnapshot = new TimeStamp.SaveSnapshot(reopenSource.getParent().getParent().toFile(),
+                    reopenSource.toFile(), savedDirectory.toFile(), savedDirectory.resolve("video/saved_transcript.txt").toFile(),
+                    reviewed, reviewedJson, false, "no-audio", 0, frozenArtifacts);
+            var saveCompleted = new CountDownLatch(1);
+            fx(() -> {
+                var save = TimeStamp.class.getDeclaredMethod("beginSessionSave", TimeStamp.SaveSnapshot.class, Runnable.class);
+                save.setAccessible(true);
+                save.invoke(null, saveSnapshot, (Runnable) saveCompleted::countDown);
+                return null;
+            });
+            check(saveCompleted.await(10, TimeUnit.SECONDS), "Verified save did not complete");
+            fx(() -> {
+                check(get("recordingWorkflowState") == TimeStamp.RecordingWorkflowState.SAVED, "Save did not reach SAVED");
+                check(!(boolean) get("recordingSessionDirty"), "Verified save remained dirty");
+                return null;
+            });
+            var imported = TimeStamp.importSavedSession(savedDirectory.resolve("saved-for-reopen_recording_manifest.json"),
+                    directory.resolve("reopened-work"));
+            fx(() -> {
+                var apply = TimeStamp.class.getDeclaredMethod("applyImportedSession", TimeStamp.ImportedSession.class);
+                apply.setAccessible(true); apply.invoke(null, imported);
+                check(((TextArea) get("liveTranscriptTextArea")).getText().equals(reviewed), "Reopen lost correction");
+                check(((List<?>) get("transcriptReviewWords")).size() == 1, "Reopen lost reviewed word metadata");
+                check(get("recordingStartedInstant").equals(frozenArtifacts.origin()), "Reopen changed origin");
+                check(get("captionPartialContents").equals(""), "Reopen retained another session's provisional text");
+                check(((Button) get("recordMoreButton")).isDisabled(), "No-audio session allowed Record more");
+                check(((MenuItem) get("panelOpenSessionMenuItem")).isVisible(), "Open session unavailable");
+                call("refreshTranscriptContents");
+                check(((TextArea) get("liveTranscriptTextArea")).getText().equals(reviewed), "Refresh lost reopened review");
+                snapshot(root, directory, "reopened-review", 420);
+                return null;
+            });
+            System.out.println("UI, review/recovery, scrolling, background storage, and verified session reopening passed.");
         } finally {
             Platform.exit();
         }

@@ -12,6 +12,16 @@ the recorder usable by a doctor who is looking at a specimen rather than at the 
 
 ## Progress
 
+- **Daily-use workflow — 2026-09-23.** FINISH/CAPTURE_SAVED separates safe audio
+  closure from blocked live decoding/model loading; the parent confirms preview
+  exit before finalization. Saves use frozen snapshots and background file I/O.
+  Verified saved-session reopening restores review metadata, events, image IDs,
+  and optional audio into a working copy. New manifests retain transcript time
+  zone; unsafe append conditions and incomplete/corrupt imports are rejected.
+  104 Python tests, 43 Java tests, build, and isolated UI checks pass. Model
+  settings, live latency, final-search cost, and the human-reference gate remain
+  unchanged. See [RECORDER_HARDENING.md](RECORDER_HARDENING.md#september-23-daily-use-workflow-update).
+
 - **Workflow and boundary corrections — 2026-09-22.** Sequentially added alias-safe
   export, durable review revisions across Record more, slide identity at event
   capture, clearer themed controls, and incremental finalization progress. Then

@@ -1,6 +1,25 @@
 # Transcript reliability and word review
 
-Reliability changes implemented September 5, 2026; recorder hardening updated September 22, 2026.
+Reliability changes implemented September 5, 2026; recorder hardening updated September 23, 2026.
+
+## Saved sessions
+
+Choose **More → Open saved session…** and select the folder created by Save
+Session. The recorder verifies the saved files and opens a working review copy.
+Your corrections, checked words, image actions, and included audio are restored.
+Review and save the copy using the normal controls. The original export remains
+unchanged until you deliberately replace it through Save Session.
+
+Select **Include audio recording** when saving if you want word replay after
+reopening. Without audio, text review remains available, but replay and Record
+more are disabled. Appending speech also requires the original recording clock
+and the same time zone. Older exports without checksums cannot be opened by this
+verified-session workflow; retain their original files and working recording.
+
+Saving and opening files now run in the background, with conflicting controls
+temporarily disabled. Finish & review waits for audio to be saved, then stops
+obsolete preview work before starting the full-audio pass. The final pass can
+still take time.
 
 Latest validation and the mixed before/after synthetic replay results are in
 [Recorder hardening](RECORDER_HARDENING.md#september-22-implementation-update).

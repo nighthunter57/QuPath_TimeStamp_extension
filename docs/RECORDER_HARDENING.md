@@ -1,5 +1,50 @@
 # Recorder hardening — September 14, 2026
 
+## September 23 daily-use workflow update
+
+- **Finish & review** uses a new FINISH/CAPTURE_SAVED handshake. The microphone
+  controller closes capture, joins the raw-audio writer, and checks writer errors
+  independently of model loading/decoding. Only after that acknowledgement does
+  QuPath terminate obsolete preview work, confirm process exit, and launch the
+  final pass. No acknowledgement means no successful handoff. Final inference
+  itself is unchanged; standalone STOP still drains its live backlog.
+- **Save Session** freezes the text, word-review metadata, serialized event data,
+  recording origin, and outcome on the FX thread. File copying, writing, and
+  checksum verification run in a worker. Recording/editing/switching/closing are
+  guarded while it runs; the interface stays responsive. Success is published
+  after verification. Save-before-close and save-before-new-recording continue
+  only after success. Event serialization itself still occurs on the FX thread.
+- **More → Open saved session…** selects the folder created by Save Session.
+  Reopening verifies a completed schema-2 manifest with checksums, validates
+  event counts and paths, and creates a separate working review copy. It restores
+  the reviewed text, checked-word metadata, original machine transcript, image
+  identity, events, and included audio. Modified, incomplete, or unchecked legacy
+  exports are rejected rather than silently trusted. Original exports are not
+  changed by opening. Interrupted imports are excluded from automatic recovery.
+- Exports without audio support text review and saving; replay and Record more
+  are unavailable. Record more also requires the original clock and matching
+  time zone. New manifests retain the transcript time zone for elapsed display
+  and event linking on other computers; old exports without it retain the local
+  time-zone assumption. Cross-time-zone sessions support review/replay, but not
+  appending speech into mixed local timestamps.
+- Session switching stops audio replay and clears prior provisional text,
+  selections, and review history. Working-copy recovery retains its saved zone
+  and restrictions. Include audio at save time to replay words after reopening.
+
+Verification: **104 Python tests and 43 Java tests pass**, plus the Gradle build
+and isolated JavaFX harness. Tests block model loading/inference during FINISH,
+reject saved acknowledgement on persistence failure, distinguish safe termination
+from timeout, freeze storage while checking FX responsiveness, and exercise
+save/open round trips, checksums, image identity, missing audio, corruption,
+incomplete manifests, escaping paths, and time-zone interpretation.
+
+These fixes do not establish physical-device or clinical acceptance. The live
+model/settings and measured live-caption latency are unchanged. The next real
+workstation check is a short non-identifying recording through Pause/Resume,
+Finish & review, playback/correction, saving with audio, and reopening it. Human
+pathology accuracy, long-session performance, and interruption testing remain
+acceptance work, not claims made by the automated suite.
+
 ## September 22 implementation update
 
 - Save/export rejects the working folder and overlapping parent/child locations,
@@ -152,7 +197,7 @@ Absent concept references produce an unavailable metric, not perfect accuracy.
   The installer job does not test model download, QuPath GUI launch, or real audio.
 - Scored human pathology corpus, negations/numbers/units, display latency, correction
   time, and confidence calibration. No model/beam settings were changed.
-- Full session reopen UI, automatic retention controls,
+- Automatic retention controls,
   organization-approved storage encryption, remaining large-class decomposition,
   and a standalone always-visible toolbar/keyboard workflow are subsequent work.
 - Speaker attribution remains a separate, unimplemented feature.

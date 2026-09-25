@@ -1,5 +1,7 @@
 package qupath.ext.timestamp;
 
+import com.google.gson.JsonObject;
+
 import com.google.gson.JsonParser;
 import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.Clip;
@@ -50,7 +52,6 @@ import javafx.scene.layout.VBox;
 import javafx.scene.text.Text;
 import javafx.scene.text.TextFlow;
 import javafx.stage.DirectoryChooser;
-import javafx.stage.FileChooser;
 import javafx.stage.WindowEvent;
 import javafx.util.Duration;
 import javafx.util.StringConverter;
@@ -221,6 +222,7 @@ public class TimeStamp implements QuPathExtension {
         AUDIO_RECOVERED(0),
         TRANSCRIPT_READY(0),
         CAPTURE_STATE(1),
+        CAPTURE_SAVED(0),
         RECORDING_ORIGIN(1),
         LIVE_MODEL_READY(1),
         TRANSCRIPT_UPDATED(0),
@@ -404,6 +406,13 @@ public class TimeStamp implements QuPathExtension {
     private static volatile boolean transcriptStopInProgress = false;
     private static volatile boolean transcriptResumePending = false;
     private static volatile TranscriptProcessPurpose transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
+    private static volatile Process captureSavedProcess;
+    private static boolean sessionIoBusy;
+    private static String sessionIoStatus = "";
+    private static boolean reviewOnlySession;
+    private static String openedSessionName;
+    private static ZoneId transcriptTimeZone = ZoneId.systemDefault();
+    private static MenuItem panelOpenSessionMenuItem;
     private static volatile TranscriptStopIntent transcriptStopIntent = TranscriptStopIntent.NONE;
     private static volatile String transcriptFinalizationResult = TRANSCRIPT_FINALIZATION_PENDING;
     private static volatile int transcriptLastExitCode = -1;
@@ -655,7 +664,7 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void checkpointWorkingSession() {
-        if (!recordingSessionDirty || transcriptSessionDir == null || recoveryCheckpointInProgress) {
+        if (sessionIoBusy || !recordingSessionDirty || transcriptSessionDir == null || recoveryCheckpointInProgress) {
             return;
         }
         RecoverySnapshot snapshot = new RecoverySnapshot(
@@ -725,8 +734,10 @@ public class TimeStamp implements QuPathExtension {
                     "Save the transcript and timestamps before closing QuPath?");
             if (choice == null || choice == javafx.scene.control.ButtonType.CANCEL) {
                 event.consume();
-            } else if (choice == javafx.scene.control.ButtonType.YES && !saveTranscriptAndTimestamps()) {
+            } else if (choice == javafx.scene.control.ButtonType.YES) {
                 event.consume();
+                saveTranscriptAndTimestamps(() -> qupath.getStage().fireEvent(
+                        new WindowEvent(qupath.getStage(), WindowEvent.WINDOW_CLOSE_REQUEST)));
             } else if (choice == javafx.scene.control.ButtonType.NO) {
                 recordingSessionDirty = false;
                 recordingWorkflowState = RecordingWorkflowState.READY;
@@ -799,6 +810,16 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void recoverWorkingSession(File workingDirectory) {
+        reviewOnlySession = Files.exists(workingDirectory.toPath().resolve(".imported-review-only"));
+        transcriptTimeZone = ZoneId.systemDefault();
+        Path zonePath = workingDirectory.toPath().resolve(".transcript-time-zone");
+        if (Files.isRegularFile(zonePath)) {
+            try { transcriptTimeZone = ZoneId.of(Files.readString(zonePath).trim()); }
+            catch (IOException | RuntimeException exception) {
+                logger.warn("Could not restore the transcript time zone", exception);
+                reviewOnlySession = true;
+            }
+        }
         transcriptSessionDir = workingDirectory;
         transcriptFile = buildTranscriptFile(workingDirectory);
         transcriptCaptureStarted = true;
@@ -1274,12 +1295,14 @@ public class TimeStamp implements QuPathExtension {
         transcriptSettingsButton.setOnAction(e -> showTranscriptSettingsDialog());
         configureMonitorButton(transcriptSettingsButton);
 
+        panelOpenSessionMenuItem = new MenuItem("Open saved session…");
+        panelOpenSessionMenuItem.setOnAction(e -> chooseSavedSession());
         panelExportTranscriptMenuItem = new MenuItem("Export Transcript");
         panelExportTranscriptMenuItem.setOnAction(e -> exportTranscript());
         panelClearEventsMenuItem = new MenuItem("Clear Events");
         panelClearEventsMenuItem.setOnAction(e -> clearLogsStatic());
         transcriptMoreButton = new MenuButton("⋯ More", null,
-                panelExportTranscriptMenuItem, panelClearEventsMenuItem);
+                panelOpenSessionMenuItem, panelExportTranscriptMenuItem, panelClearEventsMenuItem);
 
         recordingStateDotLabel = new Label("●");
         recordingStatusLabel = new Label();
@@ -1591,7 +1614,7 @@ public class TimeStamp implements QuPathExtension {
             if (resolved.charAt(lineStart) == '[' && closeBracket > lineStart && closeBracket <= lineEnd) {
                 try {
                     Instant timestamp = transcriptLineInstant(
-                            resolved.substring(lineStart + 1, closeBracket), ZoneId.systemDefault());
+                            resolved.substring(lineStart + 1, closeBracket), transcriptTimeZone);
                     starts.add(lineStart);
                     timestamps.add(timestamp);
                 } catch (RuntimeException ignored) {
@@ -1788,7 +1811,7 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static boolean isTranscriptProcessBusy() {
-        return transcriptStopInProgress || (transcriptProcess != null && transcriptProcess.isAlive());
+        return sessionIoBusy || transcriptStopInProgress || (transcriptProcess != null && transcriptProcess.isAlive());
     }
 
     private static void updateLiveEventMonitorControls() {
@@ -1813,7 +1836,7 @@ public class TimeStamp implements QuPathExtension {
                 case RECORDING -> transcriptStopInProgress || captureControlPending;
                 case PAUSED -> captureControlPending || transcriptStopInProgress;
             };
-            recordingPrimaryButton.setDisable(primaryUnavailable);
+            recordingPrimaryButton.setDisable(primaryUnavailable || sessionIoBusy);
             recordingPrimaryButton.setTooltip(new Tooltip(switch (recordingWorkflowState) {
                 case READY, SAVED -> "Begin recording audio, transcript, and QuPath interactions";
                 case STARTING -> "Waiting for the microphone to become ready";
@@ -1910,7 +1933,7 @@ public class TimeStamp implements QuPathExtension {
         if (recordMoreButton != null) {
             recordMoreButton.setVisible(showRecordMore);
             recordMoreButton.setManaged(showRecordMore);
-            recordMoreButton.setDisable(transcriptBusy);
+            recordMoreButton.setDisable(transcriptBusy || reviewOnlySession);
         }
         if (panelExportTranscriptMenuItem != null) {
             panelExportTranscriptMenuItem.setDisable(recording || transcriptBusy ||
@@ -1921,11 +1944,16 @@ public class TimeStamp implements QuPathExtension {
             panelClearEventsMenuItem.setDisable(recording || starting || transcriptStopInProgress ||
                     (eventLog.isEmpty() && mouseMoveLog.isEmpty()));
         }
+        if (panelOpenSessionMenuItem != null) {
+            panelOpenSessionMenuItem.setDisable(recording || starting || transcriptBusy ||
+                    recordingWorkflowState == RecordingWorkflowState.PAUSED);
+        }
         if (transcriptMoreButton != null) {
             boolean showMore = recordingWorkflowState != RecordingWorkflowState.RECORDING;
             transcriptMoreButton.setVisible(showMore);
             transcriptMoreButton.setManaged(showMore);
             transcriptMoreButton.setDisable(
+                    (panelOpenSessionMenuItem == null || panelOpenSessionMenuItem.isDisable()) &&
                     (panelExportTranscriptMenuItem == null || panelExportTranscriptMenuItem.isDisable()) &&
                     (panelClearEventsMenuItem == null || panelClearEventsMenuItem.isDisable()));
         }
@@ -1958,6 +1986,12 @@ public class TimeStamp implements QuPathExtension {
 
     private static void updateRecordingContext() {
         if (recordingContextLabel == null) return;
+        if (openedSessionName != null && !recordEvents.get()) {
+            recordingContextLabel.setText("Review: " + openedSessionName +
+                    (transcriptCompanionFile(transcriptFile, "_audio.wav").isFile()
+                            ? "\nSaved audio available for replay" : "\nAudio was not included"));
+            return;
+        }
         RecordedImage image = RecordedImage.from(qupathGui, qupathGui == null ? null : qupathGui.getViewer());
         recordingContextLabel.setText((image == null ? "No slide open · audio-only" : image.name()) +
                 "\nMic: " + displayTranscriptDevice(transcriptDevice.get()));
@@ -1983,6 +2017,7 @@ public class TimeStamp implements QuPathExtension {
             case SAVED -> "Session saved";
             case ERROR -> "Attention needed — session data is still available";
         };
+        if (sessionIoBusy) stateText = sessionIoStatus;
         if (recordingWorkflowState == RecordingWorkflowState.RECORDING) {
             stateText += " · " + formatRecordingElapsed(recordingStartedInstant, Instant.now());
         }
@@ -2061,6 +2096,11 @@ public class TimeStamp implements QuPathExtension {
             return;
         }
 
+        if (reviewOnlySession && !recordingSessionSaved) {
+            Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
+                    "This session cannot append audio with the current recording clock and time zone. Save your review, then start a new recording.");
+            return;
+        }
         if (!preserveReviewBeforeRecording()) return;
 
         if (recordingSessionSaved && recordingSessionDirty) {
@@ -2070,7 +2110,8 @@ public class TimeStamp implements QuPathExtension {
             if (choice == null || choice == javafx.scene.control.ButtonType.CANCEL) {
                 return;
             }
-            if (choice == javafx.scene.control.ButtonType.YES && !saveTranscriptAndTimestamps()) {
+            if (choice == javafx.scene.control.ButtonType.YES) {
+                saveTranscriptAndTimestamps(TimeStamp::startRecordingSession);
                 return;
             }
         }
@@ -2126,6 +2167,7 @@ public class TimeStamp implements QuPathExtension {
                 throw new IOException("Less than 128 MB of storage is available. Free space before recording.");
             }
             Path workingDirectory = createUniqueArchiveDirectory(workingRoot, LocalDateTime.now());
+            atomicWriteString(workingDirectory.resolve(".transcript-time-zone"), transcriptTimeZone.getId());
             transcriptSessionDir = workingDirectory.toFile();
             transcriptFile = buildTranscriptFile(transcriptSessionDir);
             transcriptCaptureStarted = false;
@@ -2144,6 +2186,18 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void resetWorkingSessionForNewRecording() {
+        recordingWorkflowState = RecordingWorkflowState.READY;
+        stopReviewAudio();
+        updateTranscriptPartial("");
+        transcriptReviewWords = List.of();
+        selectedReviewWord = null;
+        reviewSourceContents = "";
+        reviewDisplayContents = "";
+        reviewLoadedDocument = "";
+        updateTranscriptTextArea("");
+        reviewOnlySession = false;
+        openedSessionName = null;
+        transcriptTimeZone = ZoneId.systemDefault();
         reviewUndo.clear();
         reviewRedo.clear();
         previousReviewRevision = null;
@@ -3326,11 +3380,14 @@ public class TimeStamp implements QuPathExtension {
     record CaptionToken(String text, int start, int end, boolean timestamp) { }
 
     static String compactCaptionTimestamp(String raw, Instant origin) {
+        return compactCaptionTimestamp(raw, origin, transcriptTimeZone);
+    }
+
+    static String compactCaptionTimestamp(String raw, Instant origin, ZoneId timeZone) {
         try {
             String stamp = raw.substring(1, raw.length() - 1);
             if (origin == null) return transcriptLineWallTime(stamp).format(DateTimeFormatter.ofPattern("HH:mm:ss"));
-            return formatEventElapsed(java.time.Duration.between(
-                    origin, transcriptLineInstant(stamp, ZoneId.systemDefault())).toMillis());
+            return formatEventElapsed(java.time.Duration.between(origin, transcriptLineInstant(stamp, timeZone)).toMillis());
         } catch (RuntimeException exception) {
             return raw;
         }
@@ -4070,6 +4127,248 @@ public class TimeStamp implements QuPathExtension {
         Files.writeString(path, "", StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
     }
 
+    private static void chooseSavedSession() {
+        if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy() ||
+                recordingWorkflowState == RecordingWorkflowState.PAUSED) return;
+        DirectoryChooser chooser = new DirectoryChooser();
+        chooser.setTitle("Open the folder created by Save Session");
+        File parent = resolveInitialSaveParent();
+        if (parent != null && parent.isDirectory()) chooser.setInitialDirectory(parent);
+        File manifest = chooser.showDialog(qupathGui == null ? null : qupathGui.getStage());
+        if (manifest == null) return;
+        if (recordingSessionDirty) {
+            var choice = Dialogs.showYesNoCancelDialog("Unsaved recording",
+                    "Save your current recording before opening this session?");
+            if (choice == null || choice == javafx.scene.control.ButtonType.CANCEL) return;
+            if (choice == javafx.scene.control.ButtonType.YES) {
+                saveTranscriptAndTimestamps(() -> openSavedSession(manifest.toPath()));
+                return;
+            }
+        }
+        openSavedSession(manifest.toPath());
+    }
+
+    private static void openSavedSession(Path manifest) {
+        if (isTranscriptProcessBusy()) return;
+        ImportedSession[] imported = new ImportedSession[1];
+        File previousWorking = transcriptSessionDir;
+        boolean discardPrevious = recordingSessionDirty;
+        Path workingRoot = getWorkingRecordingRoot();
+        runSessionIo("Opening and verifying saved session…", () -> {
+            imported[0] = importSavedSession(findSavedManifest(manifest), workingRoot);
+            if (discardPrevious && previousWorking != null) {
+                atomicWriteString(previousWorking.toPath().resolve(".discarded"), Instant.now().toString());
+            }
+        }, () -> applyImportedSession(imported[0]));
+    }
+
+    private static void applyImportedSession(ImportedSession imported) {
+        resetWorkingSessionForNewRecording();
+        transcriptSessionDir = imported.directory().toFile();
+        transcriptFile = imported.transcript().toFile();
+        transcriptCaptureStarted = true;
+        reviewOnlySession = !imported.canResume();
+        transcriptTimeZone = imported.timeZone();
+        openedSessionName = imported.originalDirectory().getFileName().toString();
+        eventLog.clear();
+        eventLog.addAll(imported.events());
+        mouseMoveLog.clear();
+        mouseMoveLog.addAll(imported.cursor());
+        recordingStartedInstant = imported.origin();
+        nextEventSequence = java.util.stream.Stream.concat(eventLog.stream(), mouseMoveLog.stream())
+                .mapToLong(event -> event.sequence).max().orElse(0) + 1;
+        transcriptFinalizationResult = imported.result();
+        transcriptLastExitCode = imported.exitCode();
+        recordingWorkflowState = RecordingWorkflowState.UNSAVED_REVIEW;
+        recordingSessionDirty = true;
+        lastSavedSessionDir = imported.originalDirectory().toFile();
+        loadPreviousReviewRevision();
+        refreshTranscriptContents(true);
+        String text = JsonParser.parseString(imported.review()).getAsJsonObject().get("transcript").getAsString();
+        liveTranscriptTextArea.setText(text);
+        transcriptReviewWords = parseReviewWords(imported.review(), text);
+        reviewDisplayContents = text;
+        selectedReviewWord = null;
+        styleCaptionConfidence();
+        refreshLiveEventMonitor();
+        updateLiveEventMonitorControls();
+        transcriptStatusLabel.setText(imported.hasAudio()
+                ? (imported.canResume() ? "Opened a verified review copy — replay, correct, then Save Session"
+                : "Opened a verified review copy — recording clock or time zone differs; Record more is disabled")
+                : "Opened a verified review copy — audio was not included; replay and Record more are unavailable");
+        checkpointWorkingSession();
+    }
+
+    record ImportedSession(Path directory, Path transcript, Path originalDirectory, String review,
+                           List<EventRecord> events, List<EventRecord> cursor, Instant origin,
+                           String result, int exitCode, boolean hasAudio, ZoneId timeZone) {
+        boolean canResume() { return hasAudio && origin != null && timeZone.equals(ZoneId.systemDefault()); }
+    }
+
+    static Path findSavedManifest(Path directory) throws IOException {
+        if (!Files.isDirectory(directory)) throw new IOException("Choose the folder created by Save Session.");
+        try (var files = Files.list(directory)) {
+            List<Path> manifests = files.filter(Files::isRegularFile)
+                    .filter(path -> path.getFileName().toString().endsWith("_recording_manifest.json")).toList();
+            if (manifests.size() != 1) throw new IOException("Choose one saved session folder containing exactly one recording manifest.");
+            return manifests.getFirst();
+        }
+    }
+
+    static ImportedSession importSavedSession(Path manifestPath, Path workingRoot) throws IOException {
+        Path created = null;
+        try {
+            Path manifest = manifestPath.toAbsolutePath();
+            Path root = manifest.getParent();
+            String manifestText = Files.readString(manifest);
+            SessionIntegrity.verify(manifestText, root);
+            JsonObject document = JsonParser.parseString(manifestText).getAsJsonObject();
+            String state = document.get("workflowState").getAsString();
+            if (!state.equals("complete") && !state.equals("complete_with_warning")) {
+                throw new IOException("This export is incomplete. Recover its original working recording instead.");
+            }
+            Path savedTranscript = declaredArtifact(document.getAsJsonObject("transcript"), root, true);
+            Path eventFile = declaredArtifact(document.getAsJsonObject("timestamps"), root, true);
+            Path cursorFile = declaredArtifact(document.getAsJsonObject("cursor"), root, true);
+            List<EventRecord> events = readSavedEvents(eventFile, "events");
+            List<EventRecord> cursor = readSavedEvents(cursorFile, "cursorEvents");
+            if (events.size() != document.getAsJsonObject("timestamps").get("count").getAsInt() ||
+                    cursor.size() != document.getAsJsonObject("cursor").get("count").getAsInt()) {
+                throw new IOException("Saved event counts do not match the manifest");
+            }
+            String originText = document.get("recordingStartedAtUtc").getAsString();
+            Instant origin = originText.isBlank() ? null : Instant.parse(originText);
+            ZoneId timeZone = document.has("transcriptTimeZone")
+                    ? ZoneId.of(document.get("transcriptTimeZone").getAsString()) : ZoneId.systemDefault();
+            Path timed = declaredArtifact(document.getAsJsonObject("timedMachineTranscript"), root, false);
+            String machine = Files.readString(timed == null ? savedTranscript : timed);
+            String text = Files.readString(savedTranscript);
+            Path reviewed = declaredArtifact(document.getAsJsonObject("reviewedWords"), root, false);
+            String review = reviewed == null ? reviewedTranscriptJson(text, List.of()) : Files.readString(reviewed);
+            JsonObject reviewDocument = JsonParser.parseString(review).getAsJsonObject();
+            if (reviewDocument.get("version").getAsInt() != 1 ||
+                    !reviewDocument.get("transcript").getAsString().equals(text) ||
+                    !reviewDocument.get("words").isJsonArray()) {
+                throw new IOException("Saved corrections do not match their review metadata");
+            }
+            ExportSafety.requireSeparateDestination(root, workingRoot);
+            Files.createDirectories(workingRoot);
+            try {
+                Files.setPosixFilePermissions(workingRoot,
+                        java.nio.file.attribute.PosixFilePermissions.fromString("rwx------"));
+            } catch (UnsupportedOperationException ignored) {
+                // Windows uses the user's directory ACL.
+            }
+            created = Files.createTempDirectory(workingRoot, "review_");
+            atomicWriteString(created.resolve(".discarded"), "Import in progress");
+            atomicWriteString(created.resolve(".transcript-time-zone"), timeZone.getId());
+            Path transcript = buildTranscriptFile(created.toFile()).toPath();
+            atomicWriteString(transcript, machine);
+            String[][] fields = {{"timedMachineTranscript", "_timed.txt"}, {"liveTranscript", "_live.txt"},
+                    {"transcriptSegments", "_segments.csv"}, {"transcriptWords", "_words.csv"},
+                    {"wordReview", "_review.json"}, {"previousReview", "_previous_review.json"}};
+            for (String[] field : fields) {
+                copyDeclaredArtifact(document.getAsJsonObject(field[0]), root, transcript, field[1]);
+            }
+            JsonObject audio = document.getAsJsonObject("audio");
+            for (String[] field : new String[][]{{"raw", "_audio.raw"}, {"wav", "_audio.wav"},
+                    {"startTime", "_audio.start.txt"}}) {
+                copyDeclaredArtifact(audio == null ? null : audio.getAsJsonObject(field[0]), root, transcript, field[1]);
+            }
+            // Recheck the originals after copying before exposing the review copy.
+            SessionIntegrity.verify(manifestText, root);
+            atomicWriteString(created.resolve(".timestamp-review.json"), ReviewRecovery.encode(machine, review));
+            boolean hasAudio = Files.isRegularFile(transcriptCompanionFile(transcript.toFile(), "_audio.wav").toPath());
+            if (!hasAudio || origin == null || !timeZone.equals(ZoneId.systemDefault())) {
+                atomicWriteString(created.resolve(".imported-review-only"), "Audio or recording clock unavailable");
+            } else {
+                Path audioOrigin = transcriptCompanionFile(transcript.toFile(), "_audio.start.txt").toPath();
+                if (Files.exists(audioOrigin) && !Instant.parse(Files.readString(audioOrigin).trim()).equals(origin)) {
+                    throw new IOException("Saved audio origin does not match its manifest");
+                }
+                // This is the manifest's recorded origin, never a new inferred clock.
+                if (!Files.exists(audioOrigin)) atomicWriteString(audioOrigin, origin.toString());
+            }
+            RecoverySnapshot recovery = new RecoverySnapshot(events, cursor, origin,
+                    java.util.stream.Stream.concat(events.stream(), cursor.stream())
+                            .mapToLong(event -> event.sequence).max().orElse(0) + 1);
+            try (ObjectOutputStream output = new ObjectOutputStream(Files.newOutputStream(getRecoverySnapshotPath(created.toFile())))) {
+                output.writeObject(recovery);
+            }
+            ImportedSession imported = new ImportedSession(created, transcript, root, review, List.copyOf(events), List.copyOf(cursor),
+                    origin, document.get("transcriptFinalizationResult").getAsString(),
+                    document.get("transcriptProcessExitCode").getAsInt(),
+                    hasAudio, timeZone);
+            Files.delete(created.resolve(".discarded"));
+            return imported;
+        } catch (IOException | RuntimeException exception) {
+            if (created != null) {
+                try { atomicWriteString(created.resolve(".discarded"), "Incomplete import"); }
+                catch (IOException markerError) { exception.addSuppressed(markerError); }
+            }
+            throw new IOException("Could not open saved session: " + exception.getMessage(), exception);
+        }
+    }
+
+    private static Path declaredArtifact(JsonObject descriptor, Path root, boolean required) throws IOException {
+        if (descriptor == null || (descriptor.has("exists") && !descriptor.get("exists").getAsBoolean())) {
+            if (required) throw new IOException("A required saved artifact is missing");
+            return null;
+        }
+        Path path = root.resolve(descriptor.get("path").getAsString()).normalize();
+        if (!path.startsWith(root) || !Files.isRegularFile(path) || !path.toRealPath().startsWith(root.toRealPath())) {
+            throw new IOException("Saved artifact is missing or outside its session folder");
+        }
+        return path;
+    }
+
+    private static void copyDeclaredArtifact(JsonObject descriptor, Path root, Path transcript, String suffix) throws IOException {
+        Path source = declaredArtifact(descriptor, root, false);
+        if (source != null) {
+            File target = transcriptCompanionFile(transcript.toFile(), suffix);
+            copyFileAtomically(source.toFile(), target);
+            SessionIntegrity.verifyCopy(target.toPath(), descriptor);
+        }
+    }
+
+    private static List<EventRecord> readSavedEvents(Path file, String collection) throws IOException {
+        List<EventRecord> events = new ArrayList<>();
+        JsonObject document = JsonParser.parseString(Files.readString(file)).getAsJsonObject();
+        if (document.get("schemaVersion").getAsInt() != 2) throw new IOException("Unsupported event schema");
+        for (var item : document.getAsJsonArray(collection)) {
+            JsonObject row = item.getAsJsonObject();
+            JsonObject view = row.getAsJsonObject("zoom_view");
+            RecordedImage image = null;
+            if (row.has("image") && !row.get("image").isJsonNull()) {
+                JsonObject data = row.getAsJsonObject("image");
+                image = new RecordedImage(data.get("id").getAsString(), data.get("name").getAsString(), data.get("source").getAsString());
+            }
+            ViewBounds bounds = new ViewBounds(view.get("x").getAsDouble(), view.get("y").getAsDouble(),
+                    view.get("width").getAsDouble(), view.get("height").getAsDouble(),
+                    view.get("centerX").getAsDouble(), view.get("centerY").getAsDouble(),
+                    view.get("z").getAsInt(), view.get("t").getAsInt(),
+                    view.get("downsample").getAsDouble(), view.get("rotation").getAsDouble(), image);
+            AnnotationGeometry annotation = null;
+            if (row.has("annotation") && !row.get("annotation").isJsonNull()) {
+                JsonObject data = row.getAsJsonObject("annotation");
+                JsonObject box = data.getAsJsonObject("bounds");
+                List<double[]> points = new ArrayList<>();
+                for (var point : data.getAsJsonArray("points")) {
+                    var pair = point.getAsJsonArray();
+                    points.add(new double[]{pair.get(0).getAsDouble(), pair.get(1).getAsDouble()});
+                }
+                annotation = new AnnotationGeometry(data.get("roi_type").getAsString(), box.get("x").getAsDouble(),
+                        box.get("y").getAsDouble(), box.get("width").getAsDouble(), box.get("height").getAsDouble(),
+                        data.get("num_points").getAsInt(), points);
+            }
+            events.add(new EventRecord(row.get("sequence").getAsLong(),
+                    LocalDateTime.parse(row.get("timestamp").getAsString()), Instant.parse(row.get("recordedAtUtc").getAsString()),
+                    row.get("eventType").getAsString(), row.get("details").getAsString(), bounds, annotation,
+                    row.get("sessionId").getAsString()));
+        }
+        return events;
+    }
+
     private static void exportTranscript() {
         if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
@@ -4108,26 +4407,30 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 
-    private static boolean saveTranscriptAndTimestamps() {
+    private static void saveTranscriptAndTimestamps() {
+        saveTranscriptAndTimestamps(() -> { });
+    }
+
+    private static void saveTranscriptAndTimestamps(Runnable onSaved) {
         if (recordingWorkflowState == RecordingWorkflowState.PAUSED) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
                     "Choose Finish & review and wait for the final transcript before saving.");
-            return false;
+            return;
         }
         if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
                     "Choose Finish & review and wait for the final transcript before saving.");
-            return false;
+            return;
         }
 
         if (transcriptSessionDir == null) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
                     "Start a recording before saving.");
-            return false;
+            return;
         }
 
         if (liveTranscriptTextArea == null) {
-            return false;
+            return;
         }
 
         if (transcriptFile == null) {
@@ -4136,32 +4439,32 @@ public class TimeStamp implements QuPathExtension {
         if (transcriptFile == null) {
             Dialogs.showErrorMessage("Recording Save Failed",
                     "Transcript file could not be determined for the current recording.");
-            return false;
+            return;
         }
 
-        if (!comparePreviousReview()) return false;
+        if (!comparePreviousReview()) return;
         SaveOptions saveOptions = chooseRecordingSaveOptions();
         if (saveOptions == null) {
-            return false;
+            return;
         }
         File destinationDirectory = saveOptions.sessionDirectory();
         try {
             ExportSafety.requireSeparateDestination(transcriptSessionDir.toPath(), destinationDirectory.toPath());
         } catch (IOException exception) {
             Dialogs.showErrorMessage("Choose another save location", exception.getMessage());
-            return false;
+            return;
         }
         File destinationTranscript = buildTranscriptFile(destinationDirectory);
         if (destinationTranscript == null) {
             Dialogs.showErrorMessage("Recording Save Failed",
                     "Transcript file could not be determined for the selected folder.");
-            return false;
+            return;
         }
         if (!(recordingSessionSaved && destinationDirectory.equals(lastSavedSessionDir)) &&
                 hasSavedRecordingArtifacts(destinationDirectory) &&
                 !Dialogs.showYesNoDialog("Replace Saved Recording",
                         "The selected folder already contains TimeStamp recording files. Replace them with this recording?")) {
-            return false;
+            return;
         }
 
         String transcriptText = liveTranscriptTextArea.getText();
@@ -4169,63 +4472,105 @@ public class TimeStamp implements QuPathExtension {
             transcriptText = "";
         }
 
-        try {
-            recordingWorkflowState = RecordingWorkflowState.SAVING;
-            updateLiveEventMonitorControls();
-            Files.createDirectories(destinationDirectory.toPath());
-            markDestinationSavePending(destinationDirectory, destinationTranscript);
-            atomicWriteString(destinationTranscript.toPath(), transcriptText);
-            validateExactTextFile(destinationTranscript.toPath(), transcriptText,
-                    "displayed transcript");
-            copyWorkingRecordingFiles(transcriptFile, destinationTranscript, saveOptions.includeRawAudio());
-            atomicWriteString(transcriptCompanionFile(destinationTranscript, "_reviewed.json").toPath(),
-                    reviewedTranscriptJson(transcriptText, transcriptReviewWords));
-            validateTranscriptTimingFiles(destinationTranscript, transcriptFinalizationResult);
-            boolean saved = saveSessionArtifacts(destinationDirectory, destinationTranscript,
-                    transcriptFinalizationResult, transcriptLastExitCode);
-            if (!saved) {
-                throw new IOException("One or more session artifacts could not be written.");
-            }
-            lastSavedSessionDir = destinationDirectory;
+        SaveSnapshot snapshot = new SaveSnapshot(transcriptSessionDir, transcriptFile,
+                destinationDirectory, destinationTranscript, transcriptText,
+                reviewedTranscriptJson(transcriptText, List.copyOf(transcriptReviewWords)),
+                saveOptions.includeRawAudio(), transcriptFinalizationResult, transcriptLastExitCode,
+                snapshotArtifacts(destinationDirectory.getName()));
+        beginSessionSave(snapshot, onSaved);
+    }
+
+    private static void beginSessionSave(SaveSnapshot snapshot, Runnable onSaved) {
+        if (sessionIoBusy) return;
+        recordingWorkflowState = RecordingWorkflowState.SAVING;
+        runSessionIo("Saving and verifying session…", () -> writeSessionSnapshot(snapshot), () -> {
+            lastSavedSessionDir = snapshot.destinationDirectory();
             recordingSessionSaved = true;
             recordingSessionDirty = false;
             recordingWorkflowState = RecordingWorkflowState.SAVED;
-            atomicWriteString(transcriptSessionDir.toPath().resolve(".saved"),
-                    destinationDirectory.getAbsolutePath());
-            String status = buildSavedStatusText(transcriptFinalizationResult);
-            if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText(status);
-            }
+            transcriptStatusLabel.setText(buildSavedStatusText(snapshot.finalizationResult()));
+            updateLiveEventMonitorControls();
             Dialogs.showInfoNotification(TIMESTAMP_CATEGORY,
-                    String.format("Transcript and %d timestamp events saved to:%n%s",
-                            eventLog.size(), destinationDirectory.getAbsolutePath()));
-            logger.info("User saved transcript and timestamp artifacts to {}",
-                    destinationDirectory.getAbsolutePath());
-            updateLiveEventMonitorControls();
-            return true;
-        } catch (IOException e) {
-            logger.error("Failed to save transcript and timestamps", e);
-            if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText("Transcript: Error: recording could not be saved");
+                    "Transcript and " + snapshot.artifacts().eventCount() + " events saved and verified.");
+            onSaved.run();
+        });
+    }
+
+    @FunctionalInterface
+    interface SessionIoTask { void run() throws Exception; }
+
+    private static void runSessionIo(String status, SessionIoTask task, Runnable onSuccess) {
+        if (sessionIoBusy) return;
+        sessionIoBusy = true;
+        sessionIoStatus = status;
+        transcriptStatusLabel.setText(status);
+        updateLiveEventMonitorControls();
+        Thread worker = new Thread(() -> {
+            try {
+                task.run();
+                Platform.runLater(() -> {
+                    sessionIoBusy = false;
+                    onSuccess.run();
+                    updateLiveEventMonitorControls();
+                });
+            } catch (Exception exception) {
+                logger.error("Session operation failed", exception);
+                Platform.runLater(() -> {
+                    sessionIoBusy = false;
+                    recordingSessionDirty = transcriptSessionDir != null && recordingSessionDirty;
+                    if (recordingWorkflowState == RecordingWorkflowState.SAVING) {
+                        recordingSessionDirty = true;
+                        recordingWorkflowState = RecordingWorkflowState.ERROR;
+                    }
+                    transcriptStatusLabel.setText("Session operation failed — available data is preserved");
+                    updateLiveEventMonitorControls();
+                    Dialogs.showErrorMessage("Session operation failed", exception.getMessage());
+                });
             }
-            recordingSessionDirty = true;
-            recordingWorkflowState = RecordingWorkflowState.ERROR;
-            updateLiveEventMonitorControls();
-            Dialogs.showErrorMessage("Recording Save Failed",
-                    "Could not save transcript and timestamps: " + e.getMessage());
-            return false;
+        }, "timestamp-session-io");
+        worker.setDaemon(true);
+        worker.start();
+    }
+
+    static void writeSessionSnapshot(SaveSnapshot snapshot) throws IOException {
+        File destinationDirectory = snapshot.destinationDirectory();
+        File destinationTranscript = snapshot.destinationTranscript();
+        ExportSafety.requireSeparateDestination(snapshot.workingDirectory().toPath(), destinationDirectory.toPath());
+        Files.createDirectories(destinationDirectory.toPath());
+        SessionArtifactPaths paths = buildSessionArtifactPaths(destinationDirectory);
+        atomicWriteString(paths.manifest(), buildRecordingManifest(paths, destinationDirectory,
+                destinationTranscript, TRANSCRIPT_FINALIZATION_PENDING, -1, snapshot.artifacts()));
+        atomicWriteString(destinationTranscript.toPath(), snapshot.text());
+        validateExactTextFile(destinationTranscript.toPath(), snapshot.text(), "displayed transcript");
+        copyWorkingRecordingFiles(snapshot.sourceTranscript(), destinationTranscript, snapshot.includeAudio());
+        atomicWriteString(transcriptCompanionFile(destinationTranscript, "_reviewed.json").toPath(), snapshot.review());
+        validateTranscriptTimingFiles(destinationTranscript, snapshot.finalizationResult());
+        if (!saveSessionArtifacts(destinationDirectory, destinationTranscript,
+                snapshot.finalizationResult(), snapshot.exitCode(), snapshot.artifacts())) {
+            throw new IOException("One or more session artifacts could not be written or verified.");
+        }
+        atomicWriteString(snapshot.workingDirectory().toPath().resolve(".saved"), destinationDirectory.getAbsolutePath());
+    }
+
+    record SaveSnapshot(File workingDirectory, File sourceTranscript, File destinationDirectory,
+                        File destinationTranscript, String text, String review, boolean includeAudio,
+                        String finalizationResult, int exitCode, ArtifactSnapshot artifacts) { }
+
+    record ArtifactSnapshot(String eventCsv, String eventJson, String cursorJson,
+                            Instant origin, Long duration, int eventCount, int cursorCount, String timeZone) {
+        ArtifactSnapshot(String eventCsv, String eventJson, String cursorJson, Instant origin,
+                         Long duration, int eventCount, int cursorCount) {
+            this(eventCsv, eventJson, cursorJson, origin, duration, eventCount, cursorCount, ZoneId.systemDefault().getId());
         }
     }
 
-    private static void markDestinationSavePending(File destinationDirectory,
-                                                   File destinationTranscript) throws IOException {
-        SessionArtifactPaths paths = buildSessionArtifactPaths(destinationDirectory);
-        if (paths == null) {
-            throw new IOException("Could not prepare the selected recording folder.");
-        }
-        atomicWriteString(paths.manifest(), buildRecordingManifest(
-                paths, destinationDirectory, destinationTranscript,
-                TRANSCRIPT_FINALIZATION_PENDING, -1, eventLog.size(), mouseMoveLog.size()));
+    private static ArtifactSnapshot snapshotArtifacts(String sessionId) {
+        List<EventRecord> events = List.copyOf(eventLog);
+        List<EventRecord> cursor = List.copyOf(mouseMoveLog);
+        return new ArtifactSnapshot(serializeEventCsv(events, sessionId),
+                serializeEventJson(events, "events", sessionId), serializeEventJson(cursor, "cursorEvents", sessionId),
+                recordingStartedInstant, events.stream().map(TimeStamp::derivedElapsedMillis)
+                .filter(Objects::nonNull).max(Long::compareTo).orElse(null), events.size(), cursor.size(), transcriptTimeZone.getId());
     }
 
     private static SaveOptions chooseRecordingSaveOptions() {
@@ -4261,7 +4606,8 @@ public class TimeStamp implements QuPathExtension {
         HBox parentBox = new HBox(8, parentField, browseButton);
         HBox.setHgrow(parentField, Priority.ALWAYS);
         Label privacyHint = new Label(
-                "Transcript and timestamp files are always saved locally. Raw audio is excluded by default.");
+                "Transcript and image actions are saved locally. Include audio to replay words after reopening this session. " +
+                "Audio is excluded by default; the original working recording is retained.");
         privacyHint.setWrapText(true);
         GridPane content = new GridPane();
         content.setHgap(8);
@@ -4432,6 +4778,9 @@ public class TimeStamp implements QuPathExtension {
                 while ((line = reader.readLine()) != null) {
                     TranscriptMessage message = parseTranscriptMessage(line);
                     String outputLine = message.raw();
+                    if (message.type() == TranscriptMessageType.CAPTURE_SAVED) {
+                        captureSavedProcess = process;
+                    }
                     if (message.type() == TranscriptMessageType.FINALIZATION_RESULT) {
                         // Capture the protocol result before the process waiter commits session files.
                         transcriptFinalizationResult = message.fields().get(0).trim();
@@ -4557,7 +4906,7 @@ public class TimeStamp implements QuPathExtension {
                                 updateTranscriptPartial("");
                                 transcriptFinalizationResult = message.fields().get(0).trim();
                             }
-                            case MALFORMED, DEVICE, AUDIO_CHECK_READY, AUDIO_CHECK_RESULT -> { }
+                            case MALFORMED, DEVICE, AUDIO_CHECK_READY, AUDIO_CHECK_RESULT, CAPTURE_SAVED -> { }
                             case LOG -> {
                                 if (transcriptStatusLabel == null) {
                                     return;
@@ -4685,7 +5034,8 @@ public class TimeStamp implements QuPathExtension {
                     : "Transcript: stopping capture before finalization");
         }
         try {
-            process.getOutputStream().write("STOP\n".getBytes(StandardCharsets.UTF_8));
+            process.getOutputStream().write((intent == TranscriptStopIntent.PAUSE ? "STOP\n" : "FINISH\n")
+                    .getBytes(StandardCharsets.UTF_8));
             process.getOutputStream().flush();
         } catch (IOException exception) {
             process.destroy();
@@ -4695,15 +5045,13 @@ public class TimeStamp implements QuPathExtension {
             final boolean[] timedOut = {false};
             final boolean[] interrupted = {false};
             final int[] exitCode = {-1};
+            final boolean[] audioSaved = {false};
             try {
-                long timeoutSeconds = 120L;
-                logger.info("Waiting up to {} seconds for transcript capture to stop", timeoutSeconds);
-                if (!process.waitFor(timeoutSeconds, java.util.concurrent.TimeUnit.SECONDS)) {
-                    timedOut[0] = true;
-                    process.destroyForcibly();
-                    process.waitFor();
-                }
-                exitCode[0] = safeExitValue(process);
+                CaptureShutdown result = awaitCaptureShutdown(process,
+                        () -> captureSavedProcess == process && intent != TranscriptStopIntent.PAUSE, 120_000L);
+                audioSaved[0] = result.audioSaved();
+                timedOut[0] = result.timedOut();
+                exitCode[0] = result.exitCode();
                 waitForTranscriptOutputDrain();
             } catch (InterruptedException e) {
                 interrupted[0] = true;
@@ -4720,7 +5068,7 @@ public class TimeStamp implements QuPathExtension {
                     transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
                     transcriptStopIntent = TranscriptStopIntent.NONE;
                     resetTranscriptAudioLevelIndicator();
-                    if (timedOut[0] || interrupted[0] || exitCode[0] != 0) {
+                    if (timedOut[0] || interrupted[0] || (exitCode[0] != 0 && !audioSaved[0])) {
                         recordingWorkflowState = RecordingWorkflowState.ERROR;
                         transcriptFinalizationResult = timedOut[0]
                                 ? "live-preserved-pause-timeout"
@@ -4748,6 +5096,27 @@ public class TimeStamp implements QuPathExtension {
         }, "timestamp-transcript-pause");
         waitThread.setDaemon(true);
         waitThread.start();
+    }
+
+    record CaptureShutdown(boolean audioSaved, boolean timedOut, int exitCode) { }
+
+    static CaptureShutdown awaitCaptureShutdown(Process process, java.util.function.BooleanSupplier saved,
+                                                 long timeoutMillis) throws InterruptedException {
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(timeoutMillis);
+        while (process.isAlive() && System.nanoTime() < deadline && !saved.getAsBoolean()) {
+            process.waitFor(Math.min(100L, Math.max(1L, timeoutMillis)), java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+        boolean acknowledged = saved.getAsBoolean();
+        boolean timedOut = process.isAlive() && !acknowledged;
+        if (process.isAlive()) {
+            // Only a saved-audio acknowledgement permits a forced preview exit
+            // to count as successful. Always wait for exit before another writer.
+            process.destroyForcibly();
+            if (!process.waitFor(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                throw new InterruptedException("Preview process did not terminate");
+            }
+        }
+        return new CaptureShutdown(acknowledged, timedOut, safeExitValue(process));
     }
 
     private static void waitForTranscriptFinalization(Process process) {
@@ -4878,6 +5247,13 @@ public class TimeStamp implements QuPathExtension {
 
     private static boolean saveSessionArtifacts(File destinationDirectory, File destinationTranscript,
                                                 String finalizationResult, int transcriptExitCode) {
+        return saveSessionArtifacts(destinationDirectory, destinationTranscript, finalizationResult,
+                transcriptExitCode, snapshotArtifacts(destinationDirectory.getName()));
+    }
+
+    private static boolean saveSessionArtifacts(File destinationDirectory, File destinationTranscript,
+                                                String finalizationResult, int transcriptExitCode,
+                                                ArtifactSnapshot snapshot) {
         SessionArtifactPaths paths = buildSessionArtifactPaths(destinationDirectory);
         if (paths == null) {
             logger.warn("Cannot save recording artifacts because no destination folder is selected");
@@ -4885,17 +5261,14 @@ public class TimeStamp implements QuPathExtension {
         }
 
         try {
-            List<EventRecord> eventSnapshot = new ArrayList<>(eventLog);
-            List<EventRecord> mouseSnapshot = new ArrayList<>(mouseMoveLog);
-            String savedSessionId = destinationDirectory.getName();
-            String eventCsv = serializeEventCsv(eventSnapshot, savedSessionId);
-            String eventJson = serializeEventJson(eventSnapshot, "events", savedSessionId);
-            String cursorJson = serializeEventJson(mouseSnapshot, "cursorEvents", savedSessionId);
+            String eventCsv = snapshot.eventCsv();
+            String eventJson = snapshot.eventJson();
+            String cursorJson = snapshot.cursorJson();
             // Invalidate any older commit marker before replacing this session snapshot.
             atomicWriteString(paths.manifest(), buildRecordingManifest(
                     paths, destinationDirectory, destinationTranscript,
                     TRANSCRIPT_FINALIZATION_PENDING, -1,
-                    eventSnapshot.size(), mouseSnapshot.size()));
+                    snapshot));
             atomicWriteString(paths.eventCsv(), eventCsv);
             atomicWriteString(paths.eventJson(), eventJson);
             atomicWriteString(paths.cursorJson(), cursorJson);
@@ -4906,7 +5279,7 @@ public class TimeStamp implements QuPathExtension {
             String completedManifest = buildRecordingManifest(
                     paths, destinationDirectory, destinationTranscript,
                     finalizationResult, transcriptExitCode,
-                    eventSnapshot.size(), mouseSnapshot.size());
+                    snapshot);
             completedManifest = SessionIntegrity.addChecksums(completedManifest, destinationDirectory.toPath());
             atomicWriteString(paths.manifest(), completedManifest);
             validateExactTextFile(paths.manifest(), completedManifest, "recording manifest");
@@ -5067,7 +5440,7 @@ public class TimeStamp implements QuPathExtension {
 
     private static String buildRecordingManifest(SessionArtifactPaths paths, File destinationDirectory,
                                                  File destinationTranscript, String finalizationResult,
-                                                 int transcriptExitCode, int eventCount, int cursorCount) {
+                                                 int transcriptExitCode, ArtifactSnapshot snapshot) {
         String normalizedResult = defaultIfBlank(finalizationResult, TRANSCRIPT_FINALIZATION_FAILED);
         boolean transcriptExists = destinationTranscript != null && destinationTranscript.isFile();
         File liveTranscript = transcriptCompanionFile(destinationTranscript, "_live.txt");
@@ -5084,17 +5457,14 @@ public class TimeStamp implements QuPathExtension {
         String workflowState = completed
                 ? ("final".equals(normalizedResult) ? "complete" : "complete_with_warning")
                 : "incomplete";
-        Long durationMillis = eventLog.stream()
-                .map(TimeStamp::derivedElapsedMillis)
-                .filter(Objects::nonNull)
-                .max(Long::compareTo)
-                .orElse(null);
+        Long durationMillis = snapshot.duration();
         return "{\n" +
                 "  \"schemaVersion\": 2,\n" +
                 "  \"sessionId\": \"" + escapeJson(destinationDirectory.getName()) + "\",\n" +
                 "  \"savedAt\": \"" + escapeJson(formatter.format(LocalDateTime.now())) + "\",\n" +
                 "  \"recordingStartedAtUtc\": \"" +
-                escapeJson(recordingStartedInstant == null ? "" : recordingStartedInstant.toString()) + "\",\n" +
+                escapeJson(snapshot.origin() == null ? "" : snapshot.origin().toString()) + "\",\n" +
+                "  \"transcriptTimeZone\": \"" + escapeJson(snapshot.timeZone()) + "\",\n" +
                 "  \"durationMs\": " + (durationMillis == null ? "null" : durationMillis) + ",\n" +
                 "  \"qupathVersion\": \"" + escapeJson(EXTENSION_QUPATH_VERSION.toString()) + "\",\n" +
                 "  \"workflowState\": \"" + workflowState + "\",\n" +
@@ -5120,9 +5490,9 @@ public class TimeStamp implements QuPathExtension {
                 "  },\n" +
                 "  \"timestamps\": {\"path\": \"" + escapeJson(relativeSessionPath(destinationDirectory, paths.eventJson().toFile())) +
                 "\", \"csvPath\": \"" + escapeJson(relativeSessionPath(destinationDirectory, paths.eventCsv().toFile())) +
-                "\", \"count\": " + eventCount + "},\n" +
+                "\", \"count\": " + snapshot.eventCount() + "},\n" +
                 "  \"cursor\": {\"path\": \"" + escapeJson(relativeSessionPath(destinationDirectory, paths.cursorJson().toFile())) +
-                "\", \"count\": " + cursorCount + "}\n" +
+                "\", \"count\": " + snapshot.cursorCount() + "}\n" +
                 "}\n";
     }
 
@@ -5167,7 +5537,7 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void clearLogsStatic() {
-        if (recordEvents.get() || transcriptStartPending || transcriptStopInProgress) {
+        if (recordEvents.get() || transcriptStartPending || isTranscriptProcessBusy()) {
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
                     "Choose Finish & review and wait for the final transcript before clearing event logs.");
             return;
