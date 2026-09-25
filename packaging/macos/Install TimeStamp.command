@@ -14,6 +14,7 @@ UV_VERSION="0.12.5"
 REQUIREMENTS_FILE="${PACKAGE_DIR}/requirements-doctor.txt"
 CHECKSUMS_FILE="${PACKAGE_DIR}/CHECKSUMS-SHA256.txt"
 HELPER_FILE="${PACKAGE_DIR}/live_whisper_demo.py"
+MODEL_SETUP_FILE="${PACKAGE_DIR}/prepare_doctor_models.py"
 
 finish_with_error() {
   local exit_code=$?
@@ -51,7 +52,12 @@ if [[ ! -f "$HELPER_FILE" ]]; then
   exit 1
 fi
 
-echo "Verifying the TimeStamp package..."
+if [[ ! -f "$MODEL_SETUP_FILE" ]]; then
+  echo "Missing model setup helper: ${MODEL_SETUP_FILE}"
+  exit 1
+fi
+
+echo "[1/4] Verifying the TimeStamp package..."
 (
   cd "$PACKAGE_DIR"
   shasum -a 256 -c "$(basename "$CHECKSUMS_FILE")"
@@ -113,7 +119,7 @@ export UV_CACHE_DIR="${SUPPORT_DIR}/download-cache"
 export UV_PYTHON_INSTALL_DIR="${RUNTIME_DIR}/python"
 export HF_HOME="$MODEL_CACHE_DIR"
 
-echo "Preparing the private Python runtime..."
+echo "[2/4] Preparing the private recorder runtime..."
 PYTHON_BIN="${VENV_DIR}/bin/python"
 if [[ ! -x "$PYTHON_BIN" ]]; then
   "$UV_BIN" venv --python 3.12 --managed-python "$VENV_DIR"
@@ -122,13 +128,11 @@ echo "Installing the recorder and speech-to-text libraries..."
 "$UV_BIN" pip install --python "$PYTHON_BIN" --requirements "$REQUIREMENTS_FILE"
 
 if [[ "${TIMESTAMP_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]]; then
-  echo "Downloading the live transcription model..."
-  "$PYTHON_BIN" -c 'from huggingface_hub import snapshot_download; snapshot_download("Systran/faster-whisper-small.en")'
-  echo "Downloading the final high-accuracy model (this is the largest download)..."
-  "$PYTHON_BIN" -c 'from huggingface_hub import snapshot_download; snapshot_download("Systran/faster-whisper-large-v3")'
+  echo "[3/4] Preparing speech models (first setup is the largest download)..."
+  "$PYTHON_BIN" "$MODEL_SETUP_FILE"
 fi
 
-echo "Verifying microphone and transcription support..."
+echo "[4/4] Checking the recorder and installing TimeStamp..."
 "$PYTHON_BIN" -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
 if [[ "${TIMESTAMP_SKIP_AUDIO_CHECK:-0}" != "1" ]]; then
   echo "Testing the microphone for 3 seconds. Speak normally now..."

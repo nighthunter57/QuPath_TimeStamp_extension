@@ -13,6 +13,7 @@ $UvVersion = "0.12.5"
 $RequirementsFile = Join-Path $PackageDir "requirements-doctor.txt"
 $ChecksumsFile = Join-Path $PackageDir "CHECKSUMS-SHA256.txt"
 $HelperFile = Join-Path $PackageDir "live_whisper_demo.py"
+$ModelSetupFile = Join-Path $PackageDir "prepare_doctor_models.py"
 
 Write-Host "TimeStamp doctor installation for Windows"
 Write-Host "QuPath folder: $QuPathUserDir"
@@ -32,12 +33,14 @@ $JarFile = Get-ChildItem -LiteralPath $PackageDir -Filter "TimeStamp-*.jar" -Fil
     Select-Object -First 1
 if (-not $JarFile) { throw "The TimeStamp extension JAR is missing from this package." }
 
-Write-Host "Verifying the TimeStamp package..."
+if (-not (Test-Path -LiteralPath $ModelSetupFile -PathType Leaf)) { throw "Missing $ModelSetupFile" }
+
+Write-Host "[1/4] Verifying the TimeStamp package..."
 $ExpectedChecksums = @{}
 Get-Content -LiteralPath $ChecksumsFile | ForEach-Object {
     if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') { $ExpectedChecksums[$Matches[2]] = $Matches[1].ToLowerInvariant() }
 }
-foreach ($FileName in @($JarFile.Name, "requirements-doctor.txt", "live_whisper_demo.py")) {
+foreach ($FileName in @($JarFile.Name, "requirements-doctor.txt", "live_whisper_demo.py", "prepare_doctor_models.py")) {
     if (-not $ExpectedChecksums.ContainsKey($FileName)) { throw "Missing checksum for $FileName" }
     $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PackageDir $FileName)).Hash.ToLowerInvariant()
     if ($Actual -ne $ExpectedChecksums[$FileName]) { throw "Checksum verification failed for $FileName" }
@@ -83,7 +86,7 @@ $env:UV_PYTHON_INSTALL_DIR = Join-Path $RuntimeDir "python"
 $env:HF_HOME = $ModelCacheDir
 
 $PythonBin = Join-Path $VenvDir "Scripts\python.exe"
-Write-Host "Preparing the private Python runtime..."
+Write-Host "[2/4] Preparing the private recorder runtime..."
 if (-not (Test-Path -LiteralPath $PythonBin -PathType Leaf)) {
     & $UvBin venv --python 3.12 --managed-python $VenvDir
     if ($LASTEXITCODE -ne 0) { throw "Private Python setup failed." }
@@ -93,15 +96,12 @@ Write-Host "Installing the recorder and speech-to-text libraries..."
 if ($LASTEXITCODE -ne 0) { throw "Recorder dependency installation failed." }
 
 if ($env:TIMESTAMP_SKIP_MODEL_DOWNLOAD -ne "1") {
-    Write-Host "Downloading the live transcription model..."
-    & $PythonBin -c 'from huggingface_hub import snapshot_download; snapshot_download("Systran/faster-whisper-small.en")'
-    if ($LASTEXITCODE -ne 0) { throw "Live model download failed." }
-    Write-Host "Downloading the final high-accuracy model (this is the largest download)..."
-    & $PythonBin -c 'from huggingface_hub import snapshot_download; snapshot_download("Systran/faster-whisper-large-v3")'
-    if ($LASTEXITCODE -ne 0) { throw "Final model download failed." }
+    Write-Host "[3/4] Preparing speech models (first setup is the largest download)..."
+    & $PythonBin $ModelSetupFile
+    if ($LASTEXITCODE -ne 0) { throw "Speech model preparation failed." }
 }
 
-Write-Host "Verifying microphone and transcription support..."
+Write-Host "[4/4] Checking the recorder and installing TimeStamp..."
 & $PythonBin -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
 if ($LASTEXITCODE -ne 0) { throw "Recorder verification failed." }
 if ($env:TIMESTAMP_SKIP_AUDIO_CHECK -ne "1") {

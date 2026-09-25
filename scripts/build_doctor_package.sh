@@ -17,6 +17,7 @@ mkdir -p "$PACKAGE_DIR" "$DISTRIBUTION_DIR"
 cp "build/libs/TimeStamp-${VERSION}.jar" "$PACKAGE_DIR/"
 cp "requirements-doctor.txt" "$PACKAGE_DIR/"
 cp "scripts/live_whisper_demo.py" "$PACKAGE_DIR/"
+cp "scripts/prepare_doctor_models.py" "$PACKAGE_DIR/"
 cp "packaging/macos/Install TimeStamp.command" "$PACKAGE_DIR/"
 cp "packaging/linux/Install TimeStamp.sh" "$PACKAGE_DIR/Install TimeStamp on Linux.sh"
 cp "packaging/windows/Install TimeStamp on Windows.bat" "$PACKAGE_DIR/"
@@ -27,7 +28,7 @@ chmod 755 "$PACKAGE_DIR/Install TimeStamp.command" "$PACKAGE_DIR/Install TimeSta
 (
   cd "$PACKAGE_DIR"
   shasum -a 256 "TimeStamp-${VERSION}.jar" "requirements-doctor.txt" \
-    "live_whisper_demo.py" > CHECKSUMS-SHA256.txt
+    "live_whisper_demo.py" "prepare_doctor_models.py" > CHECKSUMS-SHA256.txt
 )
 
 rm -f "${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip"
