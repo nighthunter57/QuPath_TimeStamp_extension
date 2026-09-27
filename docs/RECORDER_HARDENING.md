@@ -1,5 +1,70 @@
 # Recorder hardening — September 14, 2026
 
+
+## September 25 recovery and handoff update
+
+The confirmed September 24 data-integrity defects are fixed in
+`0.2.0-preview.20260925`. This is a supervised-evaluation package, not an
+unconditional clinical-use approval.
+
+- Capture reconciles incoming chunks against the original recording clock,
+  including in-session dropouts. Missing intervals become silence in the WAV;
+  original received samples remain unprocessed. The two-second-dropout regression
+  now retains the expected 28-second timeline. Backward-clock discontinuities
+  stop capture without deleting saved audio. A periodic low-disk check stops
+  recording with a visible failure while retaining available files.
+- Quality incidents persist in a checksummed export companion and remain visible
+  after saving/reopening. Explicit microphone selection fails if unavailable
+  rather than silently switching inputs. The default-input label does not yet
+  identify the physical device automatically.
+- Invalid WAVs are preserved. Known-format stale headers are repaired through a
+  separate file with an immutable original backup; odd payloads are refused.
+  Legacy RAW migration keeps its original. Audio is synchronized before the
+  capture-saved acknowledgement. This does not establish full power-loss safety.
+- Final transcript text, segment/word timings and review metadata are staged as
+  one hashed generation. Interrupted publication retains a rollback record and
+  validated backups; retry restores the prior generation before decoding. Save
+  omits incompatible timing companions while retaining text/audio and warnings.
+- Repeated phrases at distinct known times are retained. Only duplicate entries
+  for the same known interval are removed by the final repetition pass; existing
+  structural hallucination filtering remains. An unfiltered model-hypothesis
+  artifact is not implemented, and no new accuracy percentage is claimed.
+- **Cancel final pass** terminates inference and confirms exit before allowing
+  save/retry. **More** offers retry from recorded audio, seekable audio review,
+  selection of unsaved recordings and support information without recording text.
+  Retry preserves previous corrections for comparison. Cross-time-zone sessions
+  remain review-only for retry/append; replay and saving are available.
+- Recovery restores the persisted audio clock if the event checkpoint is missing.
+  Missing/conflicting clocks block further capture. Recovered sessions can be
+  saved with a warning and reopened. Pending publication no longer hides text or
+  exposes mismatched word confidence/timings.
+- Setup prompts for the existing QuPath user folder, rejects Windows ARM64, and
+  explains the Windows x64 Visual C++ runtime prerequisite. Both cached standard
+  models load and decode silence during normal setup. The installed snapshot
+  revisions/package versions are recorded; the managed recorder loads those
+  snapshots offline. Dependencies are not yet locked transitively.
+- Package verification checks every bundled source file, all checksums, exact
+  built JAR bytes and embedded helper. Draft release creation now depends on the
+  recorder and installer jobs. Main and feedback guides link this version and
+  QuPath 0.6.0. Existing GitHub Pages hosting is preserved; nothing was published.
+
+Validation: **118 Python tests**, **49 Java tests**, Java 21 build/package,
+macOS/Linux shell syntax, isolated JavaFX controls/review/recovery/cancellation/
+scrolling/background save/reopen checks, both cached standard model loads with
+silence inference, website static export and **8 guide tests** all pass locally.
+The GUI harness uses a fake microphone/process; it does not operate active QuPath.
+
+Handoff package: `build/distributions/TimeStamp-Doctor-0.2.0-preview.20260925.zip`.
+SHA-256: `7fbc362c55b01746033285536386a71bc1937582c207b69fa8f07ce184218290`.
+Identical copies are in the website and feedback download folders.
+
+Before routine use, complete physical microphone interruption and representative
+long-session checks on the doctor's actual OS/QuPath 0.6 installation, exercise
+Start → Pause/Resume → Finish & review → replay/correct → Save with audio → reopen,
+and evaluate human pathology speech with checked references. Fresh workstation
+installation/model downloads and remote Windows/Linux CI have not been executed
+in this pass. No live-latency improvement or clinical validation is claimed.
+
 ## September 23 daily-use workflow update
 
 - **Finish & review** uses a new FINISH/CAPTURE_SAVED handshake. The microphone

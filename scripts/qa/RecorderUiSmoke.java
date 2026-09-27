@@ -261,6 +261,63 @@ public class RecorderUiSmoke {
                 snapshot(root, directory, "reopened-review", 420);
                 return null;
             });
+            // Exercise persistent warnings and cancellation without audio hardware.
+            var cancelled = new CountDownLatch(1);
+            Process finalizer = new Process() {
+                volatile boolean alive = true;
+                public OutputStream getOutputStream() { return OutputStream.nullOutputStream(); }
+                public InputStream getInputStream() { return InputStream.nullInputStream(); }
+                public InputStream getErrorStream() { return InputStream.nullInputStream(); }
+                public int waitFor() throws InterruptedException { cancelled.await(); return 137; }
+                public boolean waitFor(long timeout, TimeUnit unit) throws InterruptedException { return cancelled.await(5, TimeUnit.SECONDS); }
+                public int exitValue() { if (alive) throw new IllegalThreadStateException(); return 137; }
+                public void destroy() { alive = false; cancelled.countDown(); }
+                public Process destroyForcibly() { destroy(); return this; }
+                public boolean isAlive() { return alive; }
+            };
+            fx(() -> {
+                Path current = ((File) get("transcriptFile")).toPath();
+                TimeStamp.atomicWriteString(TranscriptArtifacts.companion(current, "_capture_quality.json"),
+                        "{\"version\":1,\"count\":2,\"issues\":[]}");
+                call("refreshCaptureQuality");
+                check(((Label) get("captureQualityLabel")).isVisible(), "Quality warning was hidden");
+                set("transcriptProcess", finalizer);
+                set("transcriptOutputThread", null);
+                set("transcriptStopInProgress", true);
+                set("recordingWorkflowState", TimeStamp.RecordingWorkflowState.FINALIZING);
+                call("updateLiveEventMonitorControls");
+                snapshot(root, directory, "finalizing-with-quality-warning", 420);
+                var wait = TimeStamp.class.getDeclaredMethod("waitForTranscriptFinalization", Process.class);
+                wait.setAccessible(true); wait.invoke(null, finalizer);
+                ((Button) get("cancelFinalizationButton")).fire();
+                check(cancelled.getCount() == 0, "Cancel did not terminate finalization");
+                return null;
+            });
+            for (int i = 0; i < 100 && fx(() -> (boolean) get("transcriptStopInProgress")); i++) Thread.sleep(20);
+            fx(() -> {
+                check(!(boolean) get("transcriptStopInProgress"), "Cancelled finalization stayed busy");
+                check("live-preserved-cancelled".equals(get("transcriptFinalizationResult")), "Cancellation was reported as successful final transcription");
+                check(((Label) get("captureQualityLabel")).isVisible(), "Cancellation erased quality warning");
+                snapshot(root, directory, "cancelled-review", 420);
+                return null;
+            });
+            Path early = directory.resolve("early-crash");
+            Path earlyText = early.resolve("video/early-crash_transcript.txt");
+            TimeStamp.atomicWriteString(earlyText, machine);
+            TimeStamp.atomicWriteString(TranscriptArtifacts.companion(earlyText, "_audio.start.txt"), "2026-09-23T12:00:00Z");
+            fx(() -> {
+                var recover = TimeStamp.class.getDeclaredMethod("recoverWorkingSession", File.class);
+                recover.setAccessible(true); recover.invoke(null, early.toFile());
+                check(java.time.Instant.parse("2026-09-23T12:00:00Z").equals(get("recordingStartedInstant")), "Missing event checkpoint lost the persisted audio clock");
+                check("live-preserved-recovered".equals(get("transcriptFinalizationResult")), "Recovered capture cannot be saved as a reopenable session");
+                TimeStamp.atomicWriteString(TranscriptArtifacts.companion(earlyText, "_generation_pending.json"), "{}");
+                set("reviewSourceContents", "");
+                var refresh = TimeStamp.class.getDeclaredMethod("refreshWordReviewMetadata", String.class);
+                refresh.setAccessible(true); refresh.invoke(null, machine);
+                check(machine.equals(((TextArea) get("liveTranscriptTextArea")).getText()), "Pending generation hid recoverable text");
+                check(((java.util.List<?>) get("transcriptReviewWords")).isEmpty(), "Pending generation exposed mixed word timings");
+                return null;
+            });
             System.out.println("UI, review/recovery, scrolling, background storage, and verified session reopening passed.");
         } finally {
             Platform.exit();

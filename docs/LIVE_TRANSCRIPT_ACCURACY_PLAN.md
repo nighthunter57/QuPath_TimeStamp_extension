@@ -12,6 +12,15 @@ the recorder usable by a doctor who is looking at a specimen rather than at the 
 
 ## Progress
 
+- **Recovery and handoff — 2026-09-25.** Fixed in-session dropout alignment,
+  non-destructive WAV recovery, consistent final-generation publication and
+  distinct-time repeated-phrase preservation. Added final-pass cancellation/retry,
+  persistent capture-quality history, seekable recording review and recovery
+  selection. Model/beam defaults remain unchanged. 118 Python tests, 49 Java
+  tests, isolated UI checks and versioned package verification pass. Human
+  pathology and physical-device acceptance remain pending. See
+  [RECORDER_HARDENING.md](RECORDER_HARDENING.md#september-25-recovery-and-handoff-update).
+
 - **Daily-use workflow — 2026-09-23.** FINISH/CAPTURE_SAVED separates safe audio
   closure from blocked live decoding/model loading; the parent confirms preview
   exit before finalization. Saves use frozen snapshots and background file I/O.

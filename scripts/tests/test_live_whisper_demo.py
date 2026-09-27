@@ -24,6 +24,9 @@ class TranscriptLogicTest(unittest.TestCase):
     def test_interactive_pause_resume_during_inference_preserves_one_wav_and_clock(self):
         self.assert_interactive_capture()
 
+    def test_dropout_keeps_final_audio_clock_aligned(self):
+        self.assert_interactive_capture(finish=True, dropout=True)
+
     def test_finish_saves_audio_before_blocked_model_load_or_decode_completes(self):
         for loading in (False, True):
             with self.subTest(blocked_loading=loading):
@@ -46,7 +49,7 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertIsInstance(controller.error, OSError)
         self.assertTrue(controller.finished.is_set())
 
-    def assert_interactive_capture(self, finish=False, block_loading=False):
+    def assert_interactive_capture(self, finish=False, block_loading=False, dropout=False):
         origin = datetime(2026, 9, 14, tzinfo=timezone.utc)
         now = [origin]
         opened = [0]
@@ -67,9 +70,11 @@ class TranscriptLogicTest(unittest.TestCase):
                 offset, count = (0, 24) if opened[0] == 0 else (20, 12)
                 opened[0] += 1
                 for index in range(count):
-                    now[0] = origin + timedelta(seconds=offset + (index + 1) * .5)
+                    gap = 2 if dropout and offset and index >= 6 else 0
+                    now[0] = origin + timedelta(seconds=offset + (index + 1) * .5 + gap)
                     chunk = np.full((8000, 1), (index + 1 + (24 if offset else 0)) / 100, dtype=np.float32)
-                    self.callback(chunk, 8000, SimpleNamespace(inputBufferAdcTime=index * .5), None)
+                    self.callback(chunk, 8000, SimpleNamespace(inputBufferAdcTime=index * .5 + gap),
+                                  "input overflow" if dropout and gap and index == 6 else None)
                 return self
             def __exit__(self, *args):
                 self.active = False
@@ -111,7 +116,7 @@ class TranscriptLogicTest(unittest.TestCase):
             if kind == "CAPTURE_STATE":
                 (paused if fields[0] == "paused" else resumed).set()
             if kind == "CAPTURE_SAVED":
-                self.assertEqual(26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
+                self.assertEqual(28 if dropout else 26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
                 saved.set()
         fake_sd = SimpleNamespace(InputStream=Microphone, check_input_settings=lambda **kw: None,
                                   PortAudioError=type("PortAudioError", (Exception,), {}))
@@ -137,7 +142,7 @@ class TranscriptLogicTest(unittest.TestCase):
             self.assertTrue(resumed.is_set(), output.getvalue() + errors.getvalue())
             self.assertEqual(2, opened[0])
             self.assertEqual(1, len(model_loads))
-            self.assertEqual(26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
+            self.assertEqual(28 if dropout else 26, transcript.wave_audio_duration_seconds(path.with_name("interactive_audio.wav")))
             self.assertEqual(origin, transcript.read_recording_start(path.with_name("interactive_audio.start.txt")))
             self.assertEqual(1, output.getvalue().count("RECORDING_ORIGIN\t"))
             self.assertEqual(int(finish), output.getvalue().count("CAPTURE_SAVED\n"))
@@ -726,18 +731,47 @@ class TranscriptLogicTest(unittest.TestCase):
                     self.assertEqual(expected_frames, handle.getnframes())
                     self.assertEqual(transcript.SAMPLE_RATE, handle.getframerate())
 
-    def test_invalid_partial_wave_is_recovered_before_recording(self):
+    def test_damaged_wave_is_preserved_instead_of_deleted(self):
         with tempfile.TemporaryDirectory() as directory:
-            raw_path = Path(directory) / "capture.raw"
-            wave_path = Path(directory) / "capture.wav"
-            wave_path.write_bytes(b"RIFF-partial-crash")
+            raw = Path(directory) / "capture.raw"
+            wav = Path(directory) / "capture.wav"
+            for data in (b"RIFF-partial-crash", b"BROK" + b"x" * 32040):
+                wav.write_bytes(data)
+                with self.assertRaises(OSError):
+                    transcript.prepare_incremental_wave(raw, wav)
+                self.assertEqual(data, wav.read_bytes())
 
-            transcript.prepare_incremental_wave(raw_path, wave_path)
-            transcript.append_wave_bytes(wave_path, b"\x00\x00" * 100)
+    def test_stale_wave_header_is_repaired_with_immutable_original(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav = root / "capture.wav"
+            transcript.append_wave_bytes(wav, b"\x01\x00" * 16000)
+            with wav.open("ab") as output:
+                output.write(b"\x02\x00" * 16000)
+            original = wav.read_bytes()
+            transcript.prepare_incremental_wave(root / "absent.raw", wav)
+            self.assertEqual(2, transcript.wave_audio_duration_seconds(wav))
+            self.assertEqual(original[44:], wav.read_bytes()[44:])
+            self.assertEqual(original, next(root.glob("*.before-header-repair-*")).read_bytes())
+            with wav.open("ab") as output:
+                output.write(b"x")
+            damaged = wav.read_bytes()
+            with self.assertRaises(OSError):
+                transcript.prepare_incremental_wave(root / "absent.raw", wav)
+            self.assertEqual(damaged, wav.read_bytes())
 
-            self.assertTrue(transcript.is_valid_capture_wave(wave_path))
-            with wave.open(str(wave_path), "rb") as handle:
-                self.assertEqual(100, handle.getnframes())
+    def test_backward_capture_clock_preserves_existing_audio_and_issue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            wav = root / "capture.wav"
+            transcript.append_wave_bytes(wav, b"\x01\x00" * 16000)
+            original = wav.read_bytes()
+            issues = transcript.CaptureIssues(root / "quality.json")
+            origin = datetime(2026, 9, 25, tzinfo=timezone.utc)
+            with self.assertRaises(OSError):
+                transcript.align_capture_wave(wav, origin, origin, False, issues)
+            self.assertEqual(original, wav.read_bytes())
+            self.assertEqual("clock-moved-backward", issues.document["issues"][0]["kind"])
 
     def test_empty_transcript_does_not_delete_resumable_audio(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -877,11 +911,11 @@ class TranscriptLogicTest(unittest.TestCase):
             "[2026-08-28T12:00:05.000] useful closing",
         ]
         segment_rows = [
-            {"segment_index": index, "text": line}
+            {"segment_index": index, "start_ms": 0, "end_ms": 1000, "text": line}
             for index, line in enumerate(lines)
         ]
         word_rows = [
-            {"segment_index": index, "word": "word"}
+            {"segment_index": index, "start_ms": 0, "end_ms": 1000, "word": "word"}
             for index in range(len(lines))
         ]
 
@@ -1050,6 +1084,52 @@ class TranscriptLogicTest(unittest.TestCase):
 
         self.assertEqual([], live_segments)
         self.assertEqual(([], [], []), (final_lines, segment_rows, word_rows))
+
+    def test_final_generation_write_failure_preserves_previous_files(self):
+        for failing_suffix in ("_segments.csv", "_words.csv"):
+            with self.subTest(suffix=failing_suffix), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory) / "case.txt"
+                transcript.publish_transcript_generation(out, ["old text"], [], [])
+                before = {s: transcript.generation_file(out, s).read_bytes()
+                          for s in transcript.GENERATION_SUFFIXES}
+                writer = transcript.write_csv_rows
+                def fail(path, fields, rows):
+                    if path.name.endswith(failing_suffix):
+                        raise OSError("disk full")
+                    writer(path, fields, rows)
+                with patch.object(transcript, "write_csv_rows", side_effect=fail):
+                    with self.assertRaises(OSError):
+                        transcript.publish_transcript_generation(out, ["new text"], [], [])
+                self.assertEqual(before, {s: transcript.generation_file(out, s).read_bytes()
+                                         for s in transcript.GENERATION_SUFFIXES})
+
+    def test_interrupted_final_generation_rolls_back_before_next_attempt(self):
+        for stop_suffix in transcript.GENERATION_SUFFIXES:
+            with self.subTest(suffix=stop_suffix), tempfile.TemporaryDirectory() as directory:
+                out = Path(directory) / "case.txt"
+                transcript.publish_transcript_generation(out, ["old text"], [], [])
+                before = {s: transcript.generation_file(out, s).read_bytes()
+                          for s in transcript.GENERATION_SUFFIXES}
+                replace = Path.replace
+                def crash(path, target):
+                    if path.parent.name.startswith(".timestamp-generation-") and path.name == "case" + stop_suffix:
+                        raise KeyboardInterrupt("simulated process death")
+                    return replace(path, target)
+                with patch.object(Path, "replace", crash):
+                    with self.assertRaises(KeyboardInterrupt):
+                        transcript.publish_transcript_generation(out, ["new text"], [], [])
+                self.assertTrue(transcript.generation_file(out, "_generation_pending.json").exists())
+                transcript.recover_transcript_generation(out)
+                self.assertEqual(before, {s: transcript.generation_file(out, s).read_bytes()
+                                         for s in transcript.GENERATION_SUFFIXES})
+
+    def test_repeated_observations_at_distinct_times_are_retained(self):
+        lines = ["[2026-09-25T00:00:00] The margin is negative."] * 6
+        rows = [{"segment_index": i, "start_ms": i * 15000, "end_ms": i * 15000 + 3000}
+                for i in range(6)]
+        kept, _, _, dropped = transcript.drop_repeated_final_segments(lines, rows, [])
+        self.assertEqual(lines, kept)
+        self.assertEqual(0, dropped)
 
     def test_finalization_keeps_audio_times_when_live_phrases_match(self):
         origin = datetime(2026, 8, 26, 12, 0, tzinfo=timezone.utc)
@@ -1537,6 +1617,24 @@ class TranscriptLogicTest(unittest.TestCase):
             ],
             attempts,
         )
+
+    def test_managed_runtime_uses_recorded_model_snapshot_offline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            snapshot = str(Path(directory) / "snapshot")
+            (Path(directory) / "timestamp-models.json").write_text(json.dumps({
+                "models": {"Systran/faster-whisper-small.en": {"snapshot": snapshot}}
+            }), encoding="utf-8")
+            with patch.dict(transcript.os.environ, {"HF_HOME": directory, "TIMESTAMP_OFFLINE_MODELS": "1"}), \
+                    patch.object(transcript, "compute_type_candidates", return_value=["int8"]):
+                factory = unittest.mock.Mock()
+                transcript.load_cpu_whisper_model(factory, "small.en", "int8")
+                factory.assert_called_once_with(snapshot, device="cpu", compute_type="int8", local_files_only=True)
+
+    def test_missing_selected_microphone_does_not_fall_back(self):
+        with patch.object(transcript, "resolve_input_device", side_effect=ValueError("Selected input missing")) as resolver:
+            with self.assertRaisesRegex(ValueError, "Selected input missing"):
+                transcript.resolve_or_fallback_input_device(object(), "Doctor microphone")
+            self.assertEqual("Doctor microphone", resolver.call_args.args[1])
 
     def test_stdio_is_utf8_even_when_the_platform_pipe_is_cp1252(self):
         # Fixed newlines: Windows would otherwise write \r\n, which Java readLine also accepts.

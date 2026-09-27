@@ -26,6 +26,73 @@ import org.junit.jupiter.api.io.TempDir;
 class TimeStampTest {
 
     @Test
+    void transcriptGenerationsRejectMixedFilesAndPendingPublication(@TempDir Path root) throws Exception {
+        Path text = root.resolve("case.txt");
+        var hashes = new com.google.gson.JsonObject();
+        for (String suffix : List.of(".txt", "_segments.csv", "_words.csv", "_review.json")) {
+            Path file = TranscriptArtifacts.companion(text, suffix);
+            Files.writeString(file, "contents " + suffix);
+            hashes.addProperty(suffix, java.util.HexFormat.of().formatHex(
+                    java.security.MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(file))));
+        }
+        var document = new com.google.gson.JsonObject();
+        document.addProperty("version", 1); document.add("files", hashes);
+        Files.writeString(TranscriptArtifacts.companion(text, "_generation.json"), document.toString());
+        assertTrue(TranscriptArtifacts.consistent(text));
+        Files.writeString(text, "different generation");
+        assertFalse(TranscriptArtifacts.consistent(text));
+        Files.writeString(text, "contents .txt");
+        Path pending = TranscriptArtifacts.companion(text, "_generation_pending.json");
+        Files.writeString(pending, "{}");
+        assertFalse(TranscriptArtifacts.consistent(text));
+    }
+
+    @Test
+    void interruptedExportOmitsMixedTimingsAndRetainsQualityHistory(@TempDir Path root) throws Exception {
+        Path working = root.resolve("working");
+        Path source = working.resolve("video/working_transcript.txt");
+        TimeStamp.atomicWriteString(source, "preserved transcript\n");
+        TimeStamp.atomicWriteString(TranscriptArtifacts.companion(source, "_segments.csv"), "mismatched timing");
+        TimeStamp.atomicWriteString(TranscriptArtifacts.companion(source, "_generation_pending.json"), "{}");
+        TimeStamp.atomicWriteString(TranscriptArtifacts.companion(source, "_capture_quality.json"),
+                "{\"version\":1,\"count\":1,\"issues\":[]}");
+        assertFalse(TranscriptArtifacts.qualityWarning(source).isBlank());
+        Path destination = root.resolve("saved");
+        Path target = destination.resolve("video/saved_transcript.txt");
+        var artifacts = new TimeStamp.ArtifactSnapshot("header\n", "{\"schemaVersion\":2,\"events\":[]}",
+                "{\"schemaVersion\":2,\"cursorEvents\":[]}", Instant.parse("2026-09-23T12:00:00Z"), 1234L, 0, 0);
+        TimeStamp.writeSessionSnapshot(new TimeStamp.SaveSnapshot(working.toFile(), source.toFile(),
+                destination.toFile(), target.toFile(), "preserved transcript\n",
+                TimeStamp.reviewedTranscriptJson("preserved transcript\n", List.of()), false,
+                "live-preserved-cancelled", 137, artifacts));
+        assertFalse(Files.exists(TranscriptArtifacts.companion(target, "_segments.csv")));
+        assertTrue(Files.exists(TranscriptArtifacts.companion(target, "_capture_quality.json")));
+        String manifest = Files.readString(destination.resolve("saved_recording_manifest.json"));
+        SessionIntegrity.verify(manifest, destination);
+        assertTrue(manifest.contains("captureQuality"));
+        var imported = TimeStamp.importSavedSession(destination.resolve("saved_recording_manifest.json"), root.resolve("reopened"));
+        assertFalse(TranscriptArtifacts.qualityWarning(imported.transcript()).isBlank());
+    }
+
+    @Test
+    void recoveredCaptureCanBeSavedAndReopenedWithWarning(@TempDir Path root) throws Exception {
+        Path working = root.resolve("working");
+        Path source = working.resolve("video/working_transcript.txt");
+        TimeStamp.atomicWriteString(source, "recovered words\n");
+        Path destination = root.resolve("saved");
+        var artifacts = new TimeStamp.ArtifactSnapshot("header\n", "{\"schemaVersion\":2,\"events\":[]}",
+                "{\"schemaVersion\":2,\"cursorEvents\":[]}", Instant.parse("2026-09-23T12:00:00Z"), 0L, 0, 0);
+        TimeStamp.writeSessionSnapshot(new TimeStamp.SaveSnapshot(working.toFile(), source.toFile(),
+                destination.toFile(), destination.resolve("video/saved_transcript.txt").toFile(), "recovered words\n",
+                TimeStamp.reviewedTranscriptJson("recovered words\n", List.of()), false,
+                "live-preserved-recovered", -1, artifacts));
+        Path manifest = destination.resolve("saved_recording_manifest.json");
+        assertTrue(Files.readString(manifest).contains("complete_with_warning"));
+        var reopened = TimeStamp.importSavedSession(manifest, root.resolve("reopened"));
+        assertEquals("recovered words\n", Files.readString(reopened.transcript()));
+    }
+
+    @Test
     void previewShutdownRequiresSavedAcknowledgementAndConfirmedExit() throws Exception {
         class Preview extends Process {
             boolean alive = true;

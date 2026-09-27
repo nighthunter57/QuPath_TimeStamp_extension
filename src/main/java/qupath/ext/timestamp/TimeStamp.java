@@ -408,6 +408,10 @@ public class TimeStamp implements QuPathExtension {
     private static volatile TranscriptProcessPurpose transcriptProcessPurpose = TranscriptProcessPurpose.NONE;
     private static volatile Process captureSavedProcess;
     private static boolean sessionIoBusy;
+    private static Label captureQualityLabel;
+    private static Button cancelFinalizationButton;
+    private static MenuItem retryFinalizationMenuItem;
+    private static volatile Process cancelledFinalizationProcess;
     private static String sessionIoStatus = "";
     private static boolean reviewOnlySession;
     private static String openedSessionName;
@@ -610,6 +614,7 @@ public class TimeStamp implements QuPathExtension {
             boolean recording = recordEvents.get();
             Platform.runLater(() -> {
                 updateRecordingContext();
+
                 if (recording && activatedView != null) logEventAt(activatedAt, "Image Activated", "Active viewer changed", activatedView, null);
             });
         });
@@ -810,6 +815,10 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void recoverWorkingSession(File workingDirectory) {
+        eventLog.clear();
+        mouseMoveLog.clear();
+        recordingStartedInstant = null;
+        nextEventSequence = 1L;
         reviewOnlySession = Files.exists(workingDirectory.toPath().resolve(".imported-review-only"));
         transcriptTimeZone = ZoneId.systemDefault();
         Path zonePath = workingDirectory.toPath().resolve(".transcript-time-zone");
@@ -825,7 +834,7 @@ public class TimeStamp implements QuPathExtension {
         transcriptCaptureStarted = true;
         recordingSessionSaved = false;
         recordingSessionDirty = true;
-        transcriptFinalizationResult = "recovered";
+        transcriptFinalizationResult = "live-preserved-recovered";
         transcriptLastExitCode = -1;
         recordingWorkflowState = RecordingWorkflowState.UNSAVED_REVIEW;
         Path snapshotPath = getRecoverySnapshotPath(workingDirectory);
@@ -844,6 +853,15 @@ public class TimeStamp implements QuPathExtension {
                 logger.warn("Recovered transcript media but could not restore its event checkpoint", e);
             }
         }
+        File originFile = transcriptCompanionFile(transcriptFile, "_audio.start.txt");
+        if (originFile != null && originFile.isFile()) {
+            try {
+                Instant original = Instant.parse(Files.readString(originFile.toPath()).trim());
+                if (recordingStartedInstant != null && !recordingStartedInstant.equals(original)) reviewOnlySession = true;
+                else recordingStartedInstant = original;
+            } catch (IOException | RuntimeException exception) { reviewOnlySession = true; }
+        }
+        if (recordingStartedInstant == null) reviewOnlySession = true;
         transcriptLastModified = -1L;
         transcriptLastSize = -1L;
         transcriptLastContents = "";
@@ -1295,6 +1313,23 @@ public class TimeStamp implements QuPathExtension {
         transcriptSettingsButton.setOnAction(e -> showTranscriptSettingsDialog());
         configureMonitorButton(transcriptSettingsButton);
 
+        MenuItem reviewAudio = new MenuItem("Review recording audio…");
+        reviewAudio.setOnAction(e -> showRecordingAudioReview());
+        MenuItem recoverSession = new MenuItem("Recover an unsaved session…");
+        recoverSession.setOnAction(e -> chooseRecoverableSession());
+        MenuItem support = new MenuItem("Copy support information");
+        support.setOnAction(e -> {
+            var content = new javafx.scene.input.ClipboardContent();
+            content.putString("TimeStamp " + extensionVersion() + "\nQuPath target: " + EXTENSION_QUPATH_VERSION +
+                    "\nOS: " + System.getProperty("os.name") + " / " + System.getProperty("os.arch") +
+                    "\nJava: " + System.getProperty("java.version") + "\nState: " + recordingWorkflowState +
+                    "\nFinalization: " + transcriptFinalizationResult + "\nExit: " + transcriptLastExitCode +
+                    "\nContains no transcript, audio, case names or file paths.\n");
+            javafx.scene.input.Clipboard.getSystemClipboard().setContent(content);
+            Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, "Support information copied without recording contents.");
+        });
+        retryFinalizationMenuItem = new MenuItem("Retry final transcription");
+        retryFinalizationMenuItem.setOnAction(e -> retryFinalTranscription());
         panelOpenSessionMenuItem = new MenuItem("Open saved session…");
         panelOpenSessionMenuItem.setOnAction(e -> chooseSavedSession());
         panelExportTranscriptMenuItem = new MenuItem("Export Transcript");
@@ -1302,7 +1337,7 @@ public class TimeStamp implements QuPathExtension {
         panelClearEventsMenuItem = new MenuItem("Clear Events");
         panelClearEventsMenuItem.setOnAction(e -> clearLogsStatic());
         transcriptMoreButton = new MenuButton("⋯ More", null,
-                panelOpenSessionMenuItem, panelExportTranscriptMenuItem, panelClearEventsMenuItem);
+                panelOpenSessionMenuItem, recoverSession, retryFinalizationMenuItem, reviewAudio, support, panelExportTranscriptMenuItem, panelClearEventsMenuItem);
 
         recordingStateDotLabel = new Label("●");
         recordingStatusLabel = new Label();
@@ -1350,7 +1385,13 @@ public class TimeStamp implements QuPathExtension {
                 transcriptSettingsButton, transcriptMoreButton);
         transcriptSecondaryControls.setPrefWrapLength(300);
 
-        VBox statusPane = new VBox(4, statusRow, transcriptMicrophoneRow,
+        captureQualityLabel = new Label();
+        captureQualityLabel.setWrapText(true);
+        captureQualityLabel.setStyle("-fx-font-weight: bold;");
+        cancelFinalizationButton = new Button("Cancel final pass · keep saved audio");
+        cancelFinalizationButton.setOnAction(e -> cancelFinalTranscription());
+        VBox statusPane = new VBox(4, statusRow, transcriptMicrophoneRow, captureQualityLabel,
+                cancelFinalizationButton,
                 transcriptFinalizationProgressLabel, transcriptFinalizationProgressBar);
         HBox recordingActions = new HBox(8, recordingPrimaryButton, recordingDoneButton);
         HBox.setHgrow(recordingPrimaryButton, Priority.ALWAYS);
@@ -1850,6 +1891,20 @@ public class TimeStamp implements QuPathExtension {
         }
         updateRecordingStatusLine();
         updateRecordingContext();
+        refreshCaptureQuality();
+        if (cancelFinalizationButton != null) {
+            boolean finalizing = recordingWorkflowState == RecordingWorkflowState.FINALIZING;
+            cancelFinalizationButton.setVisible(finalizing);
+            cancelFinalizationButton.setManaged(finalizing);
+            cancelFinalizationButton.setDisable(transcriptProcess == null || cancelledFinalizationProcess == transcriptProcess);
+        }
+        if (retryFinalizationMenuItem != null) {
+            File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
+            retryFinalizationMenuItem.setDisable(transcriptBusy || recording ||
+                    recordingWorkflowState == RecordingWorkflowState.PAUSED ||
+                    !transcriptTimeZone.equals(ZoneId.systemDefault()) ||
+                    audio == null || !audio.isFile() || recordingStartedInstant == null);
+        }
         if (transcriptModeLabel != null) {
             transcriptModeLabel.setText(switch (recordingWorkflowState) {
                 case RECORDING, PAUSED, STARTING -> "Live preview";
@@ -2466,6 +2521,37 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 
+    private static void refreshCaptureQuality() {
+        if (captureQualityLabel == null) return;
+        String warning = transcriptFile == null ? "" : TranscriptArtifacts.qualityWarning(transcriptFile.toPath());
+        if (transcriptFile != null && TranscriptArtifacts.pending(transcriptFile.toPath())) {
+            warning = "Final transcription was interrupted. Retry it to restore consistent word timings; original audio is preserved.";
+        }
+        captureQualityLabel.setText(warning);
+        captureQualityLabel.setVisible(!warning.isBlank());
+        captureQualityLabel.setManaged(!warning.isBlank());
+    }
+
+    private static void retryFinalTranscription() {
+        if (!canReviewAudio() || transcriptFile == null || recordingStartedInstant == null) return;
+        if (!transcriptTimeZone.equals(ZoneId.systemDefault())) return;
+        File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
+        if (audio == null || !audio.isFile() || !comparePreviousReview() || !preserveReviewBeforeRecording()) return;
+        invalidateSavedReviewMarker();
+        recordingSessionDirty = true;
+        startTranscriptFinalizationProcess();
+    }
+
+    private static void cancelFinalTranscription() {
+        Process process = transcriptProcess;
+        if (recordingWorkflowState != RecordingWorkflowState.FINALIZING || process == null) return;
+        cancelledFinalizationProcess = process;
+        process.destroyForcibly();
+        transcriptStatusLabel.setText("Cancelling final pass; preserving recorded audio…");
+        updateLiveEventMonitorControls();
+        // The existing waiter confirms exit before enabling saving or retry.
+    }
+
     private static void startTranscriptFinalizationProcess() {
         if (transcriptSessionDir == null || transcriptFile == null) {
             recordingWorkflowState = RecordingWorkflowState.ERROR;
@@ -2984,6 +3070,18 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void refreshWordReviewMetadata(String contents) {
+        if (transcriptFile != null && TranscriptArtifacts.pending(transcriptFile.toPath())) {
+            if (!contents.equals(reviewSourceContents)) {
+                updateTranscriptTextArea(contents);
+                reviewSourceContents = contents;
+                reviewDisplayContents = contents;
+            }
+            reviewLoadedDocument = "";
+            transcriptReviewWords = List.of();
+            selectedReviewWord = null;
+            updateWordReviewControls();
+            return;
+        }
         File metadata = transcriptCompanionFile(transcriptFile, "_review.json");
         try {
             String json = metadata != null && metadata.isFile() ? Files.readString(metadata.toPath()) : "";
@@ -3289,20 +3387,82 @@ public class TimeStamp implements QuPathExtension {
         }
     }
 
+    private static final long RECORDING_REVIEW_CHUNK_MS = 30_000L;
+
+    private static void showRecordingAudioReview() {
+        if (!canReviewAudio()) return;
+        File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
+        if (audio == null || !audio.isFile()) {
+            Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, "This session has no included audio.");
+            return;
+        }
+        Dialog<Void> dialog = new Dialog<>();
+        dialog.setTitle("Review original recording");
+        if (qupathGui != null) dialog.initOwner(qupathGui.getStage());
+        var seek = new javafx.scene.control.Slider(0, Math.max(0, recordingAudioDurationSeconds() - 0.1), 0);
+        seek.setBlockIncrement(5);
+        seek.setPrefWidth(330);
+        Label position = new Label("Start: 0 seconds");
+        seek.valueProperty().addListener((obs, oldValue, value) -> {
+            stopReviewAudio();
+            position.setText("Start: " + formatEventElapsed(value.longValue() * 1000));
+        });
+        Button play = new Button("Play next 30 seconds");
+        play.setOnAction(e -> playReviewExcerpt((long) (seek.getValue() * 1000), RECORDING_REVIEW_CHUNK_MS));
+        Button stop = new Button("Stop");
+        stop.setOnAction(e -> stopReviewAudio());
+        dialog.getDialogPane().setContent(new VBox(8, new Label("Seek to any interval, including speech missing from the transcript."),
+                seek, position, new HBox(8, play, stop)));
+        dialog.getDialogPane().getButtonTypes().add(javafx.scene.control.ButtonType.CLOSE);
+        dialog.setOnHidden(e -> stopReviewAudio());
+        dialog.showAndWait();
+    }
+
+    private static void chooseRecoverableSession() {
+        if (!canReviewAudio()) return;
+        List<File> candidates = new ArrayList<>();
+        for (Path root : List.of(getWorkingRecordingRoot(), Paths.get(System.getProperty("java.io.tmpdir"), "qupath-timestamp-recordings"))) {
+            if (!Files.isDirectory(root)) continue;
+            try (var folders = Files.list(root)) {
+                folders.filter(Files::isDirectory)
+                        .filter(path -> !Files.exists(path.resolve(".saved")) && !Files.exists(path.resolve(".discarded")))
+                        .map(Path::toFile).filter(TimeStamp::hasExistingTranscriptCapture).forEach(candidates::add);
+            } catch (IOException exception) { Dialogs.showErrorMessage("Recover sessions", exception.getMessage()); return; }
+        }
+        candidates.sort(Comparator.comparingLong(File::lastModified).reversed());
+        if (candidates.isEmpty()) { Dialogs.showInfoNotification(TIMESTAMP_CATEGORY, "No unsaved recordings found."); return; }
+        var dialog = new javafx.scene.control.ChoiceDialog<File>(candidates.getFirst(), candidates);
+        dialog.setTitle("Recover an unsaved recording");
+        dialog.setHeaderText("Choose the working recording to recover. Originals are retained.");
+        if (qupathGui != null) dialog.initOwner(qupathGui.getStage());
+        var choice = dialog.showAndWait();
+        if (choice.isEmpty()) return;
+        Runnable open = () -> { resetWorkingSessionForNewRecording(); recoverWorkingSession(choice.get()); };
+        if (recordingSessionDirty) {
+            var decision = Dialogs.showYesNoCancelDialog("Current recording", "Save the current recording before switching?");
+            if (decision == javafx.scene.control.ButtonType.YES) saveTranscriptAndTimestamps(open);
+            else if (decision == javafx.scene.control.ButtonType.NO) open.run();
+        } else open.run();
+    }
+
     private static void replaySelectedWord() {
         if (!canReviewAudio() || selectedReviewWord == null) {
             return;
         }
+        ReviewWord word = selectedReviewWord;
+        long startMs = Math.max(0, word.startMs() - REVIEW_AUDIO_CONTEXT_MS);
+        playReviewExcerpt(startMs, Math.min(REVIEW_AUDIO_MAX_MS, word.endMs() + REVIEW_AUDIO_CONTEXT_MS - startMs));
+    }
+
+    private static void playReviewExcerpt(long startMs, long durationMs) {
+        if (!canReviewAudio()) return;
         stopReviewAudio();
         long generation = reviewPlaybackGeneration.get();
-        ReviewWord word = selectedReviewWord;
         File audio = transcriptCompanionFile(transcriptFile, "_audio.wav");
         Thread player = new Thread(() -> {
             Clip clip = null;
             try (var stream = AudioSystem.getAudioInputStream(audio)) {
                 var format = stream.getFormat();
-                long startMs = Math.max(0, word.startMs() - REVIEW_AUDIO_CONTEXT_MS);
-                long durationMs = Math.min(REVIEW_AUDIO_MAX_MS, word.endMs() + REVIEW_AUDIO_CONTEXT_MS - startMs);
                 long firstFrame = (long) (startMs * format.getFrameRate() / 1000);
                 int bytes = (int) (durationMs * format.getFrameRate() / 1000) * format.getFrameSize();
                 stream.skipNBytes(firstFrame * format.getFrameSize());
@@ -3513,6 +3673,8 @@ public class TimeStamp implements QuPathExtension {
     }
 
     private static void refreshTranscriptContents(boolean force) {
+        refreshCaptureQuality();
+        if (transcriptFile != null && TranscriptArtifacts.pending(transcriptFile.toPath()) && isTranscriptProcessBusy()) return;
         if (liveTranscriptTextArea == null || transcriptStatusLabel == null) {
             return;
         }
@@ -3724,6 +3886,7 @@ public class TimeStamp implements QuPathExtension {
             if (selectedPython.equals(doctorPython)) {
                 processBuilder.environment().put(
                         "HF_HOME", doctorModelCache(getQuPathUserDirectory()).toAbsolutePath().toString());
+                processBuilder.environment().put("TIMESTAMP_OFFLINE_MODELS", "1");
             }
         } catch (RuntimeException e) {
             logger.debug("Transcript Python path is not a local filesystem path: {}", pythonExecutable);
@@ -3998,10 +4161,10 @@ public class TimeStamp implements QuPathExtension {
     private static void showTranscriptSettingsDialog() {
         if (recordEvents.get() || isTranscriptProcessBusy()) {
             if (transcriptStatusLabel != null) {
-                transcriptStatusLabel.setText("Transcript: pause recording before changing settings");
+                transcriptStatusLabel.setText("Transcript: choose Finish & review before changing settings");
             }
             Dialogs.showWarningNotification(TIMESTAMP_CATEGORY,
-                    "Pause recording before changing transcript settings.");
+                    "Finish & review before changing settings for the next recording.");
             return;
         }
 
@@ -4266,7 +4429,8 @@ public class TimeStamp implements QuPathExtension {
             atomicWriteString(transcript, machine);
             String[][] fields = {{"timedMachineTranscript", "_timed.txt"}, {"liveTranscript", "_live.txt"},
                     {"transcriptSegments", "_segments.csv"}, {"transcriptWords", "_words.csv"},
-                    {"wordReview", "_review.json"}, {"previousReview", "_previous_review.json"}};
+                    {"wordReview", "_review.json"}, {"previousReview", "_previous_review.json"},
+                    {"captureQuality", "_capture_quality.json"}, {"transcriptGeneration", "_generation.json"}};
             for (String[] field : fields) {
                 copyDeclaredArtifact(document.getAsJsonObject(field[0]), root, transcript, field[1]);
             }
@@ -4688,7 +4852,11 @@ public class TimeStamp implements QuPathExtension {
                 destinationTranscript.getParentFile().toPath());
         copyOrRemoveManagedFile(sourceTranscript,
                 transcriptCompanionFile(destinationTranscript, "_timed.txt"), true);
-        for (String suffix : List.of("_live.txt", "_segments.csv", "_words.csv", "_review.json", "_previous_review.json")) {
+        boolean consistent = TranscriptArtifacts.consistent(sourceTranscript.toPath());
+        for (String suffix : List.of("_segments.csv", "_words.csv", "_review.json", "_generation.json")) {
+            copyOrRemoveManagedCompanion(sourceTranscript, destinationTranscript, suffix, consistent);
+        }
+        for (String suffix : List.of("_live.txt", "_previous_review.json", "_capture_quality.json")) {
             copyOrRemoveManagedCompanion(sourceTranscript, destinationTranscript, suffix, true);
         }
         for (String suffix : List.of("_audio.raw", "_audio.wav", "_audio.start.txt")) {
@@ -5139,7 +5307,8 @@ public class TimeStamp implements QuPathExtension {
                 Thread.currentThread().interrupt();
                 process.destroyForcibly();
             } finally {
-                String finalizationResult = timedOut[0]
+                String finalizationResult = cancelledFinalizationProcess == process
+                        ? "live-preserved-cancelled" : timedOut[0]
                         ? "live-preserved-timeout"
                         : (interrupted[0] ? "live-preserved-interrupted" : transcriptFinalizationResult);
                 Platform.runLater(() -> {
@@ -5477,6 +5646,8 @@ public class TimeStamp implements QuPathExtension {
                 "  \"liveTranscript\": " + fileManifestJson(destinationDirectory, liveTranscript) + ",\n" +
                 "  \"transcriptSegments\": " + fileManifestJson(destinationDirectory, segmentTimings) + ",\n" +
                 "  \"transcriptWords\": " + fileManifestJson(destinationDirectory, wordTimings) + ",\n" +
+                "  \"captureQuality\": " + fileManifestJson(destinationDirectory, transcriptCompanionFile(destinationTranscript, "_capture_quality.json")) + ",\n" +
+                "  \"transcriptGeneration\": " + fileManifestJson(destinationDirectory, transcriptCompanionFile(destinationTranscript, "_generation.json")) + ",\n" +
                 "  \"wordReview\": " + fileManifestJson(destinationDirectory,
                         transcriptCompanionFile(destinationTranscript, "_review.json")) + ",\n" +
                 "  \"reviewedWords\": " + fileManifestJson(destinationDirectory,

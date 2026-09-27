@@ -4,9 +4,13 @@
 import argparse
 import csv
 import gc
+import hashlib
 import importlib.util
 import json
 import math
+import os
+import shutil
+import tempfile
 import platform
 import queue
 import re
@@ -101,6 +105,11 @@ METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
 BACKLOG_WARNING_SECONDS = 6.0
 RESUME_GAP_TOLERANCE_SECONDS = 0.25
+CAPTURE_ISSUE_LIMIT = 1024
+CAPTURE_MIN_FREE_BYTES = 128 * 1024 * 1024
+CAPTURE_STORAGE_CHECK_SECONDS = 30.0
+WAVE_HEADER_BYTES = 44
+GENERATION_SUFFIXES = ("_segments.csv", "_words.csv", "_review.json", ".txt", "_generation.json")
 AUDIO_CLOCK_DRIFT_TOLERANCE_SECONDS = 1.0
 AUDIO_WRITER_JOIN_SECONDS = 10.0
 CAPTURE_CONTROL_POLL_SECONDS = 0.1
@@ -691,6 +700,15 @@ def load_cpu_whisper_model(
     model_name: str,
     compute_type: str,
 ) -> tuple[object, str]:
+    options = {}
+    if os.environ.get("TIMESTAMP_OFFLINE_MODELS") == "1":
+        options["local_files_only"] = True
+        record = Path(os.environ.get("HF_HOME", "")) / "timestamp-models.json"
+        if record.is_file():
+            models = json.loads(record.read_text(encoding="utf-8"))["models"]
+            repository = model_name if "/" in model_name else "Systran/faster-whisper-" + model_name
+            if repository in models:
+                model_name = models[repository]["snapshot"]
     errors: list[str] = []
     for candidate_compute_type in compute_type_candidates(compute_type):
         try:
@@ -698,6 +716,7 @@ def load_cpu_whisper_model(
                 model_name,
                 device="cpu",
                 compute_type=candidate_compute_type,
+                **options,
             )
             return model, candidate_compute_type
         except Exception as exc:
@@ -1751,7 +1770,7 @@ def explain_portaudio_error(error: Exception) -> str:
     message = str(error)
     lowered = message.lower()
     if "permission" in lowered or "not authorized" in lowered:
-        return "Microphone access was denied. Grant microphone permission to Terminal or your shell app in macOS System Settings."
+        return "Microphone access was denied. Allow microphone access for QuPath and its recorder in your operating system's privacy settings, then use Test microphone."
     if "device" in lowered:
         return "Unable to open the requested input device. Check --device or run with --list-devices."
     return f"Audio input error: {message}"
@@ -1849,16 +1868,36 @@ def is_valid_capture_wave(wave_path: Path) -> bool:
 
 
 def prepare_incremental_wave(raw_path: Path, wave_path: Path) -> None:
-    """Migrate legacy raw capture once, then keep only the crash-playable WAV."""
-    if is_valid_capture_wave(wave_path):
-        raw_path.unlink(missing_ok=True)
-        return
+    """Preserve damaged originals; repair only the known capture format in a copy."""
     if wave_path.exists():
-        wave_path.unlink()
+        with wave_path.open("rb") as source:
+            header = source.read(WAVE_HEADER_BYTES)
+        expected = struct.pack("<4sIHHIIHH4s", b"fmt ", 16, 1, CHANNELS,
+                               SAMPLE_RATE, SAMPLE_RATE * CHANNELS * 2,
+                               CHANNELS * 2, 16, b"data")
+        payload = wave_path.stat().st_size - WAVE_HEADER_BYTES
+        if (len(header) != WAVE_HEADER_BYTES or header[:4] != b"RIFF"
+                or header[8:12] != b"WAVE" or header[12:40] != expected
+                or payload < 0 or payload % (CHANNELS * 2)):
+            raise OSError("Damaged or unsupported WAV; original preserved. Recover a copy before continuing.")
+        if (struct.unpack_from("<I", header, 4)[0] != payload + 36
+                or struct.unpack_from("<I", header, 40)[0] != payload):
+            # Keep an immutable original before replacing any header bytes.
+            backup = wave_path.with_name(wave_path.name + ".before-header-repair-" + str(time_module.time_ns()))
+            shutil.copy2(wave_path, backup)
+            temporary = wave_path.with_name(wave_path.name + ".repair.tmp")
+            shutil.copy2(wave_path, temporary)
+            with temporary.open("r+b") as handle:
+                update_incremental_wave_header(handle, payload)
+                os.fsync(handle.fileno())
+            temporary.replace(wave_path)
+        return
     if raw_path.exists() and raw_path.stat().st_size > 0:
-        if not export_raw_audio_to_wave(raw_path, wave_path):
+        temporary = wave_path.with_name(wave_path.name + ".migration.tmp")
+        if not export_raw_audio_to_wave(raw_path, temporary):
             raise OSError(f"Could not migrate legacy raw recording {raw_path}")
-        raw_path.unlink(missing_ok=True)
+        temporary.replace(wave_path)
+        # The legacy original remains available if migration is interrupted.
 
 
 def export_raw_audio_to_wave(raw_path: Path, wave_path: Path) -> bool:
@@ -1892,7 +1931,41 @@ def read_recording_start(start_path: Path) -> Optional[datetime]:
 
 
 def write_recording_start(start_path: Path, timestamp: datetime) -> None:
-    start_path.write_text(format_utc_timestamp(timestamp), encoding="utf-8")
+    write_lines(start_path, [format_utc_timestamp(timestamp)])
+
+
+class CaptureIssues:
+    """Persistent bounded quality history, written by the capture writer, not the callback."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.document = {"version": 1, "count": 0, "issues": []}
+        if path.exists():
+            self.document = json.loads(path.read_text(encoding="utf-8"))
+            if self.document.get("version") != 1 or not isinstance(self.document.get("issues"), list):
+                raise ValueError("Invalid capture-quality history; original preserved")
+
+    def record(self, kind: str, at: datetime, duration: float = 0.0) -> None:
+        self.document["count"] += 1
+        if len(self.document["issues"]) < CAPTURE_ISSUE_LIMIT:
+            self.document["issues"].append({"kind": kind, "at_utc": format_utc_timestamp(at),
+                                             "duration_seconds": duration})
+        write_lines(self.path, [json.dumps(self.document)])
+        print("Warning: recording quality needs review; see saved capture-quality history.", flush=True)
+
+
+def align_capture_wave(wave_path: Path, origin: datetime, chunk_start: datetime,
+                       resumed: bool, issues: CaptureIssues) -> None:
+    saved_seconds = wave_audio_duration_seconds(wave_path)
+    gap = (chunk_start - origin).total_seconds() - saved_seconds
+    if gap < -RESUME_GAP_TOLERANCE_SECONDS:
+        issues.record("clock-moved-backward", chunk_start, -gap)
+        raise OSError("Recording clock moved backward; original audio preserved. Start a new session.")
+    if gap > RESUME_GAP_TOLERANCE_SECONDS:
+        # Padding represents time with NO captured speech, never synthesized words.
+        if not resumed:
+            issues.record("missing-audio", origin + timedelta(seconds=saved_seconds), gap)
+        append_wave_silence(wave_path, round(gap * SAMPLE_RATE))
 
 
 def transcribe_saved_audio_with_timings(
@@ -2079,13 +2152,18 @@ def drop_repeated_final_segments(
         if text != normalize_transcript_text(UNCLEAR_SPEECH_MARKER)
         and count >= 4 and count / max(1, len(normalized)) >= 0.4
     }
-    seen: set[str] = set()
+    seen: set[tuple] = set()
     kept_positions = []
     for position, text in enumerate(normalized):
-        if text in offenders and text in seen:
+        row = resolved_segment_rows[position] if position < len(resolved_segment_rows) else {}
+        # Text alone cannot distinguish a repeated observation from a decoder loop.
+        # Suppress only duplicate hypotheses for exactly the same known interval.
+        interval = (text, row.get("start_ms"), row.get("end_ms"))
+        known_interval = interval[1] is not None and interval[2] is not None
+        if text in offenders and known_interval and interval in seen:
             continue
         kept_positions.append(position)
-        seen.add(text)
+        seen.add(interval)
 
     kept_lines = [resolved_lines[position] for position in kept_positions]
     kept_segment_rows = [
@@ -2319,11 +2397,8 @@ def emit_signal_quality(result: tuple[Optional[float], str]) -> None:
 
 
 def resolve_or_fallback_input_device(sd, device_arg: Optional[str]) -> Optional[int]:
-    try:
-        return resolve_input_device(sd, device_arg)
-    except ValueError as exc:
-        print(f"Warning: {exc}; using the system default microphone.", file=sys.stderr, flush=True)
-        return None
+    # An explicit selection must not silently switch to a different microphone.
+    return resolve_input_device(sd, device_arg)
 
 
 def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
@@ -2392,6 +2467,86 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
     return 0
 
 
+def generation_file(out_path: Path, suffix: str) -> Path:
+    return out_path.with_name(out_path.stem + suffix)
+
+
+def recover_transcript_generation(out_path: Path) -> None:
+    """Roll back an interrupted publication, using only this transcript's known files."""
+    marker = generation_file(out_path, "_generation_pending.json")
+    if not marker.exists():
+        return
+    document = json.loads(marker.read_text(encoding="utf-8"))
+    name = document["directory"]
+    if Path(name).name != name or not name.startswith(".timestamp-generation-"):
+        raise OSError("Invalid finalization recovery directory; files preserved")
+    directory = out_path.parent / name
+    if directory.is_symlink() or directory.resolve().parent != out_path.parent.resolve():
+        raise OSError("Invalid finalization recovery path; files preserved")
+    previous = document["previous"]
+    if set(previous) != set(GENERATION_SUFFIXES):
+        raise OSError("Incomplete finalization recovery record; files preserved")
+    # Validate every backup before restoring any of them.
+    for suffix, digest in previous.items():
+        backup = directory / "previous" / generation_file(out_path, suffix).name
+        if digest is not None and (backup.is_symlink() or not backup.is_file()
+                or hashlib.sha256(backup.read_bytes()).hexdigest() != digest):
+            raise OSError("Finalization backup is missing or damaged; files preserved")
+    for suffix, digest in previous.items():
+        target = generation_file(out_path, suffix)
+        if digest is None:
+            target.unlink(missing_ok=True)
+        else:
+            temporary = target.with_name(target.name + ".restore.tmp")
+            shutil.copyfile(directory / "previous" / target.name, temporary)
+            temporary.replace(target)
+    marker.unlink()
+    shutil.rmtree(directory)
+
+
+def publish_transcript_generation(out_path: Path, lines: Sequence[str],
+                                  segments: Sequence[dict], words: Sequence[dict]) -> None:
+    recover_transcript_generation(out_path)
+    directory = Path(tempfile.mkdtemp(prefix=".timestamp-generation-", dir=out_path.parent))
+    marker = generation_file(out_path, "_generation_pending.json")
+    staged = directory / out_path.name
+    try:
+        write_csv_rows(generation_file(staged, "_segments.csv"),
+                       ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"), segments)
+        write_csv_rows(generation_file(staged, "_words.csv"), WORD_CSV_FIELDS, words)
+        write_review_metadata(staged, lines, words)
+        write_lines(staged, lines)
+        hashes = {suffix: hashlib.sha256(generation_file(staged, suffix).read_bytes()).hexdigest()
+                  for suffix in GENERATION_SUFFIXES if suffix != "_generation.json"}
+        write_lines(generation_file(staged, "_generation.json"),
+                    [json.dumps({"version": 1, "files": hashes})])
+        previous = {}
+        (directory / "previous").mkdir()
+        for suffix in GENERATION_SUFFIXES:
+            source = generation_file(out_path, suffix)
+            previous[suffix] = None
+            if source.exists():
+                backup = directory / "previous" / source.name
+                shutil.copyfile(source, backup)
+                previous[suffix] = hashlib.sha256(backup.read_bytes()).hexdigest()
+        # Flush staged output and backups before exposing the recovery marker.
+        for path in directory.rglob("*"):
+            if path.is_file():
+                with path.open("rb") as handle:
+                    os.fsync(handle.fileno())
+        write_lines(marker, [json.dumps({"version": 1, "directory": directory.name, "previous": previous})])
+        for suffix in GENERATION_SUFFIXES:
+            generation_file(staged, suffix).replace(generation_file(out_path, suffix))
+        marker.unlink()
+    except Exception:
+        if marker.exists():
+            recover_transcript_generation(out_path)
+        raise
+    finally:
+        if not marker.exists() and directory.exists():
+            shutil.rmtree(directory)
+
+
 def finalize_existing_capture(
     whisper_model_class,
     args: argparse.Namespace,
@@ -2409,6 +2564,11 @@ def finalize_existing_capture(
     word_timing_path = out_path.with_name(f"{out_path.stem}_words.csv")
     finalization_result = "no-audio"
     finalization_failed = False
+
+    if recording_start_time is None:
+        print("Error: original recording clock is missing; audio and transcript preserved.", file=sys.stderr)
+        emit_protocol_message("FINALIZATION_RESULT", "failed")
+        return 1
 
     if recording_start_time is not None:
         try:
@@ -2468,18 +2628,7 @@ def finalize_existing_capture(
                         live_backup_path.write_text(existing_text, encoding="utf-8")
                     # Final text, CSV timings, and review metadata share the final
                     # audio-derived clock. Repeated live phrases cannot retime it.
-                    write_csv_rows(
-                        segment_timing_path,
-                        ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
-                        segment_rows,
-                    )
-                    write_csv_rows(
-                        word_timing_path,
-                        WORD_CSV_FIELDS,
-                        word_rows,
-                    )
-                    write_review_metadata(out_path, final_lines, word_rows)
-                    write_lines(out_path, final_lines)
+                    publish_transcript_generation(out_path, final_lines, segment_rows, word_rows)
                     finalization_result = "final"
                     print(f"Final transcript regenerated from full audio: {out_path}")
                 else:
@@ -2499,19 +2648,8 @@ def finalize_existing_capture(
     if finalization_result.startswith("live-fallback") and out_path.exists():
         try:
             fallback_lines = out_path.read_text(encoding="utf-8").splitlines()
-            write_csv_rows(
-                segment_timing_path,
-                ("segment_index", "text", "start_utc", "end_utc", "start_ms", "end_ms"),
-                build_live_fallback_segment_rows(
-                    fallback_lines,
-                    recording_start_time or datetime.now(timezone.utc),
-                ),
-            )
-            write_csv_rows(
-                word_timing_path,
-                WORD_CSV_FIELDS,
-                (),
-            )
+            publish_transcript_generation(out_path, fallback_lines,
+                build_live_fallback_segment_rows(fallback_lines, recording_start_time), [])
         except OSError as exc:
             finalization_result = "failed"
             finalization_failed = True
@@ -2572,8 +2710,8 @@ def main() -> int:
 
     device = None
     if not args.finalize_existing:
-        device = resolve_or_fallback_input_device(sd, args.device)
         try:
+            device = resolve_or_fallback_input_device(sd, args.device)
             sd.check_input_settings(
                 device=device,
                 channels=CHANNELS,
@@ -2603,6 +2741,7 @@ def main() -> int:
     raw_audio_wave_path = out_path.with_name(f"{out_path.stem}_audio.wav")
     recording_start_path = out_path.with_name(f"{out_path.stem}_audio.start.txt")
     try:
+        recover_transcript_generation(out_path)
         prepare_incremental_wave(raw_audio_path, raw_audio_wave_path)
     except OSError as exc:
         print(f"Error: could not prepare the recording file: {exc}", file=sys.stderr)
@@ -2658,6 +2797,9 @@ def main() -> int:
     last_decoded_word_end: Optional[datetime] = None
     recording_origin_emitted = False
     capture_controller = None
+    capture_issues = CaptureIssues(out_path.with_name(f"{out_path.stem}_capture_quality.json"))
+    callback_notices = queue.SimpleQueue()
+    last_storage_check = 0.0
 
     def request_stop(signum, frame) -> None:
         del signum, frame
@@ -2669,8 +2811,7 @@ def main() -> int:
     def callback(indata, frames, time_info, status) -> None:
         nonlocal stream_time_anchor, stream_wall_anchor
         if status:
-            print(f"Warning: microphone input status {status}; check this recording for missing audio.",
-                  file=sys.stderr, flush=True)
+            callback_notices.put(("input-overflow-or-device-status", datetime.now(timezone.utc)))
         chunk_duration = frames / SAMPLE_RATE
         fallback_chunk_start_time = datetime.now(timezone.utc) - timedelta(seconds=chunk_duration)
         chunk_start_time = fallback_chunk_start_time
@@ -2683,6 +2824,7 @@ def main() -> int:
                     stream_wall_anchor = fallback_chunk_start_time
                 candidate_start_time = stream_wall_anchor + timedelta(seconds=adc_timestamp - stream_time_anchor)
                 if abs((candidate_start_time - fallback_chunk_start_time).total_seconds()) > AUDIO_CLOCK_DRIFT_TOLERANCE_SECONDS:
+                    callback_notices.put(("audio-clock-reset", fallback_chunk_start_time))
                     stream_time_anchor = adc_timestamp
                     stream_wall_anchor = fallback_chunk_start_time
                     chunk_start_time = fallback_chunk_start_time
@@ -2693,10 +2835,10 @@ def main() -> int:
         chunk_rms = audio_rms(indata[:, 0])
         clipped_percent = clipping_watchdog.update(indata[:, 0])
         if clipped_percent is not None:
-            emit_protocol_message("AUDIO_CLIPPING", f"{clipped_percent:.3f}")
+            callback_notices.put(("AUDIO_CLIPPING", f"{clipped_percent:.3f}"))
         now_monotonic = time_module.monotonic()
         for kind, fields in silence_watchdog.update(chunk_rms, now_monotonic):
-            emit_protocol_message(kind, *fields)
+            callback_notices.put((kind, *fields))
         capture_writer.submit(indata.copy(), chunk_start_time)
 
     preferred_live_engine = resolve_live_engine(
@@ -2757,30 +2899,35 @@ def main() -> int:
 
     def align_resumed_wave_audio(first_chunk_start_time: datetime) -> None:
         nonlocal resume_gap_checked
-        if resume_gap_checked:
-            return
+        resumed = not resume_gap_checked
         resume_gap_checked = True
-        saved_audio_seconds = wave_audio_duration_seconds(raw_audio_wave_path)
-        if recording_start_time is None or saved_audio_seconds <= 0:
-            return
-
-        expected_audio_end = recording_start_time + timedelta(seconds=saved_audio_seconds)
-        gap_seconds = (first_chunk_start_time - expected_audio_end).total_seconds()
-        if gap_seconds <= RESUME_GAP_TOLERANCE_SECONDS:
-            return
-
-        silence_frames = int(round(gap_seconds * SAMPLE_RATE))
-        append_wave_silence(raw_audio_wave_path, silence_frames)
-        print(f"Inserted {gap_seconds:.2f}s transcript silence gap for resumed capture.")
+        align_capture_wave(raw_audio_wave_path, recording_start_time, first_chunk_start_time,
+                           resumed, capture_issues)
 
     def persist_captured_chunk(chunk, chunk_start_time: datetime) -> None:
-        nonlocal recording_start_time, recording_origin_emitted
+        nonlocal recording_start_time, recording_origin_emitted, last_storage_check
+        now = time_module.monotonic()
+        if now - last_storage_check >= CAPTURE_STORAGE_CHECK_SECONDS:
+            last_storage_check = now
+            if shutil.disk_usage(out_path.parent).free < CAPTURE_MIN_FREE_BYTES:
+                capture_issues.record("low-disk-space", chunk_start_time)
+                raise OSError("Storage is almost full. Capture stopped; saved audio is preserved.")
         if recording_start_time is None:
             existing_audio_seconds = wave_audio_duration_seconds(raw_audio_wave_path)
-            recording_start_time = chunk_start_time - timedelta(seconds=existing_audio_seconds)
+            if existing_audio_seconds > 0:
+                raise OSError("Original recording clock is missing; existing audio preserved. Start a new session.")
+            recording_start_time = chunk_start_time
             write_recording_start(recording_start_path, recording_start_time)
-        else:
-            align_resumed_wave_audio(chunk_start_time)
+        align_resumed_wave_audio(chunk_start_time)
+
+        while not callback_notices.empty():
+            kind, *fields = callback_notices.get_nowait()
+            if kind in PROTOCOL_FIELDS:
+                emit_protocol_message(kind, *fields)
+                if kind == "AUDIO_CLIPPING":
+                    capture_issues.record("audio-clipping", chunk_start_time)
+            else:
+                capture_issues.record(kind, fields[0])
 
         if not recording_origin_emitted:
             emit_protocol_message("RECORDING_ORIGIN", format_utc_timestamp(recording_start_time))
@@ -3071,6 +3218,9 @@ def main() -> int:
         # The controller has closed the microphone. Acknowledgement means no
         # thread can append more raw audio, even if model loading/decoding hangs.
         capture_writer.close()
+        if raw_audio_wave_path.exists():
+            with raw_audio_wave_path.open("rb") as saved_audio:
+                os.fsync(saved_audio.fileno())
         emit_protocol_message("CAPTURE_SAVED")
 
     try:
@@ -3121,6 +3271,10 @@ def main() -> int:
             capture_error = str(exc)
     if capture_error is not None:
         audio_queue.close()
+        try:
+            capture_issues.record("capture-error", datetime.now(timezone.utc))
+        except OSError as exc:
+            print(f"Warning: could not save capture quality history: {exc}", file=sys.stderr)
         print(f"Error: transcription failed: {capture_error}", file=sys.stderr)
         emit_protocol_message("FINALIZATION_RESULT", "failed")
         return 1
