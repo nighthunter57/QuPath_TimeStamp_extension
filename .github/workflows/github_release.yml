@@ -12,7 +12,12 @@ permissions:
   contents: write
 
 jobs:
+  recorder-checks:
+    uses: ./.github/workflows/recorder-tests.yml
+  installer-checks:
+    uses: ./.github/workflows/doctor_installers.yml
   release:
+    needs: [recorder-checks, installer-checks]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ inputs.version }}

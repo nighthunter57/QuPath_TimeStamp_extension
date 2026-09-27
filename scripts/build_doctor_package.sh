@@ -28,7 +28,9 @@ chmod 755 "$PACKAGE_DIR/Install TimeStamp.command" "$PACKAGE_DIR/Install TimeSta
 (
   cd "$PACKAGE_DIR"
   shasum -a 256 "TimeStamp-${VERSION}.jar" "requirements-doctor.txt" \
-    "live_whisper_demo.py" "prepare_doctor_models.py" > CHECKSUMS-SHA256.txt
+    "live_whisper_demo.py" "prepare_doctor_models.py" "DOCTOR-INSTALL.txt" \
+    "Install TimeStamp.command" "Install TimeStamp on Linux.sh" \
+    "Install TimeStamp on Windows.bat" "Install-TimeStamp.ps1" > CHECKSUMS-SHA256.txt
 )
 
 rm -f "${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip"
@@ -36,6 +38,8 @@ rm -f "${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip"
   cd "$STAGING_ROOT"
   zip -qry "${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip" "$PACKAGE_NAME"
 )
+
+python3 scripts/verify_doctor_package.py "${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip"
 
 echo "Doctor package created:"
 echo "  ${DISTRIBUTION_DIR}/${PACKAGE_NAME}.zip"

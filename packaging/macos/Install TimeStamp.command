@@ -2,6 +2,12 @@
 set -euo pipefail
 
 PACKAGE_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -z "${QUPATH_USER_DIR:-}" && -t 0 ]]; then
+  echo "In QuPath Preferences, check the User directory (then close QuPath)."
+  echo "Press Return for ${HOME}/QuPath/v0.6, or paste your custom QuPath user directory:"
+  read -r TIMESTAMP_SELECTED_USER_DIR
+  QUPATH_USER_DIR="${TIMESTAMP_SELECTED_USER_DIR:-${HOME}/QuPath/v0.6}"
+fi
 QUPATH_USER_DIR="${QUPATH_USER_DIR:-${HOME}/QuPath/v0.6}"
 EXTENSIONS_DIR="${QUPATH_USER_DIR}/extensions"
 SUPPORT_DIR="${QUPATH_USER_DIR}/timestamp"
@@ -129,7 +135,7 @@ echo "Installing the recorder and speech-to-text libraries..."
 
 if [[ "${TIMESTAMP_SKIP_MODEL_DOWNLOAD:-0}" != "1" ]]; then
   echo "[3/4] Preparing speech models (first setup is the largest download)..."
-  "$PYTHON_BIN" "$MODEL_SETUP_FILE"
+  "$PYTHON_BIN" "$MODEL_SETUP_FILE" --validate
 fi
 
 echo "[4/4] Checking the recorder and installing TimeStamp..."

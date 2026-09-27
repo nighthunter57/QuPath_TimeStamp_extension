@@ -14,7 +14,7 @@ The standard package installs only the Whisper engine used by automatic mode.
 The experimental Parakeet engine is not part of the standard doctor install.
 
 Supported systems:
-- Windows 10/11: x64 or ARM64
+- Windows 10/11: x64 only (Windows ARM64 is not supported by this package)
 - macOS: Apple Silicon or Intel
 - Linux: x64 or ARM64
 
@@ -22,12 +22,14 @@ Before installation:
 1. Connect the computer to the internet for the one-time runtime/model download.
 2. Install QuPath 0.6.
 3. Open QuPath once and complete its first-time user-folder setup, keeping the
-   recommended default QuPath user folder.
+   recommended default QuPath user folder, or note your custom User directory
+   from QuPath Preferences. The installer lets you enter that folder.
 4. Close QuPath completely.
 
 Windows:
 Extract the downloaded ZIP first; do not run the installer inside the ZIP viewer.
-Double-click "Install TimeStamp on Windows.bat".
+Double-click "Install TimeStamp on Windows.bat". Windows also requires the
+Microsoft Visual C++ 2015-2022 x64 runtime. Ask IT if setup reports a missing DLL.
 
 macOS:
 Extract the downloaded ZIP first.
@@ -51,6 +53,13 @@ Click Start Recording. Pause/Resume keeps the same session open. Finish & review
 capture and prepares the final transcript. Review the text, then click Save Session.
 The folder choice appears only after Save. Recent actions remain visible while
 recording; View all actions expands the list.
+If the final pass is slow, Cancel final pass keeps the saved audio. More > Retry
+final transcription uses that audio again without opening the microphone.
+More > Review recording audio lets you seek to any interval, including missed speech.
+Recording-quality warnings stay visible and are included with the saved session.
+More > Recover an unsaved session lists working recordings after interruption.
+More > Copy support information copies versions and status without recording contents.
+
 More > Open saved session reopens a saved session folder for review. Include
 audio when saving if you want word replay after reopening. If you correct text
 then Record more, Compare earlier review preserves and reconciles your corrections.

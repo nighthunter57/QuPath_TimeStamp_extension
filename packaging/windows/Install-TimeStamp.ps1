@@ -2,6 +2,15 @@ $ErrorActionPreference = "Stop"
 
 $PackageDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $QuPathUserDir = if ($env:QUPATH_USER_DIR) { $env:QUPATH_USER_DIR } else { Join-Path $env:USERPROFILE "QuPath\v0.6" }
+if (-not $env:QUPATH_USER_DIR) {
+    Write-Host "Check QuPath Preferences > User directory, then close QuPath."
+    $SelectedFolder = Read-Host "Press Enter for $QuPathUserDir, or paste your custom QuPath user directory"
+    if (-not [string]::IsNullOrWhiteSpace($SelectedFolder)) { $QuPathUserDir = $SelectedFolder.Trim('"') }
+}
+$Architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+if ($Architecture -ne "X64") {
+    throw "This package supports Windows x64 only. Windows ARM64 needs a separately tested runtime; ask the study coordinator."
+}
 $ExtensionsDir = Join-Path $QuPathUserDir "extensions"
 $SupportDir = Join-Path $QuPathUserDir "timestamp"
 $RuntimeDir = Join-Path $SupportDir "runtime"
@@ -40,7 +49,7 @@ $ExpectedChecksums = @{}
 Get-Content -LiteralPath $ChecksumsFile | ForEach-Object {
     if ($_ -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') { $ExpectedChecksums[$Matches[2]] = $Matches[1].ToLowerInvariant() }
 }
-foreach ($FileName in @($JarFile.Name, "requirements-doctor.txt", "live_whisper_demo.py", "prepare_doctor_models.py")) {
+foreach ($FileName in @($JarFile.Name, "requirements-doctor.txt", "live_whisper_demo.py", "prepare_doctor_models.py", "DOCTOR-INSTALL.txt", "Install TimeStamp.command", "Install TimeStamp on Linux.sh", "Install TimeStamp on Windows.bat", "Install-TimeStamp.ps1")) {
     if (-not $ExpectedChecksums.ContainsKey($FileName)) { throw "Missing checksum for $FileName" }
     $Actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $PackageDir $FileName)).Hash.ToLowerInvariant()
     if ($Actual -ne $ExpectedChecksums[$FileName]) { throw "Checksum verification failed for $FileName" }
@@ -55,10 +64,6 @@ if (-not (Test-Path -LiteralPath $UvBin -PathType Leaf)) {
         "X64" {
             $UvPlatform = "x86_64-pc-windows-msvc"
             $UvSha256 = "4c4d49d8738847d9b71ba319e49a5688c93eac0fe6204b1df24e98528dddf39a"
-        }
-        "Arm64" {
-            $UvPlatform = "aarch64-pc-windows-msvc"
-            $UvSha256 = "724279317fee6e5fa8ad1908e4eba2bbe764ef1ece5b3f4597927b62b1fe562a"
         }
         default { throw "Unsupported Windows architecture: $Architecture" }
     }
@@ -97,13 +102,13 @@ if ($LASTEXITCODE -ne 0) { throw "Recorder dependency installation failed." }
 
 if ($env:TIMESTAMP_SKIP_MODEL_DOWNLOAD -ne "1") {
     Write-Host "[3/4] Preparing speech models (first setup is the largest download)..."
-    & $PythonBin $ModelSetupFile
+    & $PythonBin $ModelSetupFile --validate
     if ($LASTEXITCODE -ne 0) { throw "Speech model preparation failed." }
 }
 
 Write-Host "[4/4] Checking the recorder and installing TimeStamp..."
 & $PythonBin -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
-if ($LASTEXITCODE -ne 0) { throw "Recorder verification failed." }
+if ($LASTEXITCODE -ne 0) { throw "Recorder verification failed. If a DLL is missing, ask IT to install the Microsoft Visual C++ 2015–2022 x64 runtime and rerun setup." }
 if ($env:TIMESTAMP_SKIP_AUDIO_CHECK -ne "1") {
     Write-Host "Testing the microphone for 3 seconds. Speak normally now..."
     & $PythonBin $HelperFile --check-audio --check-seconds 3

@@ -7,6 +7,7 @@ on:
       - "requirements-doctor.txt"
       - "scripts/build_doctor_package.sh"
       - "scripts/prepare_doctor_models.py"
+      - "scripts/verify_doctor_package.py"
       - ".github/workflows/doctor_installers.yml"
   pull_request:
     paths:
@@ -14,7 +15,9 @@ on:
       - "requirements-doctor.txt"
       - "scripts/build_doctor_package.sh"
       - "scripts/prepare_doctor_models.py"
+      - "scripts/verify_doctor_package.py"
       - ".github/workflows/doctor_installers.yml"
+  workflow_call:
   workflow_dispatch:
 
 permissions:
