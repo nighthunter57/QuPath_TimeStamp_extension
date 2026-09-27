@@ -3,6 +3,13 @@
 
 ## September 25 recovery and handoff update
 
+> **September 26:** superseded by `0.2.0-preview.20260926`, which fixes a
+> Windows-only failure: the helper synced the saved WAV and the final
+> transcript generation through read-only handles, which Windows rejects
+> ("Bad file descriptor"), so Finish & review and final-transcript
+> publication failed on Windows. Remote Windows CI found it. Do not hand out
+> the 20260925 package.
+
 The confirmed September 24 data-integrity defects are fixed in
 `0.2.0-preview.20260925`. This is a supervised-evaluation package, not an
 unconditional clinical-use approval.
