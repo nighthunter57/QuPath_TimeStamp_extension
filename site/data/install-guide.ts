@@ -5,6 +5,7 @@ export const doctorPackage = {
   date: "September 25, 2026",
   href: "./downloads/TimeStamp-Doctor-0.2.0-preview.20260925.zip",
   instructions: "./downloads/DOCTOR-INSTALL.txt",
+  guide: "./downloads/TimeStamp-Install-Guide.pdf",
 };
 
 export const computers: Record<Computer, {

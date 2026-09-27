@@ -126,6 +126,9 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .before-note p { color: #58665d; margin-top: 6px; }
 .before-panel > a { margin-top: 23px; font-size: 12px; }
 .installation-main { min-width: 0; }
+.setup-stages { display: grid; gap: 7px; margin: 12px 0 14px; padding: 0; list-style: none; font-size: 14px; color: #3f4f45; }
+.setup-stages li { display: flex; gap: 10px; align-items: baseline; }
+.setup-stages span { flex-shrink: 0; min-width: 38px; font-weight: 700; color: #145c50; font-variant-numeric: tabular-nums; }
 .computer-picker legend { font-size: 14px; font-weight: 650; margin-bottom: 12px; }
 .computer-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .computer-option { position: relative; display: flex; align-items: center; gap: 9px; min-width: 0; min-height: 79px; padding: 14px; border-radius: 9px; border: 1px solid #d0d9d0; background: white; cursor: pointer; }

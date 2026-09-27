@@ -44,6 +44,8 @@ for (const computer of ["windows", "mac", "linux"]) {
     assert.ok(html.includes(`Installation guide for ${computers[computer].name}`));
     assert.equal((html.match(/<h1[ >]/g) ?? []).length, 1);
     assert.equal(html.includes("terminal-command"), computer === "linux");
+    assert.ok(html.includes(doctorPackage.guide));
+    assert.ok(html.includes("Confirm your QuPath folder"));
   });
 }
 
@@ -63,6 +65,8 @@ test("all three computer guides have instructions and exact installer filenames"
 test("linked package is present, complete, and contains the current pause protocol", () => {
   assert.ok(existsSync(zip));
   assert.ok(existsSync(resolve(site, "public", doctorPackage.instructions)));
+  assert.ok(existsSync(resolve(site, "public", doctorPackage.guide)));
+  assert.equal(readFileSync(resolve(site, "public", doctorPackage.guide)).subarray(0, 5).toString(), "%PDF-");
   execFileSync("unzip", ["-tq", zip]);
   const prefix = `TimeStamp-Doctor-${doctorPackage.version}/`;
   const checksums = execFileSync("unzip", ["-p", zip, `${prefix}CHECKSUMS-SHA256.txt`], { encoding: "utf8" });
