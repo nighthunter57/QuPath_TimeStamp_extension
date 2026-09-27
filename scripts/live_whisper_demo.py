@@ -344,6 +344,12 @@ def parse_transcript_line(line: str) -> Optional[tuple[datetime, str]]:
     return parsed_timestamp.astimezone(timezone.utc), text.strip()
 
 
+def fsync_file(path: Path) -> None:
+    """Flush a file to disk. Windows only allows fsync on handles opened for writing."""
+    with path.open("r+b") as handle:
+        os.fsync(handle.fileno())
+
+
 def write_lines(out_path: Path, lines: Sequence[str]) -> None:
     temporary_path = out_path.with_name(f"{out_path.name}.tmp")
     with temporary_path.open("w", encoding="utf-8") as handle:
@@ -2532,8 +2538,7 @@ def publish_transcript_generation(out_path: Path, lines: Sequence[str],
         # Flush staged output and backups before exposing the recovery marker.
         for path in directory.rglob("*"):
             if path.is_file():
-                with path.open("rb") as handle:
-                    os.fsync(handle.fileno())
+                fsync_file(path)
         write_lines(marker, [json.dumps({"version": 1, "directory": directory.name, "previous": previous})])
         for suffix in GENERATION_SUFFIXES:
             generation_file(staged, suffix).replace(generation_file(out_path, suffix))
@@ -3219,8 +3224,7 @@ def main() -> int:
         # thread can append more raw audio, even if model loading/decoding hangs.
         capture_writer.close()
         if raw_audio_wave_path.exists():
-            with raw_audio_wave_path.open("rb") as saved_audio:
-                os.fsync(saved_audio.fileno())
+            fsync_file(raw_audio_wave_path)
         emit_protocol_message("CAPTURE_SAVED")
 
     try:

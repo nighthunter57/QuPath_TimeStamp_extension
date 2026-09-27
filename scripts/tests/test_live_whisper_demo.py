@@ -6,6 +6,7 @@ import json
 import queue
 import sys
 import threading
+import os
 import tempfile
 import unittest
 import wave
@@ -1658,6 +1659,26 @@ class TranscriptLogicTest(unittest.TestCase):
         legacy = transcript.parse_transcript_line("[2026-08-20T12:00:01.250] old format")
         self.assertEqual(datetime(2026, 8, 20, 12, 0, 1, 250000).astimezone(), legacy[0])
         self.assertEqual("old format", legacy[1])
+
+    @unittest.skipIf(os.name == "nt", "Windows enforces this natively")
+    def test_fsync_uses_writable_handles_like_windows_requires(self):
+        import fcntl
+        real_fsync = os.fsync
+
+        def windows_like_fsync(fd):
+            # Windows FlushFileBuffers fails with EBADF on read-only handles.
+            if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
+                raise OSError(9, "Bad file descriptor")
+            real_fsync(fd)
+
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(transcript.os, "fsync", windows_like_fsync):
+            out = Path(directory) / "case_transcript.txt"
+            transcript.publish_transcript_generation(out, ["[2026-09-26T10:00:00.000-05:00] lymph node"], [], [])
+            self.assertIn("lymph node", out.read_text(encoding="utf-8"))
+            wave = Path(directory) / "capture.wav"
+            wave.write_bytes(b"RIFF")
+            transcript.fsync_file(wave)
 
     def test_final_transcript_exports_segment_and_word_timing_rows(self):
         recording_start = datetime(
