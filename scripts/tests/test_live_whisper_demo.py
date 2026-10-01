@@ -1759,6 +1759,33 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual([3.5, 14.44, 29.88, 37.768], seen["clip_timestamps"])
         self.assertFalse(seen["vad_filter"])
 
+    def test_final_pass_never_splits_speech_at_a_short_breath(self):
+        # Observed: an 80 ms gap split a sentence; the fragment was decoded as a repeat of the sentence.
+        speech = [{"start": 41920, "end": 216160}, {"start": 430400, "end": 540320},
+                  {"start": 541600, "end": 576640}]
+        audio = np.zeros(transcript.SAMPLE_RATE * 40, dtype=np.float32)
+        settings = transcript.build_transcribe_kwargs("en", 8, 8, True, final_pass=True)
+        with patch("faster_whisper.vad.get_speech_timestamps", return_value=speech):
+            clipped = transcript.final_pass_clip_kwargs(audio, settings)
+        self.assertEqual([2.62, 13.51, 26.9, 36.04], clipped["clip_timestamps"])
+
+    def test_final_pass_flags_a_word_for_word_repeat_instead_of_publishing_it(self):
+        sentence = " The kick he had received was a foretaste of what he might expect."
+        def segment(start, end):
+            return SimpleNamespace(start=start, end=end, text=sentence, avg_logprob=-0.1, no_speech_prob=0.0,
+                                   compression_ratio=1.2, words=[SimpleNamespace(
+                                       start=start, end=end, word=w, probability=0.9) for w in sentence.split()])
+        model = SimpleNamespace(transcribe=lambda *args, **kwargs: (
+            [segment(26.9, 33.38), segment(33.85, 35.75)], SimpleNamespace(duration=40.0)))
+        start = datetime(2026, 10, 1, 21, 14, 20, tzinfo=timezone.utc)
+        with patch.object(transcript, "decode_saved_audio",
+                          return_value=np.zeros(transcript.SAMPLE_RATE * 40, dtype=np.float32)):
+            lines, segments, _ = transcript.transcribe_saved_audio_with_timings(
+                model, Path("capture.wav"), "en", start, 8, 8, True)
+        self.assertEqual(1, sum(sentence.strip() in line for line in lines))
+        self.assertIn(transcript.UNCLEAR_SPEECH_MARKER, lines[1])
+        self.assertEqual(33850, segments[1]["start_ms"])
+
     def test_prompt_echo_needs_a_prompt_copy_and_low_word_confidence(self):
         prompt = transcript.build_transcribe_kwargs("en", 8, 8, True, final_pass=True,
                                                     hotwords="lymphovascular invasion")["initial_prompt"]

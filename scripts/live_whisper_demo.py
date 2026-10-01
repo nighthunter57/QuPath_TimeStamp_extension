@@ -105,6 +105,10 @@ METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
 # A segment copying part of the initial prompt is an echo when the model was this unsure of its words.
 PROMPT_ECHO_MAX_WORD_PROBABILITY = 0.2
+# Speech regions closer than this are decoded together: a sentence must never be cut at a breath.
+FINAL_CLIP_MERGE_GAP_SECONDS = 2.0
+# A segment repeating the previous one word for word (at least this long) is treated as unreliable.
+FINAL_REPEAT_MIN_WORDS = 6
 # Below this RMS for a whole microphone check, no signal reached the recorder (muted, blocked or absent).
 AUDIO_CHECK_NO_SOUND_RMS = 1e-4
 AUDIO_CHECK_MAX_SECONDS_KEPT = 15.0
@@ -2073,7 +2077,15 @@ def final_pass_clip_kwargs(audio, transcribe_kwargs: dict) -> dict:
     if not chunks:
         # Keep the library's own handling of silent recordings.
         return transcribe_kwargs
-    clips = [round(value / SAMPLE_RATE, 3) for chunk in chunks for value in (chunk["start"], chunk["end"])]
+    # Decoding a short fragment with the previous sentence as context made Whisper repeat that
+    # sentence and lose the fragment's own words; only real pauses should split decoding.
+    regions: list[list[int]] = []
+    for chunk in chunks:
+        if regions and (chunk["start"] - regions[-1][1]) / SAMPLE_RATE < FINAL_CLIP_MERGE_GAP_SECONDS:
+            regions[-1][1] = chunk["end"]
+        else:
+            regions.append([chunk["start"], chunk["end"]])
+    clips = [round(value / SAMPLE_RATE, 3) for region in regions for value in region]
     clip_kwargs = {key: value for key, value in transcribe_kwargs.items() if key != "vad_parameters"}
     clip_kwargs.update(vad_filter=False, clip_timestamps=clips)
     return clip_kwargs
@@ -2113,6 +2125,7 @@ def transcribe_saved_audio_with_timings(
     lines: list[str] = []
     segment_rows: list[dict] = []
     word_rows: list[dict] = []
+    previous_words: list[str] = []
     for segment_index, segment in enumerate(iter_final_segments(
             segments, raw_audio, duration_seconds, progress_callback)):
         text = segment.text.strip()
@@ -2120,7 +2133,14 @@ def transcribe_saved_audio_with_timings(
             continue
         if looks_like_structural_repetition_loop(text):
             continue
-        if looks_like_low_confidence_segment(segment) or \
+        segment_words = re.findall(r"[a-z0-9]+", text.lower())
+        repeats_previous = len(segment_words) >= FINAL_REPEAT_MIN_WORDS and segment_words == previous_words
+        previous_words = segment_words
+        if repeats_previous:
+            # A word-for-word copy of the previous segment is a known decoding failure; flag it for
+            # review at its own time rather than publish it as new speech.
+            text = UNCLEAR_SPEECH_MARKER
+        elif looks_like_low_confidence_segment(segment) or \
                 looks_like_prompt_echo(segment, transcribe_kwargs.get("initial_prompt")):
             if not should_mark_unclear_speech(segment, raw_audio):
                 continue
