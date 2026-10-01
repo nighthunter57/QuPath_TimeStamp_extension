@@ -81,7 +81,7 @@ test("linked package is present, complete, and contains the current pause protoc
 });
 
 test("tutorial follows the real recorder controls and avoids old promises", () => {
-  assert.equal(recorderSteps.length, 6);
+  assert.equal(recorderSteps.length, 4);
   const copy = JSON.stringify(recorderSteps);
   for (const label of ["Open Clinical Session Recorder", "Test microphone", "Start Recording", "Pause", "Resume", "Finish & review", "Save Session"]) assert.ok(copy.includes(label), label);
   assert.doesNotMatch(page, /Select Session Folder|Open live event monitor|About 5 minutes|source of truth|\bDone\b|Discard/);

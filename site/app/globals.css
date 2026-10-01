@@ -167,7 +167,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .workflow-summary { display: flex; align-items: center; flex-wrap: wrap; gap: 15px; color: #145c50; font-size: 13px; font-weight: 650; margin-bottom: 30px; }
 .workflow-summary span { padding: 7px 12px; border-radius: 5px; background: #eff4eb; }
 .workflow-summary svg { width: 15px; height: 15px; color: #7c9483; }
-.recording-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 32px; }
+.recording-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0 28px; }
 .recording-grid li { border-top: 1px solid #dce3dc; padding-block: 24px 29px; }
 .recording-number { color: #6f866e; font-size: 11px; font-variant-numeric: tabular-nums; letter-spacing: 1px; }
 .recording-grid h3 { margin-top: 12px; }
@@ -187,6 +187,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .privacy-items h3 { font-size: 16px; }
 .privacy-items p { margin-top: 7px; color: #58665d; font-size: 14px; line-height: 1.8; }
 .privacy-items code { font-size: 12px; overflow-wrap: anywhere; }
+.good-to-know { grid-template-columns: repeat(3, 1fr); gap: 24px 32px; margin-top: 40px; }
 .help-section { background: #edf2e9; border-block: 1px solid #d8e1d4; }
 .help-layout { display: grid; grid-template-columns: .8fr 1.2fr; gap: 90px; }
 .help-layout .text-link { margin-top: 24px; }
@@ -203,6 +204,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .skip-link { position: fixed; left: 16px; top: -80px; z-index: 60; padding: 12px 18px; background: #145c50; color: white; border-radius: 5px; }
 .skip-link:focus { top: 10px; }
 @media (max-width: 1000px) {
+  .recording-grid { grid-template-columns: repeat(2, 1fr); }
   .hero { gap: 28px; padding-block: 58px; }
   .hero-actions { align-items: flex-start; flex-direction: column; gap: 16px; }
   .installation-layout { grid-template-columns: 245px 1fr; gap: 28px; }
@@ -248,6 +250,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
   .preview-notice, .important-difference { padding: 18px; }
   .important-difference { align-items: flex-start; }
   .saved-contents, .saved-contents ul { grid-template-columns: 1fr; gap: 18px; }
+  .good-to-know { grid-template-columns: 1fr; }
 }
 @media (max-width: 560px) {
   .recording-grid { grid-template-columns: 1fr; }

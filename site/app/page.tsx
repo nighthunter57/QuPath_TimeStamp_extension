@@ -4,11 +4,10 @@ import Image from "next/image";
 import { useState } from "react";
 import {
   ArrowDown, ArrowRight, Check, CheckCircle2, ChevronDown, Download,
-  ExternalLink, FileText, Headphones, Laptop, Mic2, MousePointer2,
-  Pause, Printer, ShieldCheck,
+  ExternalLink, FileText, Laptop, MousePointer2, Pause, ShieldCheck,
 } from "lucide-react";
 import histologyBanner from "@/assets/histology-support-banner.jpg";
-import { computers, doctorPackage, helpItems, recorderSteps, savedContents, type Computer } from "@/data/install-guide";
+import { computers, doctorPackage, goodToKnow, helpItems, recorderSteps, type Computer } from "@/data/install-guide";
 
 const repository = "https://github.com/nighthunter57/QuPath_TimeStamp_extension";
 const qupathDownload = "https://github.com/qupath/qupath/releases/tag/v0.6.0";
@@ -45,45 +44,41 @@ export default function Home() {
       <header className="site-header">
         <div className="site-container header-inner">
           <a href="#top" className="brand" aria-label="TimeStamp for QuPath home"><span className="brand-mark">ts<span>.</span></span><span>TimeStamp<small>for QuPath</small></span></a>
-          <nav className="desktop-nav" aria-label="Main navigation"><a href="#install">Installation</a><a href="#first-recording">First recording</a><a href="#help">Help</a></nav>
-          <a className="button button-small" href="#install">Get started <ArrowRight size={16} aria-hidden="true" /></a>
+          <nav className="desktop-nav" aria-label="Main navigation"><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
+          <a className="button button-small" href="#install">Install <ArrowRight size={16} aria-hidden="true" /></a>
         </div>
-        <nav className="mobile-nav site-container" aria-label="Mobile navigation"><a href="#install">Installation</a><a href="#first-recording">First recording</a><a href="#help">Help</a></nav>
+        <nav className="mobile-nav site-container" aria-label="Mobile navigation"><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
       </header>
 
       <main id="main">
         <section id="top" className="hero site-container">
           <div className="hero-copy">
-            <p className="eyebrow"><span className="eyebrow-line" /> A simpler way to record your work</p>
-            <h1>Your observations.<br /><span>One recorded session.</span></h1>
-            <p className="hero-description">Speak while you work in QuPath. TimeStamp keeps your audio, transcript, and image actions together—ready for you to review.</p>
-            <div className="hero-actions"><a className="button" href="#install">Install TimeStamp <ArrowDown size={18} aria-hidden="true" /></a><a className="text-link" href="#first-recording">Already installed? Start here <ArrowRight size={16} aria-hidden="true" /></a></div>
-            <p className="hero-footnote">For QuPath 0.6 · Windows, Mac & Linux guides</p>
+            <h1>Record your observations <span>while you work in QuPath.</span></h1>
+            <p className="hero-description">TimeStamp records your voice, writes the transcript and logs your image actions, all on your computer.</p>
+            <div className="hero-actions"><a className="button" href="#install">Install TimeStamp <ArrowDown size={18} aria-hidden="true" /></a><a className="text-link" href={doctorPackage.guide} download><FileText size={16} aria-hidden="true" /> Printable guide (PDF)</a></div>
+            <p className="hero-footnote">For QuPath 0.6 · Windows, Mac & Linux · Preview {doctorPackage.version}</p>
           </div>
           <RecorderPreview />
         </section>
 
-        <div className="benefits-band"><div className="site-container benefits"><span><Mic2 aria-hidden="true" /> Record your voice</span><span><MousePointer2 aria-hidden="true" /> Keep image actions in view</span><span><FileText aria-hidden="true" /> Review before saving</span><span><ShieldCheck aria-hidden="true" /> Transcribe on your computer</span></div></div>
-
         <section id="install" className="section site-container">
-          <div className="section-heading"><div><p className="eyebrow">01 / One-time setup</p><h2>Let’s get you set up.</h2><p>Choose your computer. Follow the steps below in order.</p></div><button type="button" className="print-button" onClick={() => window.print()}><Printer size={17} aria-hidden="true" /> Print this guide</button></div>
+          <div className="section-heading"><div><h2>Install</h2><p>One time only. Choose your computer and follow the steps.</p></div></div>
           <div className="installation-layout">
             <aside className="before-panel">
               <div className="before-icon"><Laptop size={27} aria-hidden="true" /></div>
-              <h3>Before you begin</h3>
+              <h3>You need</h3>
               <ul className="checklist">
-                <li><Check size={18} aria-hidden="true" /><span><strong>A supported computer</strong>Windows 10 or 11 (x64), a Mac (Apple Silicon or Intel), or Linux. Windows on ARM is not supported.</span></li>
-                <li><Check size={18} aria-hidden="true" /><span><strong>Internet for setup</strong>About 3.6 GB of speech models download once. Ideally, IT or a colleague completes setup and a test recording before your first session.</span></li>
-                <li><Check size={18} aria-hidden="true" /><span><strong>A working microphone</strong>A built-in or connected microphone is fine. Test it before recording.</span></li>
-                <li><Check size={18} aria-hidden="true" /><span><strong>Permission to install</strong>On a hospital computer, check with IT first.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>QuPath 0.6.0</strong>Opened once, so its setup is complete.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>A supported computer</strong>Windows 10/11 (x64), Mac or Linux. Not Windows on ARM.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>Internet, once</strong>About 3.6 GB downloads during setup.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>A microphone</strong>Built-in or headset.</span></li>
+                <li><Check size={18} aria-hidden="true" /><span><strong>Permission to install</strong>On a hospital computer, ask IT.</span></li>
               </ul>
-              <div className="before-note"><strong>No separate Python setup.</strong><p>The TimeStamp installer takes care of its recording tools and default speech models.</p></div>
-              <a className="text-link" href={doctorPackage.guide} download><FileText size={17} aria-hidden="true" /> Download the printable guide (PDF)</a>
-              <a className="text-link" href={doctorPackage.instructions} download><FileText size={17} aria-hidden="true" /> Plain-text instructions</a>
+              <a className="text-link" href={doctorPackage.guide} download><FileText size={17} aria-hidden="true" /> Printable guide (PDF)</a>
             </aside>
             <div className="installation-main">
               <fieldset className="computer-picker">
-                <legend>Which computer are you using?</legend>
+                <legend>Your computer</legend>
                 <div className="computer-options">{(Object.keys(computers) as Computer[]).map((key) => (
                   <label key={key} className={computer === key ? "computer-option selected" : "computer-option"}>
                     <input type="radio" name="computer" value={key} checked={computer === key} onChange={() => setComputer(key)} aria-controls="computer-guide" />
@@ -95,43 +90,33 @@ export default function Home() {
               <div id="computer-guide" className="computer-guide">
                 <p className="guide-label" role="status">Installation guide for {guide.name}</p>
                 <ol className="install-steps">
-                  <li><span className="step-number">1</span><div><h3>Install QuPath 0.6 first</h3><p>{guide.qupath}</p><a className="text-link" href={qupathDownload} target="_blank" rel="noopener noreferrer">Get QuPath 0.6.0 <ExternalLink size={15} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a><p className="step-note">Whether QuPath is new or already installed: open it once to finish its setup, then open Preferences and note the <strong>User directory</strong>. Close QuPath completely before continuing.</p></div></li>
-                  <li><span className="step-number">2</span><div><h3>Download and extract TimeStamp</h3><p>{guide.extract}</p><a className="button download-button" href={doctorPackage.href} download><Download size={18} aria-hidden="true" /> Download TimeStamp for {guide.name}</a><p className="download-note">Preview {doctorPackage.version} · {doctorPackage.date}<br />One ZIP contains installers for all three systems.</p></div></li>
+                  <li><span className="step-number">1</span><div><h3>Note your QuPath folder, then quit QuPath</h3><p>In QuPath, open Preferences and write down the <strong>User directory</strong>. Then quit QuPath.</p><p className="step-note">No QuPath yet? <a className="text-link" href={qupathDownload} target="_blank" rel="noopener noreferrer">Get QuPath 0.6.0 <ExternalLink size={15} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a> {guide.qupath}</p></div></li>
+                  <li><span className="step-number">2</span><div><h3>Download and unzip</h3><a className="button download-button" href={doctorPackage.href} download><Download size={18} aria-hidden="true" /> Download TimeStamp for {guide.name}</a><p>{guide.extract}</p></div></li>
                   <li><span className="step-number">3</span><div><h3>Run the installer</h3><p>{guide.run}</p><div className="installer-file"><FileText size={19} aria-hidden="true" /><code>{guide.installer}</code></div>{computer === "linux" && <pre className="terminal-command"><code>bash "Install TimeStamp on Linux.sh"</code></pre>}<p className="step-note">{guide.help}</p></div></li>
-                  <li><span className="step-number">4</span><div><h3>Confirm your QuPath folder</h3><p>The installer shows a folder and asks you to confirm it. If it matches the User directory you noted in step 1, press <strong>Enter</strong>. If not, paste your folder and press <strong>Enter</strong>.</p></div></li>
-                  <li><span className="step-number">5</span><div><h3>Wait for all four stages</h3><p>Keep the window open and the computer online. Setup shows its progress:</p><ol className="setup-stages"><li><span>1/4</span>Checks the package is complete.</li><li><span>2/4</span>Prepares the private recording tools.</li><li><span>3/4</span>Downloads the speech models (the longest step).</li><li><span>4/4</span>Installs TimeStamp and tests the microphone for 5 seconds. Say a sentence with no patient information; setup then tells you whether the microphone works.</li></ol><p>Setup is finished when you see:</p><div className="success-message"><CheckCircle2 size={19} aria-hidden="true" /><span>TimeStamp is ready for the doctor.</span></div><p>Then reopen QuPath and allow microphone access when asked. If a download was interrupted, run the same installer again; finished files are reused.</p></div></li>
+                  <li><span className="step-number">4</span><div><h3>Confirm your QuPath folder</h3><p>Press <strong>Enter</strong> if the folder shown matches your User directory. If not, paste your folder and press <strong>Enter</strong>.</p></div></li>
+                  <li><span className="step-number">5</span><div><h3>Wait until it says</h3><div className="success-message"><CheckCircle2 size={19} aria-hidden="true" /><span>TimeStamp is ready for the doctor.</span></div><p>Keep the window open; the speech download takes the longest. When asked, say one sentence to test the microphone. Then open QuPath.</p></div></li>
                 </ol>
-                <div className="next-step"><span><strong>Installed? Try a short recording first.</strong><small>Confirm the microphone, Pause/Resume, and Save all work.</small></span><a href="#first-recording" className="circle-link" aria-label="Go to your first recording"><ArrowRight aria-hidden="true" /></a></div>
+                <div className="next-step"><span><strong>Installed? Make a 1-minute test recording.</strong><small>Use no patient information.</small></span><a href="#first-recording" className="circle-link" aria-label="Go to recording steps"><ArrowRight aria-hidden="true" /></a></div>
               </div>
             </div>
           </div>
-          <div className="preview-notice"><ShieldCheck size={21} aria-hidden="true" /><p><strong>A preview for supervised evaluation.</strong> Not yet clinically validated. Real-device and Windows/Linux acceptance testing remain. Review every transcript and follow your organization’s approval process.</p></div>
         </section>
 
         <section id="first-recording" className="recording-section">
           <div className="site-container section">
-            <div className="section-heading"><div><p className="eyebrow">02 / Your first recording</p><h2>Try it once. Then make it your routine.</h2><p>Use a short test with no patient information before your first real session.</p></div></div>
+            <div className="section-heading"><div><h2>Record a session</h2></div></div>
             <div className="workflow-summary" aria-label="Recording workflow"><span>Start</span><ArrowRight aria-hidden="true" /><span>Pause / Resume</span><ArrowRight aria-hidden="true" /><span>Finish &amp; review</span><ArrowRight aria-hidden="true" /><span>Save</span></div>
             <ol className="recording-grid">{recorderSteps.map((step, index) => <li key={step.title}><span className="recording-number">0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol>
-            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Finish &amp; review ends the recording.</strong><br />Use Resume to continue the same session. Choose Finish &amp; review only when you are ready for the final transcript. Need to add more afterwards? Record more continues the same take.</p></div>
-            <div className="saved-contents"><div><h3>What Save Session gives you</h3><p>One folder you choose, containing:</p></div><ul>{savedContents.map(item => <li key={item.title}><Check size={17} aria-hidden="true" /><span><strong>{item.title}</strong>{item.text}</span></li>)}</ul></div>
-          </div>
-        </section>
-
-        <section id="privacy" className="section site-container privacy-layout">
-          <div><p className="eyebrow">03 / Know where your data goes</p><h2>Local recording.<br />Thoughtful review.</h2><p className="section-intro">TimeStamp helps you capture your work. You stay responsible for checking the text and protecting the recording.</p></div>
-          <div className="privacy-items">
-            <article><ShieldCheck aria-hidden="true" /><div><h3>Your audio stays on this computer</h3><p>Transcription runs locally after the required models are installed. Audio is not sent to a transcription service.</p></div></article>
-            <article><Headphones aria-hidden="true" /><div><h3>Live text is a preview—not a clinical record</h3><p>Words can change or be missed. After Finish &amp; review, check the final text against the audio before using or sharing it.</p></div></article>
-            <article><FileText aria-hidden="true" /><div><h3>Saving and deleting are different</h3><p>Working audio stays in your QuPath user folder under <code>timestamp/recordings</code>, even when you exclude it from an export. Declining to save when you close QuPath does not erase it. No automatic deletion or application-level encryption is configured.</p></div></article>
+            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Finish &amp; review ends the recording.</strong></p></div>
+            <div className="privacy-items good-to-know">{goodToKnow.map(item => <article key={item.title}><ShieldCheck aria-hidden="true" /><div><h3>{item.title}</h3><p>{item.text}</p></div></article>)}</div>
           </div>
         </section>
 
         <section id="help" className="help-section section">
-          <div className="site-container help-layout"><div><p className="eyebrow">A little help, if you need it</p><h2>Stuck on a step?</h2><p className="section-intro">Start with these common questions. For managed computers, your IT team can help with installation and permissions.</p><a className="text-link" href="mailto:haopham52d@gmail.com?subject=TimeStamp%20installation%20help">Email for help <ArrowRight size={17} aria-hidden="true" /></a><p className="support-note">Include your operating system, QuPath version, TimeStamp version, and the step that failed. Do not send recordings, transcripts, or screenshots containing patient information.</p></div><div className="faq-list">{helpItems.map(item => <details key={item.question}><summary>{item.question}<ChevronDown size={19} aria-hidden="true" /></summary><p>{item.answer}</p></details>)}</div></div>
+          <div className="site-container help-layout"><div><h2>Help</h2><p className="section-intro">On a hospital computer, IT can help with installing and permissions.</p><a className="text-link" href="mailto:haopham52d@gmail.com?subject=TimeStamp%20help">Email for help <ArrowRight size={17} aria-hidden="true" /></a><p className="support-note">In the recorder, choose More → Copy support information and paste it into your email. Never send patient information.</p></div><div className="faq-list">{helpItems.map(item => <details key={item.question}><summary>{item.question}<ChevronDown size={19} aria-hidden="true" /></summary><p>{item.answer}</p></details>)}</div></div>
         </section>
       </main>
-      <footer className="site-container site-footer"><div className="brand"><span className="brand-mark">ts<span>.</span></span><span>TimeStamp<small>Record. Review. Keep together.</small></span></div><div><span>Preview · Updated {doctorPackage.date}</span><a href={repository} target="_blank" rel="noopener noreferrer">Project & source <ExternalLink size={14} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a></div></footer>
+      <footer className="site-container site-footer"><div className="brand"><span className="brand-mark">ts<span>.</span></span><span>TimeStamp<small>for QuPath</small></span></div><div><span>Preview {doctorPackage.version} · {doctorPackage.date}</span><a href={repository} target="_blank" rel="noopener noreferrer">Source <ExternalLink size={14} aria-hidden="true" /><span className="sr-only"> (opens in a new tab)</span></a></div></footer>
     </div>
   );
 }
