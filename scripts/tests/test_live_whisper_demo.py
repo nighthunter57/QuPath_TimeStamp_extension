@@ -1680,6 +1680,33 @@ class TranscriptLogicTest(unittest.TestCase):
             wave.write_bytes(b"RIFF")
             transcript.fsync_file(wave)
 
+    def test_final_pass_decodes_speech_clips_on_the_recording_clock(self):
+        # vad_filter stitched speech together and stamped words after a pause too early.
+        speech = [{"start": 56000, "end": 231040}, {"start": 478080, "end": 604288}]
+        audio = np.zeros(transcript.SAMPLE_RATE * 40, dtype=np.float32)
+        settings = transcript.build_transcribe_kwargs("en", 8, 8, True, final_pass=True)
+        with patch("faster_whisper.vad.get_speech_timestamps", return_value=speech):
+            clipped = transcript.final_pass_clip_kwargs(audio, settings)
+        self.assertFalse(clipped["vad_filter"])
+        self.assertNotIn("vad_parameters", clipped)
+        self.assertEqual([3.5, 14.44, 29.88, 37.768], clipped["clip_timestamps"])
+        with patch("faster_whisper.vad.get_speech_timestamps", return_value=[]):
+            self.assertEqual(settings, transcript.final_pass_clip_kwargs(audio, settings))
+        live = transcript.build_transcribe_kwargs("en", 2, 2, False, final_pass=False)
+        self.assertEqual(live, transcript.final_pass_clip_kwargs(audio, live))
+
+        seen = {}
+        def transcribe(audio, **kwargs):
+            seen.update(kwargs)
+            return [], SimpleNamespace(duration=40.0)
+        with patch.object(transcript, "decode_saved_audio", return_value=audio), \
+                patch("faster_whisper.vad.get_speech_timestamps", return_value=speech):
+            transcript.transcribe_saved_audio_with_timings(
+                SimpleNamespace(transcribe=transcribe), Path("capture.wav"), "en",
+                datetime(2026, 10, 1, 20, 0, 21, tzinfo=timezone.utc), 8, 8, True)
+        self.assertEqual([3.5, 14.44, 29.88, 37.768], seen["clip_timestamps"])
+        self.assertFalse(seen["vad_filter"])
+
     def test_final_transcript_exports_segment_and_word_timing_rows(self):
         recording_start = datetime(
             2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))

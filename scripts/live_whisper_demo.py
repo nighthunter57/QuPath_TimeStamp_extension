@@ -1974,6 +1974,28 @@ def align_capture_wave(wave_path: Path, origin: datetime, chunk_start: datetime,
         append_wave_silence(wave_path, round(gap * SAMPLE_RATE))
 
 
+def final_pass_clip_kwargs(audio, transcribe_kwargs: dict) -> dict:
+    """Decode only detected speech, keeping timestamps on the recording's own clock.
+
+    faster-whisper's vad_filter concatenates speech chunks and maps times back afterwards.
+    A segment that starts at a concatenation seam is mapped before the removed silence, so
+    speech after a pause was stamped up to the full pause length too early. clip_timestamps
+    skips the same silence without concatenating, so times stay absolute.
+    """
+    if not transcribe_kwargs.get("vad_filter"):
+        return transcribe_kwargs
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    chunks = get_speech_timestamps(audio, VadOptions(**transcribe_kwargs.get("vad_parameters", {})))
+    if not chunks:
+        # Keep the library's own handling of silent recordings.
+        return transcribe_kwargs
+    clips = [round(value / SAMPLE_RATE, 3) for chunk in chunks for value in (chunk["start"], chunk["end"])]
+    clip_kwargs = {key: value for key, value in transcribe_kwargs.items() if key != "vad_parameters"}
+    clip_kwargs.update(vad_filter=False, clip_timestamps=clips)
+    return clip_kwargs
+
+
 def transcribe_saved_audio_with_timings(
     model,
     audio_path: Path,
@@ -1987,16 +2009,17 @@ def transcribe_saved_audio_with_timings(
 ) -> tuple[list[str], list[dict], list[dict]]:
     raw_audio = decode_saved_audio(audio_path)
     conditioned_audio = condition_final_audio(raw_audio)
+    transcribe_kwargs = build_transcribe_kwargs(
+        language,
+        beam_size,
+        best_of,
+        previous_text,
+        final_pass=True,
+        hotwords=hotwords,
+    )
     segments, transcription_info = model.transcribe(
         conditioned_audio,
-        **build_transcribe_kwargs(
-            language,
-            beam_size,
-            best_of,
-            previous_text,
-            final_pass=True,
-            hotwords=hotwords,
-        ),
+        **final_pass_clip_kwargs(conditioned_audio, transcribe_kwargs),
     )
     duration_seconds = float(getattr(transcription_info, "duration", 0.0) or 0.0)
     if duration_seconds <= 0:
