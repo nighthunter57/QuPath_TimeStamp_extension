@@ -5,6 +5,8 @@ import argparse
 import gc
 import json
 import os
+import tempfile
+import wave
 import importlib.metadata
 from pathlib import Path
 from typing import Callable
@@ -27,6 +29,16 @@ def model_files_present(directory: Path, repository: str) -> bool:
         path.is_file() and path.stat().st_size > 0
         for path in [*(directory / name for name in required), *vocabulary]
     )
+
+
+def write_silent_wav(path: Path, seconds: float = 1.0) -> Path:
+    """One second of 16 kHz mono silence in the recorder's WAV format."""
+    with wave.open(str(path), "wb") as audio:
+        audio.setnchannels(1)
+        audio.setsampwidth(2)
+        audio.setframerate(VALIDATION_SAMPLE_RATE)
+        audio.writeframes(b"\0\0" * int(VALIDATION_SAMPLE_RATE * seconds))
+    return path
 
 
 def prepare_model(repository: str, download: Callable, offline: bool = False) -> Path:
@@ -63,9 +75,12 @@ def main() -> int:
             from faster_whisper import WhisperModel
             print(f"Checking {label} model locally...", flush=True)
             model = WhisperModel(str(snapshot), device="cpu", compute_type="int8", local_files_only=True)
-            segments, _ = model.transcribe(np.zeros(VALIDATION_SAMPLE_RATE, dtype=np.float32),
-                                           language="en", beam_size=1)
-            list(segments)
+            # Decode a real WAV file: Finish & review reads the saved recording from disk,
+            # which exercises the audio decoder that an in-memory array would skip.
+            with tempfile.TemporaryDirectory() as directory:
+                sample = write_silent_wav(Path(directory) / "validation.wav")
+                segments, _ = model.transcribe(str(sample), language="en", beam_size=1)
+                list(segments)
             del model
             gc.collect()
         installed[repository] = {"snapshot": str(snapshot.resolve()), "revision": snapshot.name}

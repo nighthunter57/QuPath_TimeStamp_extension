@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+from scripts import prepare_doctor_models as models
 from scripts.prepare_doctor_models import MODEL_FILES, model_files_present, prepare_model
 
 
@@ -54,3 +55,12 @@ class DoctorModelSetupTest(unittest.TestCase):
             self.assertTrue(model_files_present(root, "Systran/faster-whisper-large-v3"))
             (root / "model.bin").write_bytes(b"")
             self.assertFalse(model_files_present(root, "Systran/faster-whisper-large-v3"))
+
+    def test_installed_decoder_reads_a_saved_wav(self):
+        # Guards the installed audio stack: PyAV 19 broke faster-whisper's file decoding.
+        from faster_whisper.audio import decode_audio
+        with tempfile.TemporaryDirectory() as directory:
+            sample = models.write_silent_wav(Path(directory) / "check.wav", seconds=0.5)
+            audio = decode_audio(str(sample), sampling_rate=models.VALIDATION_SAMPLE_RATE)
+        self.assertEqual(int(models.VALIDATION_SAMPLE_RATE * 0.5), len(audio))
+
