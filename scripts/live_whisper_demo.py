@@ -105,6 +105,9 @@ METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
 # A segment copying part of the initial prompt is an echo when the model was this unsure of its words.
 PROMPT_ECHO_MAX_WORD_PROBABILITY = 0.2
+# Below this RMS for a whole microphone check, no signal reached the recorder (muted, blocked or absent).
+AUDIO_CHECK_NO_SOUND_RMS = 1e-4
+AUDIO_CHECK_MAX_SECONDS_KEPT = 15.0
 # Input blocks arrive every LIVE_VAD_WINDOW_SECONDS; none for this long means a stalled or lost device.
 AUDIO_STALL_WARNING_SECONDS = 3.0
 BACKLOG_WARNING_SECONDS = 6.0
@@ -238,6 +241,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Stop --check-audio automatically after this many seconds; 0 waits until stopped",
+    )
+    parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="With --check-audio, print one plain-language result instead of protocol messages",
     )
     parser.add_argument(
         "--hotwords",
@@ -2506,7 +2514,27 @@ def resolve_or_fallback_input_device(sd, device_arg: Optional[str]) -> Optional[
     return resolve_input_device(sd, device_arg)
 
 
-def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
+def describe_audio_check(max_rms: float, heard_speech: bool, signal_state: str, clipped: bool) -> str:
+    """One plain sentence for the installer: whether the microphone works and what to do."""
+    if max_rms < AUDIO_CHECK_NO_SOUND_RMS:
+        message = ("Microphone check: no sound reached TimeStamp. Check that a microphone is connected and "
+                   "not muted, and that it is allowed in your computer's privacy settings. "
+                   "You can test again later in TimeStamp with Test microphone.")
+    elif not heard_speech:
+        message = ("Microphone check: the microphone works, but no speech was heard. If you were speaking, "
+                   "move closer or raise the input level. You can test again later in TimeStamp with "
+                   "Test microphone.")
+    elif signal_state in ("low", "critical"):
+        message = ("Microphone check: speech was heard, but it was quiet or the room was noisy. "
+                   "Move closer to the microphone or reduce background noise.")
+    else:
+        message = "Microphone check: OK - speech was heard clearly."
+    if clipped:
+        message += " The input was too loud (clipping); lower the microphone input level."
+    return message
+
+
+def run_audio_check(sd, np, device: Optional[int], check_seconds: float, plain: bool = False) -> int:
     """Run the same input path as recording, without importing or loading Whisper."""
     stop_event = threading.Event()
     watchdog = AudioSilenceWatchdog()
@@ -2514,6 +2542,13 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
     signal_analyzer = SignalQualityAnalyzer()
     signal_queue = queue.Queue()
     last_meter_emit = 0.0
+    stats = {"max_rms": 0.0, "clipped": False}
+    kept_audio = []
+    kept_samples = 0
+
+    def emit(kind: str, *fields: object) -> None:
+        if not plain:
+            emit_protocol_message(kind, *fields)
 
     def request_check_stop(signum, frame) -> None:
         del signum, frame
@@ -2524,12 +2559,14 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
         if status:
             print(f"Audio status: {status}", file=sys.stderr, flush=True)
         rms = audio_rms(indata[:, 0])
+        stats["max_rms"] = max(stats["max_rms"], float(rms))
         clipped_percent = clipping_watchdog.update(indata[:, 0])
         if clipped_percent is not None:
-            emit_protocol_message("AUDIO_CLIPPING", f"{clipped_percent:.3f}")
+            stats["clipped"] = True
+            emit("AUDIO_CLIPPING", f"{clipped_percent:.3f}")
         now_monotonic = time_module.monotonic()
         for kind, fields in watchdog.update(rms, now_monotonic):
-            emit_protocol_message(kind, *fields)
+            emit(kind, *fields)
         signal_queue.put(indata[:, 0].copy())
 
     signal.signal(signal.SIGINT, request_check_stop)
@@ -2543,27 +2580,40 @@ def run_audio_check(sd, np, device: Optional[int], check_seconds: float) -> int:
             callback=audio_check_callback,
             device=device,
         ):
-            emit_protocol_message("AUDIO_CHECK_READY")
+            emit("AUDIO_CHECK_READY")
             while not stop_event.wait(0.05):
                 while True:
                     try:
                         signal_audio = signal_queue.get_nowait()
                     except queue.Empty:
                         break
+                    if plain and kept_samples < AUDIO_CHECK_MAX_SECONDS_KEPT * SAMPLE_RATE:
+                        kept_audio.append(signal_audio)
+                        kept_samples += len(signal_audio)
                     result = signal_analyzer.update(signal_audio)
                     now_monotonic = time_module.monotonic()
                     if result is not None and now_monotonic - last_meter_emit >= METER_EMIT_INTERVAL_SECONDS:
-                        emit_signal_quality(result)
+                        if not plain:
+                            emit_signal_quality(result)
                         last_meter_emit = now_monotonic
                 if check_seconds > 0 and time_module.monotonic() - started >= check_seconds:
                     break
     except KeyboardInterrupt:
         pass
     except Exception as exc:
-        print(f"Error: {explain_portaudio_error(exc)}", file=sys.stderr, flush=True)
+        if plain:
+            print(f"Microphone check: the microphone could not be opened ({explain_portaudio_error(exc)}). "
+                  "Check the connection and privacy settings, then use Test microphone in TimeStamp.",
+                  flush=True)
+        else:
+            print(f"Error: {explain_portaudio_error(exc)}", file=sys.stderr, flush=True)
         return 1
 
     snr_db, result = signal_analyzer.estimator.current()
+    if plain:
+        heard_speech = bool(kept_audio) and contains_speech(np.concatenate(kept_audio))
+        print(describe_audio_check(stats["max_rms"], heard_speech, result, stats["clipped"]), flush=True)
+        return 0
     emit_protocol_message(
         "AUDIO_CHECK_RESULT",
         f"{snr_db:.2f}" if snr_db is not None else "-1",
@@ -2827,7 +2877,7 @@ def main() -> int:
             return 2
 
         if args.check_audio:
-            return run_audio_check(sd, np, device, max(0.0, args.check_seconds))
+            return run_audio_check(sd, np, device, max(0.0, args.check_seconds), plain=args.plain)
 
     try:
         from faster_whisper import WhisperModel

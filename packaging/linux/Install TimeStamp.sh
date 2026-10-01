@@ -163,8 +163,8 @@ fi
 echo "[4/4] Checking the recorder and installing TimeStamp..."
 "$PYTHON_BIN" -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
 if [[ "${TIMESTAMP_SKIP_AUDIO_CHECK:-0}" != "1" ]]; then
-  echo "Testing the microphone for 3 seconds. Speak normally now..."
-  if ! "$PYTHON_BIN" "$HELPER_FILE" --check-audio --check-seconds 3; then
+  echo "Testing the microphone for 5 seconds. Please say a sentence now (no patient information)..."
+  if ! "$PYTHON_BIN" "$HELPER_FILE" --check-audio --check-seconds 5 --plain; then
     echo "Warning: the microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking OS permissions."
   fi
 fi

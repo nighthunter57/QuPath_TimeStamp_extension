@@ -56,6 +56,14 @@ class DoctorModelSetupTest(unittest.TestCase):
             (root / "model.bin").write_bytes(b"")
             self.assertFalse(model_files_present(root, "Systran/faster-whisper-large-v3"))
 
+    def test_hub_server_notices_are_hidden_but_errors_remain(self):
+        import logging
+        from huggingface_hub.utils import logging as hub_logging
+        models.quiet_hub_notices()
+        logger = hub_logging.get_logger("huggingface_hub.utils._http")
+        self.assertFalse(logger.isEnabledFor(logging.WARNING))
+        self.assertTrue(logger.isEnabledFor(logging.ERROR))
+
     def test_installed_decoder_reads_a_saved_wav(self):
         # Guards the installed audio stack: PyAV 19 broke faster-whisper's file decoding.
         from faster_whisper.audio import decode_audio

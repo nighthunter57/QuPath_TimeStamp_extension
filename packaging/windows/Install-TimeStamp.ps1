@@ -110,8 +110,8 @@ Write-Host "[4/4] Checking the recorder and installing TimeStamp..."
 & $PythonBin -c 'import faster_whisper, numpy, sounddevice; devices=sounddevice.query_devices(); print(f"Recorder ready; {len(devices)} audio device(s) detected")'
 if ($LASTEXITCODE -ne 0) { throw "Recorder verification failed. If a DLL is missing, ask IT to install the Microsoft Visual C++ 2015–2022 x64 runtime and rerun setup." }
 if ($env:TIMESTAMP_SKIP_AUDIO_CHECK -ne "1") {
-    Write-Host "Testing the microphone for 3 seconds. Speak normally now..."
-    & $PythonBin $HelperFile --check-audio --check-seconds 3
+    Write-Host "Testing the microphone for 5 seconds. Please say a sentence now (no patient information)..."
+    & $PythonBin $HelperFile --check-audio --check-seconds 5 --plain
     if ($LASTEXITCODE -ne 0) {
         Write-Warning "The microphone test could not open an input. Installation will finish; use Test microphone in QuPath after checking Windows privacy permissions."
     }

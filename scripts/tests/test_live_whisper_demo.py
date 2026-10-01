@@ -33,6 +33,19 @@ class TranscriptLogicTest(unittest.TestCase):
             with self.subTest(blocked_loading=loading):
                 self.assert_interactive_capture(finish=True, block_loading=loading)
 
+    def test_installer_microphone_check_gives_one_plain_answer(self):
+        describe = transcript.describe_audio_check
+        self.assertIn("no sound reached", describe(0.0, False, "calibrating", False))
+        self.assertIn("works, but no speech", describe(0.01, False, "calibrating", False))
+        self.assertIn("quiet or the room was noisy", describe(0.05, True, "low", False))
+        self.assertEqual("Microphone check: OK - speech was heard clearly.", describe(0.1, True, "good", False))
+        # A short check may end before the SNR estimate settles; heard speech is still OK.
+        self.assertIn("OK", describe(0.1, True, "calibrating", False))
+        self.assertIn("lower the microphone input level", describe(0.9, True, "good", True))
+        for message in (describe(0.0, False, "calibrating", False), describe(0.1, True, "good", True)):
+            self.assertNotIn("\t", message)
+            self.assertNotIn("AUDIO_", message)
+
     def test_arrival_watchdog_reports_a_stalled_microphone_and_its_recovery(self):
         now = [0.0]
         watchdog = transcript.AudioArrivalWatchdog(stall_seconds=3.0, clock=lambda: now[0])

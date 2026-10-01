@@ -59,11 +59,22 @@ def prepare_model(repository: str, download: Callable, offline: bool = False) ->
     return directory
 
 
+def quiet_hub_notices() -> None:
+    """Hide Hugging Face server notices (e.g. "unauthenticated requests") from doctors.
+
+    The library logs them as warnings; failed downloads still raise and are reported.
+    """
+    os.environ.setdefault("HF_HUB_VERBOSITY", "error")
+    from huggingface_hub.utils import logging as hub_logging
+    hub_logging.set_verbosity_error()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--offline", action="store_true", help="Check cached files without any downloads")
     parser.add_argument("--validate", action="store_true", help="Load each model and run a local silence decode")
     args = parser.parse_args()
+    quiet_hub_notices()
     from huggingface_hub import snapshot_download
 
     installed = {}
