@@ -3,6 +3,17 @@
 
 ## September 25 recovery and handoff update
 
+> **October 1:** superseded by `0.2.0-preview.20261001`. An end-to-end run of
+> the 20260926 package (fresh install, real models, loopback audio, Start →
+> Pause → Resume → Finish & review → Save with audio → reopen) found two
+> release blockers, both fixed: (1) fresh installs resolved PyAV 19, which
+> broke every final pass ("unexpected keyword argument 'metadata_errors'");
+> PyAV is now pinned to 18.1.0 and installer validation decodes a real WAV;
+> (2) faster-whisper's VAD stitching stamped speech after a pause up to the
+> pause length too early (15 s in the test); the final pass now decodes VAD
+> speech regions through clip_timestamps on the recording clock. Do not hand
+> out the 20260925 or 20260926 packages.
+
 > **September 26:** superseded by `0.2.0-preview.20260926`, which fixes a
 > Windows-only failure: the helper synced the saved WAV and the final
 > transcript generation through read-only handles, which Windows rejects
