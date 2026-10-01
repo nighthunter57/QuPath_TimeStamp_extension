@@ -1746,6 +1746,41 @@ class TranscriptLogicTest(unittest.TestCase):
         self.assertEqual([3.5, 14.44, 29.88, 37.768], seen["clip_timestamps"])
         self.assertFalse(seen["vad_filter"])
 
+    def test_prompt_echo_needs_a_prompt_copy_and_low_word_confidence(self):
+        prompt = transcript.build_transcribe_kwargs("en", 8, 8, True, final_pass=True,
+                                                    hotwords="lymphovascular invasion")["initial_prompt"]
+        def segment(text, probability):
+            return SimpleNamespace(text=text, words=[SimpleNamespace(word=w, probability=probability)
+                                                     for w in text.split()])
+        # Observed over room noise: the prompt preamble, decoded with ~0.01 word probability.
+        self.assertTrue(transcript.looks_like_prompt_echo(segment("Pathology dictation.", 0.01), prompt))
+        # Real dictation of a prompt term is confident and must be kept.
+        self.assertFalse(transcript.looks_like_prompt_echo(segment("Lymphovascular invasion.", 0.92), prompt))
+        # Uncertain speech that is not a copy of the prompt is left to the other checks.
+        self.assertFalse(transcript.looks_like_prompt_echo(segment("The margins are clear.", 0.05), prompt))
+        self.assertFalse(transcript.looks_like_prompt_echo(segment("Pathology dictation.", 0.01), None))
+
+    def test_final_pass_never_publishes_a_prompt_echo_as_speech(self):
+        echo = SimpleNamespace(start=5.18, end=6.58, text=" Pathology dictation.", avg_logprob=-0.2,
+                               no_speech_prob=0.1, compression_ratio=1.0,
+                               words=[SimpleNamespace(start=5.18, end=6.58, word=" Pathology", probability=0.002),
+                                      SimpleNamespace(start=6.58, end=6.58, word=" dictation.", probability=0.011)])
+        model = SimpleNamespace(transcribe=lambda *args, **kwargs: ([echo], SimpleNamespace(duration=10.0)))
+        start = datetime(2026, 10, 1, 20, 33, 11, tzinfo=timezone.utc)
+        with patch.object(transcript, "decode_saved_audio",
+                          return_value=np.zeros(transcript.SAMPLE_RATE * 10, dtype=np.float32)):
+            for speech_like in (True, False):
+                with self.subTest(speech_like=speech_like), \
+                        patch.object(transcript, "should_mark_unclear_speech", return_value=speech_like):
+                    lines, _, words = transcript.transcribe_saved_audio_with_timings(
+                        model, Path("capture.wav"), "en", start, 8, 8, True)
+                    text = " ".join(lines)
+                    self.assertNotIn("Pathology", text)
+                    if speech_like:
+                        self.assertIn(transcript.UNCLEAR_SPEECH_MARKER, text)
+                    else:
+                        self.assertEqual([], lines)
+
     def test_final_transcript_exports_segment_and_word_timing_rows(self):
         recording_start = datetime(
             2026, 8, 20, 12, 0, 0, tzinfo=timezone(timedelta(hours=-5))

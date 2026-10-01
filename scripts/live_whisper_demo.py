@@ -103,6 +103,8 @@ ENDPOINT_MAX_TURN_SECONDS = 12.0
 TRANSCRIPT_LINE_GAP_SECONDS = 0.7
 METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
+# A segment copying part of the initial prompt is an echo when the model was this unsure of its words.
+PROMPT_ECHO_MAX_WORD_PROBABILITY = 0.2
 # Input blocks arrive every LIVE_VAD_WINDOW_SECONDS; none for this long means a stalled or lost device.
 AUDIO_STALL_WARNING_SECONDS = 3.0
 BACKLOG_WARNING_SECONDS = 6.0
@@ -1516,6 +1518,26 @@ class AudioClippingWatchdog:
         return fraction * 100.0
 
 
+def looks_like_prompt_echo(segment, initial_prompt: Optional[str]) -> bool:
+    """Whisper can repeat its initial prompt over near-silence ("Pathology dictation.").
+
+    Real dictation of prompt terms (e.g. "lymphovascular invasion") is decoded confidently,
+    so an echo needs both a contiguous copy of the prompt and very low word probability.
+    """
+    if not initial_prompt:
+        return False
+    segment_words = re.findall(r"[a-z0-9]+", str(getattr(segment, "text", "")).lower())
+    prompt_words = re.findall(r"[a-z0-9]+", initial_prompt.lower())
+    if not segment_words or len(segment_words) > len(prompt_words):
+        return False
+    size = len(segment_words)
+    if not any(prompt_words[i:i + size] == segment_words for i in range(len(prompt_words) - size + 1)):
+        return False
+    probabilities = [float(word.probability) for word in (getattr(segment, "words", None) or [])
+                     if getattr(word, "probability", None) is not None]
+    return bool(probabilities) and sum(probabilities) / len(probabilities) < PROMPT_ECHO_MAX_WORD_PROBABILITY
+
+
 def looks_like_low_confidence_segment(segment) -> bool:
     avg_logprob = getattr(segment, "avg_logprob", None)
     if avg_logprob is not None and float(avg_logprob) < SEGMENT_AVG_LOGPROB_THRESHOLD:
@@ -2090,7 +2112,8 @@ def transcribe_saved_audio_with_timings(
             continue
         if looks_like_structural_repetition_loop(text):
             continue
-        if looks_like_low_confidence_segment(segment):
+        if looks_like_low_confidence_segment(segment) or \
+                looks_like_prompt_echo(segment, transcribe_kwargs.get("initial_prompt")):
             if not should_mark_unclear_speech(segment, raw_audio):
                 continue
             text = UNCLEAR_SPEECH_MARKER
