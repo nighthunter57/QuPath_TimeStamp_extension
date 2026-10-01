@@ -33,6 +33,45 @@ class TranscriptLogicTest(unittest.TestCase):
             with self.subTest(blocked_loading=loading):
                 self.assert_interactive_capture(finish=True, block_loading=loading)
 
+    def test_arrival_watchdog_reports_a_stalled_microphone_and_its_recovery(self):
+        now = [0.0]
+        watchdog = transcript.AudioArrivalWatchdog(stall_seconds=3.0, clock=lambda: now[0])
+        self.assertEqual([], watchdog.poll())            # not open yet
+        watchdog.opened()
+        now[0] = 2.9
+        self.assertEqual([], watchdog.poll())
+        now[0] = 3.0
+        self.assertEqual([("AUDIO_SILENT", ("3.0",))], watchdog.poll())
+        now[0] = 4.0
+        self.assertEqual([], watchdog.poll())             # warned once per stall
+        watchdog.mark()
+        now[0] = 4.5
+        self.assertEqual([("AUDIO_RECOVERED", ())], watchdog.poll())
+        now[0] = 4.9
+        watchdog.mark()
+        self.assertEqual([], watchdog.poll())
+        watchdog.closed()                                  # paused: no warnings
+        now[0] = 60.0
+        self.assertEqual([], watchdog.poll())
+
+    def test_open_microphone_that_delivers_no_audio_raises_the_silence_warning(self):
+        # A stalled device opened fine but never called back; the panel said Recording for minutes.
+        class SilentStream:
+            active = True
+            def __enter__(self):
+                threading.Timer(0.6, lambda: controller.command("STOP")).start()
+                return self
+            def __exit__(self, *args):
+                return False
+        sent = []
+        controller = transcript.CaptureController(
+            SilentStream, lambda: None, lambda: None, lambda state: None,
+            arrival=transcript.AudioArrivalWatchdog(stall_seconds=0.3))
+        with patch.object(transcript, "emit_protocol_message", lambda kind, *fields: sent.append(kind)):
+            controller.run()
+        self.assertIsNone(controller.error)
+        self.assertEqual(["AUDIO_SILENT"], sent)
+
     def test_finish_does_not_acknowledge_failed_audio_persistence(self):
         calls = []
         class Stream:

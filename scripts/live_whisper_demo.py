@@ -103,6 +103,8 @@ ENDPOINT_MAX_TURN_SECONDS = 12.0
 TRANSCRIPT_LINE_GAP_SECONDS = 0.7
 METER_EMIT_INTERVAL_SECONDS = 0.25
 AUDIO_SILENCE_WARNING_SECONDS = 30.0
+# Input blocks arrive every LIVE_VAD_WINDOW_SECONDS; none for this long means a stalled or lost device.
+AUDIO_STALL_WARNING_SECONDS = 3.0
 BACKLOG_WARNING_SECONDS = 6.0
 RESUME_GAP_TOLERANCE_SECONDS = 0.25
 CAPTURE_ISSUE_LIMIT = 1024
@@ -917,17 +919,61 @@ class AudioCaptureWriter:
         self.check()
 
 
+class AudioArrivalWatchdog:
+    """Warn when an open microphone stream stops delivering audio blocks at all.
+
+    AudioSilenceWatchdog judges the level of blocks that arrive; it cannot see a stalled
+    or disconnected device that delivers nothing while the panel still says Recording.
+    The audio callback only records arrival time; messages are emitted from the
+    controller's poll so the callback never blocks on output.
+    """
+
+    def __init__(self, stall_seconds: float = AUDIO_STALL_WARNING_SECONDS, clock=time_module.monotonic) -> None:
+        self.stall_seconds = stall_seconds
+        self.clock = clock
+        self.opened_at: Optional[float] = None
+        self.last_block: Optional[float] = None
+        self.warning_active = False
+
+    def opened(self) -> None:
+        self.opened_at = self.clock()
+        self.last_block = None
+
+    def closed(self) -> None:
+        self.opened_at = None
+
+    def mark(self) -> None:
+        self.last_block = self.clock()
+
+    def poll(self) -> list[tuple[str, tuple[object, ...]]]:
+        if self.opened_at is None:
+            return []
+        now = self.clock()
+        reference = self.last_block if self.last_block is not None and self.last_block >= self.opened_at \
+            else self.opened_at
+        gap = now - reference
+        if gap >= self.stall_seconds and not self.warning_active:
+            self.warning_active = True
+            return [("AUDIO_SILENT", (f"{gap:.1f}",))]
+        if gap < self.stall_seconds and self.warning_active:
+            self.warning_active = False
+            return [("AUDIO_RECOVERED", ())]
+        return []
+
+
 class CaptureController:
     """Own microphone lifecycle independently of model inference; acknowledge actual state."""
 
     def __init__(self, open_stream, flush, before_resume, announce, check_writer=lambda: None,
-                 finish_capture: Optional[Callable[[], None]] = None):
+                 finish_capture: Optional[Callable[[], None]] = None,
+                 arrival: Optional[AudioArrivalWatchdog] = None):
         self.open_stream = open_stream
         self.flush = flush
         self.before_resume = before_resume
         self.announce = announce
         self.check_writer = check_writer
         self.finish_capture = finish_capture
+        self.arrival = arrival
         self.commands = queue.Queue()
         self.commands.put("RESUME")
         self.finished = threading.Event()
@@ -965,6 +1011,8 @@ class CaptureController:
                     continue
                 self.before_resume()
                 with self.open_stream() as stream:
+                    if self.arrival is not None:
+                        self.arrival.opened()
                     self.announce("ready" if first else "recording")
                     first = False
                     while True:
@@ -974,9 +1022,14 @@ class CaptureController:
                             self.check_writer()
                             if not getattr(stream, "active", True):
                                 raise RuntimeError("Microphone disconnected; captured audio is preserved")
+                            if self.arrival is not None:
+                                for kind, fields in self.arrival.poll():
+                                    emit_protocol_message(kind, *fields)
                             continue
                         if command in {"PAUSE", "STOP", "FINISH"}:
                             break
+                    if self.arrival is not None:
+                        self.arrival.closed()
                 # Closing the stream joins its callback before acknowledging Pause.
                 self.flush()
                 if command in {"STOP", "FINISH"}:
@@ -2818,6 +2871,7 @@ def main() -> int:
     stream_time_anchor: Optional[float] = None
     stream_wall_anchor: Optional[datetime] = None
     silence_watchdog = AudioSilenceWatchdog()
+    arrival_watchdog = AudioArrivalWatchdog()
     clipping_watchdog = AudioClippingWatchdog()
     signal_analyzer = SignalQualityAnalyzer()
     live_audio_conditioner = LiveAudioConditioner()
@@ -2838,6 +2892,7 @@ def main() -> int:
 
     def callback(indata, frames, time_info, status) -> None:
         nonlocal stream_time_anchor, stream_wall_anchor
+        arrival_watchdog.mark()
         if status:
             callback_notices.put(("input-overflow-or-device-status", datetime.now(timezone.utc)))
         chunk_duration = frames / SAMPLE_RATE
@@ -3255,7 +3310,7 @@ def main() -> int:
             capture_controller = CaptureController(open_capture_stream, capture_writer.flush, prepare_resume,
                 lambda state: emit_protocol_message("TRANSCRIPT_READY") if state == "ready"
                 else emit_protocol_message("CAPTURE_STATE", state), capture_writer.check,
-                finish_capture=finish_capture)
+                finish_capture=finish_capture, arrival=arrival_watchdog)
             capture_thread = threading.Thread(target=capture_controller.run, name="microphone-controller", daemon=True)
             capture_thread.start()
             threading.Thread(target=capture_controller.read_commands, args=(sys.stdin,),

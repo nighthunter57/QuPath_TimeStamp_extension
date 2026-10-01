@@ -12,7 +12,7 @@ as a log line and never as a state transition.
 | `AUDIO_CHECK_RESULT` | SNR dB, signal state | Terminal microphone-test signal quality. SNR is `-1` while calibration is incomplete. |
 | `AUDIO_LEVEL` | SNR dB, signal state | Periodic signal quality. State is `calibrating`, `critical`, `low`, or `good`; 8 dB is recommended and below 3 dB is critical. |
 | `AUDIO_CLIPPING` | percent of samples at full scale | At least 0.1% of a raw input chunk reached full scale. Emitted once per capture; the user should lower microphone gain. |
-| `AUDIO_SILENT` | quiet seconds | No usable input has been observed for the watchdog interval. Emitted once per quiet stretch. |
+| `AUDIO_SILENT` | quiet seconds | No usable input has been observed for the watchdog interval, or an open input has delivered no audio blocks at all for 3 seconds (stalled or lost device). Emitted once per quiet stretch. |
 | `AUDIO_RECOVERED` | none | Input recovered after `AUDIO_SILENT`. |
 | `TRANSCRIPT_READY` | none | Audio capture is open. Recording may begin even while the model is warming. |
 | `CAPTURE_STATE` | `paused` or `recording` | Acknowledges in-process microphone Pause/Resume. Paused is emitted after the stream closes and queued raw audio is written, independently of live decoding. |
