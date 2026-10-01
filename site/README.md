@@ -8,7 +8,7 @@ This update has not been published automatically.
 - `app/page.tsx`: doctor-facing home page, native computer selector, first-recording
   tutorial, privacy notes, and keyboard-accessible troubleshooting disclosures.
 - `data/install-guide.ts`: exact installer names, instructions, and current download.
-- `public/downloads/TimeStamp-Doctor-0.2.0-preview.20261001.zip`: copy of the tested local
+- `public/downloads/TimeStamp-Doctor-0.2.0-preview.20261001.3.zip`: copy of the tested local
   doctor package built October 1, 2026. Old downloads are preserved but not linked
   by the new guide.
 - `public/downloads/DOCTOR-INSTALL.txt`: downloadable written instructions.

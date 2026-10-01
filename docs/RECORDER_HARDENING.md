@@ -3,6 +3,19 @@
 
 ## September 25 recovery and handoff update
 
+> **October 1 (later):** superseded by `0.2.0-preview.20261001.3`. Tests with
+> recorded human speech (LibriSpeech, three speakers, played into a loopback
+> microphone through the full panel workflow) found and fixed: a stalled input
+> device showing "Recording" with no warning (AUDIO_SILENT after 3 s without
+> audio blocks); the final pass publishing its own prompt ("Pathology
+> dictation.") over near-silence; and a regression in the clip-based final pass
+> where a sentence split at an 80 ms gap was decoded as a repeat of the previous
+> sentence, losing words (speech regions under 2 s apart are now decoded
+> together; word-for-word repeats are flagged for review). The installer's
+> microphone test now prints one plain sentence. Final verification: 0.0% word
+> errors on both human speakers and 2.2% on the synthetic clinical dictation,
+> every clinical phrase correct, paused speech excluded, events aligned.
+
 > **October 1:** superseded by `0.2.0-preview.20261001`. An end-to-end run of
 > the 20260926 package (fresh install, real models, loopback audio, Start →
 > Pause → Resume → Finish & review → Save with audio → reopen) found two
