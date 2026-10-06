@@ -188,6 +188,11 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .privacy-items p { margin-top: 7px; color: #58665d; font-size: 14px; line-height: 1.8; }
 .privacy-items code { font-size: 12px; overflow-wrap: anywhere; }
 .good-to-know { grid-template-columns: repeat(3, 1fr); gap: 24px 32px; margin-top: 40px; }
+.study-section { padding-bottom: 20px; }
+.study-signals { display: grid; grid-template-columns: repeat(5, 1fr); gap: 14px; margin: 0; padding: 0; list-style: none; }
+.study-signals li { display: grid; gap: 6px; padding: 16px; background: #f0f4ec; border-radius: 10px; font-size: 14px; line-height: 1.6; color: #4b5b50; }
+.study-signals strong { color: #145c50; font-size: 15px; }
+.study-more { margin-top: 18px; font-size: 14px; color: #4b5b50; display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
 .help-section { background: #edf2e9; border-block: 1px solid #d8e1d4; }
 .help-layout { display: grid; grid-template-columns: .8fr 1.2fr; gap: 90px; }
 .help-layout .text-link { margin-top: 24px; }
@@ -205,6 +210,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
 .skip-link:focus { top: 10px; }
 @media (max-width: 1000px) {
   .recording-grid { grid-template-columns: repeat(2, 1fr); }
+  .study-signals { grid-template-columns: repeat(3, 1fr); }
   .hero { gap: 28px; padding-block: 58px; }
   .hero-actions { align-items: flex-start; flex-direction: column; gap: 16px; }
   .installation-layout { grid-template-columns: 245px 1fr; gap: 28px; }
@@ -251,6 +257,7 @@ h3 { font-size: 18px; line-height: 1.4; font-weight: 650; letter-spacing: -.3px;
   .important-difference { align-items: flex-start; }
   .saved-contents, .saved-contents ul { grid-template-columns: 1fr; gap: 18px; }
   .good-to-know { grid-template-columns: 1fr; }
+  .study-signals { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 560px) {
   .recording-grid { grid-template-columns: 1fr; }

@@ -3,6 +3,13 @@
 
 ## September 25 recovery and handoff update
 
+> **October 5:** superseded by `0.2.0-preview.20261005` for the diagnostic-process
+> pilot. Mouse tracking now defaults to on: the pilot needs the cursor trajectory
+> and the preference previously defaulted to off, so cases would have been recorded
+> without it. The doctor guide (PDF) now opens with the study overview, lists the
+> signals recorded per case, and gives a per-case routine (think aloud, say findings,
+> dictate the final report, save with the case ID and audio).
+
 > **October 1 (later):** superseded by `0.2.0-preview.20261001.3`. Tests with
 > recorded human speech (LibriSpeech, three speakers, played into a loopback
 > microphone through the full panel workflow) found and fixed: a stalled input

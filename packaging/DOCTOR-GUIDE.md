@@ -10,7 +10,7 @@ TimeStamp records spoken observations and timestamped image actions in QuPath. F
 
 Ask the study coordinator or IT team to finish setup ahead of your appointment. You already have QuPath; keep that installation if it is **version 0.6.0**. If it is another version, ask the coordinator to confirm compatibility before proceeding.
 
-**1  Obtain the correct package.** Ask your coordinator for **TimeStamp-Doctor-0.2.0-preview.20261001.3.zip**. The installer adds TimeStamp and its recording tools automatically; you do not need to install Python separately.
+**1  Obtain the correct package.** Ask your coordinator for **TimeStamp-Doctor-0.2.0-preview.20261005.zip**. The installer adds TimeStamp and its recording tools automatically; you do not need to install Python separately.
 
 **2  Prepare the computer.** Connect a microphone and internet. First setup downloads about **3.6 GB of speech models**, plus recording tools. Allow time and storage for these files; download speed determines how long setup takes.
 
@@ -92,4 +92,4 @@ After setup, standard recording and transcription run locally using the installe
 
 Use **More > Copy support information** for the app version and status. Give your coordinator that information, what you were doing and the exact error message. Do not include patient speech, images or transcript contents. Do not delete a working recording while troubleshooting.
 
-Guide for TimeStamp 0.2.0-preview.20261001.3. Local checks cover automated recording logic, recovery, saving and interface behavior. The doctor’s actual microphone, longer sessions and human pathology accuracy still require evaluation.
+Guide for TimeStamp 0.2.0-preview.20261005. Local checks cover automated recording logic, recovery, saving and interface behavior. The doctor’s actual microphone, longer sessions and human pathology accuracy still require evaluation.

@@ -2,41 +2,45 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>TimeStamp for QuPath — Install and set up</title>
+<title>TimeStamp for QuPath — Pilot study guide</title>
 <!-- Source for downloads/TimeStamp-Install-Guide.pdf. Rebuild with site/scripts/build-install-guide-pdf.sh -->
 <style>
   @page { size: Letter; margin: 0.6in 0.65in 0.65in; }
   * { box-sizing: border-box; }
   body { margin: 0; font: 10.5pt/1.45 -apple-system, "Helvetica Neue", Helvetica, Arial, sans-serif; color: #1f2a24; }
   h1 { font-size: 21pt; line-height: 1.15; margin: 0 0 4pt; letter-spacing: -0.3pt; }
-  h2 { font-size: 13pt; margin: 18pt 0 6pt; color: #145c50; }
+  h2 { font-size: 13pt; margin: 16pt 0 6pt; color: #145c50; }
+  h3 { font-size: 10.5pt; margin: 10pt 0 3pt; }
   p { margin: 0 0 6pt; }
+  ul { margin: 0 0 6pt; padding-left: 15pt; }
+  li { margin-bottom: 2pt; }
   strong { font-weight: 650; }
-  code, .ui { font-family: inherit; font-weight: 650; }
-  .file { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.5pt; background: #eef3ee; padding: 1pt 4pt; border-radius: 3pt; white-space: nowrap; }
+  .ui { font-weight: 650; }
+  .file { font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 9.2pt; background: #eef3ee; padding: 1pt 4pt; border-radius: 3pt; white-space: nowrap; }
   .top { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 2pt solid #145c50; padding-bottom: 8pt; margin-bottom: 12pt; }
   .brand { font-size: 9pt; font-weight: 700; letter-spacing: 1.2pt; text-transform: uppercase; color: #145c50; margin-bottom: 4pt; }
   .meta { font-size: 8.5pt; color: #56655b; text-align: right; }
   .lead { font-size: 11pt; color: #3c4b41; }
-  .box { border: 1pt solid #cfdccb; background: #f4f8f3; border-radius: 6pt; padding: 9pt 12pt; margin: 8pt 0; }
-  .box h3 { margin: 0 0 5pt; font-size: 10.5pt; }
-  .box ul { margin: 0; padding-left: 14pt; }
-  .box li { margin-bottom: 2pt; }
+  .flow { display: flex; flex-wrap: wrap; align-items: center; gap: 4pt; margin: 6pt 0 8pt; font-size: 9.5pt; }
+  .flow span { background: #eef3ee; border: 1pt solid #cfdccb; border-radius: 4pt; padding: 2pt 6pt; font-weight: 600; }
+  .flow i { color: #145c50; font-style: normal; font-weight: 700; }
+  .box { border: 1pt solid #cfdccb; background: #f4f8f3; border-radius: 6pt; padding: 9pt 12pt; margin: 8pt 0; break-inside: avoid; }
+  .box h3 { margin: 0 0 5pt; }
   .warn { background: #fbf4e8; border-color: #e8d3ad; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 10pt 18pt; }
   ol.steps { list-style: none; counter-reset: step; padding: 0; margin: 0; }
-  ol.steps > li { counter-increment: step; position: relative; padding: 0 0 10pt 30pt; break-inside: avoid; }
+  ol.steps > li { counter-increment: step; position: relative; padding: 0 0 9pt 30pt; break-inside: avoid; }
   ol.steps > li::before { content: counter(step); position: absolute; left: 0; top: -1pt; width: 20pt; height: 20pt; border-radius: 50%; background: #145c50; color: #fff; font-weight: 700; font-size: 10pt; display: flex; align-items: center; justify-content: center; }
-  ol.steps h3 { margin: 0 0 3pt; font-size: 11pt; }
+  ol.steps h3 { margin: 0 0 2pt; font-size: 11pt; }
   .os { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7pt; margin: 6pt 0 2pt; }
   .os div { border: 1pt solid #cfdccb; border-radius: 5pt; padding: 7pt 9pt; font-size: 9.5pt; break-inside: avoid; }
   .os b { display: block; font-size: 10pt; margin-bottom: 3pt; color: #145c50; }
-  .stages { display: grid; grid-template-columns: auto 1fr; gap: 2pt 8pt; margin: 4pt 0; font-size: 9.5pt; }
-  .stages span:nth-child(odd) { font-weight: 700; color: #145c50; }
   .done { border-left: 3pt solid #2f8a4b; background: #eef7f0; padding: 6pt 10pt; margin: 6pt 0; font-weight: 650; }
   table { width: 100%; border-collapse: collapse; font-size: 9.5pt; }
   th, td { text-align: left; vertical-align: top; padding: 5pt 6pt; border-bottom: 1pt solid #dce3dc; }
   th { color: #145c50; font-size: 9pt; }
-  td:first-child { width: 36%; font-weight: 650; }
+  td:first-child { width: 28%; font-weight: 650; }
+  table.help td:first-child { width: 36%; }
   .page-break { break-before: page; }
   .foot { margin-top: 12pt; padding-top: 7pt; border-top: 1pt solid #dce3dc; font-size: 8.5pt; color: #56655b; }
 </style>
@@ -45,109 +49,141 @@
 
 <div class="top">
   <div>
-    <div class="brand">TimeStamp for QuPath</div>
-    <h1>Install and set up</h1>
+    <div class="brand">TimeStamp for QuPath · Pilot study</div>
+    <h1>Guide for participating physicians</h1>
   </div>
-  <div class="meta">Package 0.2.0-preview.20261001.3<br>For QuPath 0.6.0</div>
+  <div class="meta">Package 0.2.0-preview.20261005<br>For QuPath 0.6.0</div>
 </div>
 
-<p class="lead">TimeStamp records your spoken observations together with your image actions in QuPath. You install it once. Setup takes one sitting; most of the time is an unattended download.</p>
+<p class="lead">Thank you for taking part. This guide explains the study, how to install TimeStamp once, and what to do for each case. Please work as you normally would; the study is designed to add as little extra work as possible.</p>
 
+<h2>About the study</h2>
+<p>Most medical imaging AI is trained to predict the final diagnosis or report from an image. A physician does not reach a diagnosis in one step: you explore the image, focus on different regions, consider possible findings, gather evidence, update your interpretation and finally write the report. <strong>This study models that diagnostic process itself</strong>, not only the final outcome.</p>
+<div class="flow"><span>Image</span><i>→</i><span>Inspect a region</span><i>→</i><span>Observe evidence</span><i>→</i><span>Update your interpretation</span><i>→</i><span>Inspect the next region</span><i>→ … →</i><span>Final report</span></div>
+<p>We will use a <strong>world model</strong> to learn how a physician’s diagnostic state changes over time: from the image, what has been seen so far, mouse interaction and dictation, it learns how your interpretation evolves and what is likely to happen next. Instead of only <em>Image → Diagnosis</em>, it learns <em>Image + diagnostic history → current diagnostic state → next action or observation → updated state</em>. It aims to capture both:</p>
+<ul>
+  <li><strong>Diagnostic reasoning</strong>: how your interpretation changes as new evidence is observed.</li>
+  <li><strong>Diagnostic behavior</strong>: where you search and what you choose to inspect next.</li>
+</ul>
+
+<div class="cols">
+  <div>
+    <h3>The pilot: about 30 cases</h3>
+    <p>This first pilot tests whether the recorded signals are enough to reconstruct meaningful diagnostic behavior. We want to find out whether we can:</p>
+    <ul>
+      <li>identify the stages of the diagnostic process;</li>
+      <li>infer which finding or question you are investigating;</li>
+      <li>predict which image region you will inspect next;</li>
+      <li>predict which finding may be reported next;</li>
+      <li>model how the evidence you gather leads to the final report;</li>
+      <li>describe how diagnostic strategies differ between physicians.</li>
+    </ul>
+  </div>
+  <div>
+    <h3>Long-term goal</h3>
+    <p>A world model of physician diagnostic behavior that captures how a diagnosis is reached, not only the diagnosis. It could help study search strategies, compare diagnostic behaviors, spot incomplete search patterns, predict next diagnostic actions, and build AI that supports physicians during diagnosis.</p>
+    <p>The pilot is a feasibility experiment for the data-collection protocol itself.</p>
+  </div>
+</div>
+
+<h2>What is recorded for each case</h2>
+<table>
+  <tr><th>Signal</th><th>How it is captured</th></tr>
+  <tr><td>Medical image</td><td>Which slide you have open in QuPath, and the region and zoom you are viewing. The image itself is not copied.</td></tr>
+  <tr><td>Mouse position and path</td><td>Automatic: your cursor position on the image about 10 times per second, plus zooms, pans and clicks.</td></tr>
+  <tr><td>Dictation</td><td>Your voice and an automatic transcript, with the time of every word.</td></tr>
+  <tr><td>Findings</td><td>Say each finding aloud as you identify it. Any annotations you draw in QuPath are also recorded.</td></tr>
+  <tr><td>Final report</td><td>Dictate your final report aloud at the end of the case.</td></tr>
+</table>
+<p style="margin-top:6pt">Everything is synchronized on one clock, stays on this computer, and is only recorded while TimeStamp shows <span class="ui">Recording</span>. Nothing is recorded while paused. There is no screen or camera recording.</p>
+
+<h2 class="page-break">Install (once)</h2>
 <div class="box">
-  <h3>Before you start, check you have:</h3>
+  <h3>You need</h3>
   <ul>
-    <li><strong>QuPath 0.6.0</strong>, already opened once so its first-time setup is complete.</li>
-    <li><strong>A supported computer:</strong> Windows 10 or 11 (x64), a Mac (Apple Silicon or Intel), or Linux (x64 or ARM64). Windows on ARM is not supported.</li>
-    <li><strong>Internet access</strong> for the first setup. It downloads about <strong>3.6 GB</strong> of speech models plus recording tools.</li>
-    <li><strong>A microphone</strong> (built-in or connected).</li>
-    <li><strong>Permission to install software.</strong> On a hospital computer, ask IT first.</li>
-    <li>The file <span class="file">TimeStamp-Doctor-0.2.0-preview.20261001.3.zip</span>.</li>
+    <li><strong>QuPath 0.6.0</strong>, opened once so its first-time setup is complete.</li>
+    <li><strong>Windows 10 or 11 (x64), a Mac, or Linux.</strong> Windows on ARM is not supported.</li>
+    <li><strong>Internet for setup</strong> (about 3.6 GB downloads once), <strong>a microphone</strong>, and <strong>permission to install</strong> (on a hospital computer, ask IT).</li>
+    <li>The file <span class="file">TimeStamp-Doctor-0.2.0-preview.20261005.zip</span>.</li>
   </ul>
 </div>
-
-<h2>Install</h2>
 <ol class="steps">
   <li>
-    <h3>Note your QuPath folder, then close QuPath</h3>
-    <p>In QuPath, open <span class="ui">Preferences</span> and find <span class="ui">User directory</span>. Write it down. Then quit QuPath completely. The installer will stop if QuPath is still open.</p>
+    <h3>Note your QuPath folder, then quit QuPath</h3>
+    <p>In QuPath, open <span class="ui">Preferences</span> and write down the <span class="ui">User directory</span>. Then quit QuPath; setup stops if QuPath is open.</p>
   </li>
   <li>
     <h3>Unzip the download</h3>
-    <p><strong>Windows:</strong> right-click the ZIP and choose <span class="ui">Extract All</span>. <strong>Mac:</strong> double-click the ZIP. Then open the <span class="file">TimeStamp-Doctor-0.2.0-preview.20261001.3</span> folder. Do not run anything from inside the ZIP itself.</p>
+    <p><strong>Windows:</strong> right-click the ZIP, choose <span class="ui">Extract All</span>. <strong>Mac:</strong> double-click the ZIP. Then open the <span class="file">TimeStamp-Doctor-0.2.0-preview.20261005</span> folder.</p>
   </li>
   <li>
     <h3>Run the installer for your computer</h3>
     <div class="os">
-      <div><b>Windows</b>Double-click <span class="file">Install TimeStamp on Windows.bat</span>. A setup window opens.</div>
-      <div><b>Mac</b>Double-click <span class="file">Install TimeStamp.command</span>. If macOS blocks it, Control-click the file, choose <span class="ui">Open</span>, then <span class="ui">Open</span> again.</div>
-      <div><b>Linux</b>Open a terminal in the folder and run:<br><span class="file">bash "Install TimeStamp on Linux.sh"</span><br>It may ask for an administrator password.</div>
+      <div><b>Windows</b>Double-click <span class="file">Install TimeStamp on Windows.bat</span></div>
+      <div><b>Mac</b>Double-click <span class="file">Install TimeStamp.command</span>. If blocked, Control-click it and choose <span class="ui">Open</span>.</div>
+      <div><b>Linux</b>In a terminal in the folder:<br><span class="file">bash "Install TimeStamp on Linux.sh"</span></div>
     </div>
-    <p>If your computer or organization blocks the installer, stop and ask IT to approve it. Do not turn off security software.</p>
+    <p>If your computer blocks the installer, ask IT to approve it. Do not turn off security software.</p>
   </li>
   <li>
     <h3>Confirm the QuPath folder</h3>
-    <p>The installer shows a folder and asks you to confirm it. If it matches the <span class="ui">User directory</span> from step 1, press <span class="ui">Enter</span>. If not, paste your folder and press <span class="ui">Enter</span>.</p>
+    <p>Press <span class="ui">Enter</span> if the folder shown matches your User directory. If not, paste your folder and press <span class="ui">Enter</span>.</p>
   </li>
   <li>
-    <h3>Wait for all four stages</h3>
-    <p>Keep the window open. Do not close it while it is working.</p>
-    <div class="stages">
-      <span>[1/4]</span><span>Checks the package is complete.</span>
-      <span>[2/4]</span><span>Prepares the private recording tools.</span>
-      <span>[3/4]</span><span>Downloads the speech models. This is the longest step.</span>
-      <span>[4/4]</span><span>Installs TimeStamp and tests the microphone for 5 seconds. <strong>Say a sentence when asked;</strong> the window then tells you whether the microphone works.</span>
-    </div>
+    <h3>Wait, and say one sentence when asked</h3>
+    <p>Keep the window open; the speech download takes the longest. When asked, say a sentence so setup can test the microphone; it then tells you whether the microphone works.</p>
     <div class="done">Setup is finished when you see: “TimeStamp is ready for the doctor.”</div>
     <p>If a download is interrupted, run the same installer again. Files already downloaded are reused.</p>
   </li>
 </ol>
 
-<h2 class="page-break">Make a short test recording</h2>
-<p>Do this once before your first real session. Use a slide and speech with <strong>no patient information</strong>.</p>
+<h3>Before your first case: a 1-minute test</h3>
+<p>Open QuPath and allow microphone access. Choose <span class="ui">Extensions → TimeStamp Extension → Open Clinical Session Recorder</span>, then <span class="ui">⚙ Settings → Test microphone</span>. Record a few sentences on any slide (no patient information), move the mouse around, choose <span class="ui">Finish &amp; review</span>, then <span class="ui">Save Session</span>. Send that saved test folder to the study coordinator so they can confirm everything was recorded.</p>
+
+<h2 class="page-break">For each case</h2>
 <ol class="steps">
   <li>
-    <h3>Open the recorder</h3>
-    <p>Open QuPath and allow microphone access if asked. Choose <span class="ui">Extensions → TimeStamp Extension → Open Clinical Session Recorder</span>.</p>
+    <h3>Open the slide and the recorder</h3>
+    <p>Open the case slide in QuPath. Open the recorder: <span class="ui">Extensions → TimeStamp Extension → Open Clinical Session Recorder</span>.</p>
   </li>
   <li>
-    <h3>Check the microphone</h3>
-    <p>Choose <span class="ui">⚙ Settings</span>, select your microphone and choose <span class="ui">Test microphone</span>. Speak and check that the signal indicator moves.</p>
+    <h3>Start recording, then read the slide as you normally would</h3>
+    <p>Choose <span class="ui">Start Recording</span> and wait until it says <span class="ui">Recording</span>. Navigate with the mouse as usual. <strong>Think aloud</strong>: say what you are looking at, what you notice and what you are considering.</p>
   </li>
   <li>
-    <h3>Record a few sentences</h3>
-    <p>Choose <span class="ui">Start Recording</span> and wait until it says <span class="ui">Recording</span>. Speak a few sentences and zoom or move around the slide. Try <span class="ui">Pause</span> and then <span class="ui">Resume</span>.</p>
+    <h3>Say each finding as you identify it</h3>
+    <p>For example: “Here, tumor invades the muscularis propria.” Annotations you draw in QuPath are recorded too, but are not required.</p>
   </li>
   <li>
-    <h3>Finish and review</h3>
-    <p>Choose <span class="ui">Finish &amp; review</span>. The final transcript is prepared from the whole recording; keep QuPath open until it is ready. Replay and correct any wrong words.</p>
+    <h3>Dictate your final report</h3>
+    <p>When you have reached your conclusion, say your final report aloud, as you would dictate it.</p>
   </li>
   <li>
-    <h3>Save with audio, then reopen</h3>
-    <p>Choose <span class="ui">Save Session</span>, pick a folder and a name without patient details, and tick <span class="ui">Include audio recording</span>. Then choose <span class="ui">More → Open saved session…</span> and open that folder to confirm it reopens.</p>
+    <h3>Finish &amp; review, then save</h3>
+    <p>Choose <span class="ui">Finish &amp; review</span> and wait for the final transcript (it takes about as long as the recording). Correct any wrong words, especially numbers and negations. Then choose <span class="ui">Save Session</span>, name it with the <strong>case ID only</strong> (for example <span class="file">case-07</span>; never patient names or record numbers), tick <span class="ui">Include audio recording</span>, and save it in the study folder.</p>
   </li>
 </ol>
-<div class="done">If all five steps work, TimeStamp is ready to use.</div>
+<div class="box"><p style="margin:0"><strong>Need a break?</strong> <span class="ui">Pause</span> stops recording; <span class="ui">Resume</span> continues the same case. Choose <span class="ui">Finish &amp; review</span> only when the case is complete.</p></div>
 
 <h2>If something goes wrong</h2>
-<table>
+<table class="help">
   <tr><th>What you see</th><th>What to do</th></tr>
-  <tr><td>The installer is blocked</td><td>Ask IT to approve it. Do not change security settings yourself.</td></tr>
-  <tr><td>“Please close QuPath completely”</td><td>Quit QuPath (check it is not still running), then run the installer again.</td></tr>
-  <tr><td>“This package supports Windows x64 only”</td><td>This computer runs Windows on ARM, which is not supported. Contact the study coordinator.</td></tr>
+  <tr><td>“Please close QuPath completely”</td><td>Quit QuPath, then run the installer again.</td></tr>
+  <tr><td>“This package supports Windows x64 only”</td><td>This computer is Windows on ARM, which is not supported. Contact the study coordinator.</td></tr>
   <tr><td>Windows mentions a missing DLL</td><td>Ask IT to install the Microsoft Visual C++ 2015–2022 x64 runtime, then run the installer again.</td></tr>
-  <tr><td>The download stopped or failed</td><td>Check the internet connection and run the installer again. Finished files are reused.</td></tr>
-  <tr><td>TimeStamp is not in the Extensions menu</td><td>Quit and reopen QuPath. Check the <span class="ui">User directory</span> in Preferences, then run the installer again and enter that folder.</td></tr>
-  <tr><td>The microphone test failed or stays silent</td><td>Setup still finishes. Check the microphone is connected and allowed in your computer’s privacy settings, then use <span class="ui">Test microphone</span> in TimeStamp.</td></tr>
-  <tr><td>The final transcript takes too long</td><td>Choose <span class="ui">Cancel final pass · keep saved audio</span>. The audio is kept; use <span class="ui">More → Retry final transcription</span> later.</td></tr>
+  <tr><td>TimeStamp is not in the Extensions menu</td><td>Quit and reopen QuPath. Check the User directory, then run the installer again and enter that folder.</td></tr>
+  <tr><td>“No microphone signal detected”</td><td>Sound stopped arriving. Check the microphone or headset connection; the warning clears when sound returns.</td></tr>
+  <tr><td>The final transcript takes too long</td><td>Choose <span class="ui">Cancel final pass · keep saved audio</span>; later use <span class="ui">More → Retry final transcription</span>.</td></tr>
+  <tr><td>QuPath closed before you saved</td><td>Reopen the recorder and use <span class="ui">More → Recover an unsaved session</span>.</td></tr>
 </table>
 
 <div class="box warn">
   <h3>Getting help</h3>
-  <p>In the recorder, choose <span class="ui">More → Copy support information</span> and send it with a short description of the step that failed and the exact message shown. Never send recordings, transcripts or screenshots containing patient information.</p>
+  <p style="margin:0">In the recorder, choose <span class="ui">More → Copy support information</span> and send it to the study coordinator with the step that failed and the exact message. Never send patient information in emails or screenshots.</p>
 </div>
 
 <div class="foot">
-  This is a preview for supervised evaluation. It is not clinically validated: review every transcript against the recording before relying on it. Recording and transcription run on this computer after setup; audio is not sent to a transcription service. Working recordings stay in the QuPath User directory under <span class="file">timestamp/recordings</span>, even when audio is not included in a saved session. Follow your organization’s storage and retention policy.
+  TimeStamp is a research preview for supervised use and is not clinically validated. Recording and transcription run on this computer; audio is not sent to any service. Working recordings stay in the QuPath User directory under <span class="file">timestamp/recordings</span> until removed by IT, even when not saved. Follow your organization’s policy for storing study data.
 </div>
 
 </body>

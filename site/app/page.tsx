@@ -7,7 +7,7 @@ import {
   ExternalLink, FileText, Laptop, MousePointer2, Pause, ShieldCheck,
 } from "lucide-react";
 import histologyBanner from "@/assets/histology-support-banner.jpg";
-import { computers, doctorPackage, goodToKnow, helpItems, recorderSteps, type Computer } from "@/data/install-guide";
+import { computers, doctorPackage, goodToKnow, helpItems, recorderSteps, studySignals, type Computer } from "@/data/install-guide";
 
 const repository = "https://github.com/nighthunter57/QuPath_TimeStamp_extension";
 const qupathDownload = "https://github.com/qupath/qupath/releases/tag/v0.6.0";
@@ -44,21 +44,27 @@ export default function Home() {
       <header className="site-header">
         <div className="site-container header-inner">
           <a href="#top" className="brand" aria-label="TimeStamp for QuPath home"><span className="brand-mark">ts<span>.</span></span><span>TimeStamp<small>for QuPath</small></span></a>
-          <nav className="desktop-nav" aria-label="Main navigation"><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
+          <nav className="desktop-nav" aria-label="Main navigation"><a href="#study">Study</a><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
           <a className="button button-small" href="#install">Install <ArrowRight size={16} aria-hidden="true" /></a>
         </div>
-        <nav className="mobile-nav site-container" aria-label="Mobile navigation"><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
+        <nav className="mobile-nav site-container" aria-label="Mobile navigation"><a href="#study">Study</a><a href="#install">Install</a><a href="#first-recording">Record</a><a href="#help">Help</a></nav>
       </header>
 
       <main id="main">
         <section id="top" className="hero site-container">
           <div className="hero-copy">
             <h1>Record your observations <span>while you work in QuPath.</span></h1>
-            <p className="hero-description">TimeStamp records your voice, writes the transcript and logs your image actions, all on your computer.</p>
+            <p className="hero-description">For the diagnostic-process pilot study. TimeStamp records your dictation, mouse path and image actions together, all on your computer.</p>
             <div className="hero-actions"><a className="button" href="#install">Install TimeStamp <ArrowDown size={18} aria-hidden="true" /></a><a className="text-link" href={doctorPackage.guide} download><FileText size={16} aria-hidden="true" /> Printable guide (PDF)</a></div>
             <p className="hero-footnote">For QuPath 0.6 · Windows, Mac & Linux · Preview {doctorPackage.version}</p>
           </div>
           <RecorderPreview />
+        </section>
+
+        <section id="study" className="section site-container study-section">
+          <div className="section-heading"><div><h2>About the study</h2><p>We are studying how physicians reach a diagnosis, step by step, not only the final result. For about 30 cases, TimeStamp records these signals together while you work as usual:</p></div></div>
+          <ul className="study-signals">{studySignals.map(item => <li key={item.title}><strong>{item.title}</strong><span>{item.text}</span></li>)}</ul>
+          <p className="study-more">Everything stays on your computer and is recorded only while TimeStamp shows Recording. <a className="text-link" href={doctorPackage.guide} download>Full study overview and guide (PDF)</a></p>
         </section>
 
         <section id="install" className="section site-container">
@@ -107,7 +113,7 @@ export default function Home() {
             <div className="section-heading"><div><h2>Record a session</h2></div></div>
             <div className="workflow-summary" aria-label="Recording workflow"><span>Start</span><ArrowRight aria-hidden="true" /><span>Pause / Resume</span><ArrowRight aria-hidden="true" /><span>Finish &amp; review</span><ArrowRight aria-hidden="true" /><span>Save</span></div>
             <ol className="recording-grid">{recorderSteps.map((step, index) => <li key={step.title}><span className="recording-number">0{index + 1}</span><h3>{step.title}</h3><p>{step.text}</p></li>)}</ol>
-            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>Pause is a break. Finish &amp; review ends the recording.</strong></p></div>
+            <div className="important-difference"><Pause size={22} aria-hidden="true" /><p><strong>One recording per case. Pause is a break; Finish &amp; review ends the case.</strong></p></div>
             <div className="privacy-items good-to-know">{goodToKnow.map(item => <article key={item.title}><ShieldCheck aria-hidden="true" /><div><h3>{item.title}</h3><p>{item.text}</p></div></article>)}</div>
           </div>
         </section>

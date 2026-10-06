@@ -1,9 +1,9 @@
 export type Computer = "windows" | "mac" | "linux";
 
 export const doctorPackage = {
-  version: "0.2.0-preview.20261001.3",
-  date: "October 1, 2026",
-  href: "./downloads/TimeStamp-Doctor-0.2.0-preview.20261001.3.zip",
+  version: "0.2.0-preview.20261005",
+  date: "October 5, 2026",
+  href: "./downloads/TimeStamp-Doctor-0.2.0-preview.20261005.zip",
   instructions: "./downloads/DOCTOR-INSTALL.txt",
   guide: "./downloads/TimeStamp-Install-Guide.pdf",
 };
@@ -46,11 +46,19 @@ export const computers: Record<Computer, {
   },
 };
 
+export const studySignals = [
+  { title: "Medical image", text: "Which slide is open, and the region and zoom you view." },
+  { title: "Mouse path", text: "Your cursor position on the image, about 10 times per second." },
+  { title: "Dictation", text: "Your voice and a transcript, with the time of every word." },
+  { title: "Findings", text: "Say each finding aloud as you find it." },
+  { title: "Final report", text: "Dictate your report at the end of the case." },
+];
+
 export const recorderSteps = [
   { title: "Open the recorder", text: "In QuPath: Extensions → TimeStamp Extension → Open Clinical Session Recorder. The first time, open Settings and use Test microphone." },
-  { title: "Record", text: "Choose Start Recording and speak while you work. Pause for a break; Resume continues the same recording." },
-  { title: "Finish & review", text: "Finish & review creates the final transcript. Check highlighted words, numbers and negations against the audio." },
-  { title: "Save Session", text: "Choose a folder and name without patient details. Tick Include audio recording if you may want to replay or add to it later." },
+  { title: "Record", text: "Choose Start Recording, read the slide as usual and think aloud. Pause for a break; Resume continues the same case." },
+  { title: "Finish & review", text: "Say each finding as you find it and dictate your final report, then choose Finish & review. Check numbers and negations." },
+  { title: "Save Session", text: "Name it with the case ID only (e.g. case-07), tick Include audio recording, and save it in the study folder." },
 ];
 
 export const goodToKnow = [
