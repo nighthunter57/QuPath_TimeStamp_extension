@@ -449,8 +449,10 @@ public class TimeStamp implements QuPathExtension {
 
     private static final BooleanProperty recordEvents = new SimpleBooleanProperty(false);
             
+    // The diagnostic-process study needs the cursor trajectory, so it is recorded unless turned off.
+    static final boolean DEFAULT_TRACK_MOUSE = true;
     private static final BooleanProperty enableMouseTracking = PathPrefs.createPersistentPreference(
-            "timestamp.trackMouse", false);
+            "timestamp.trackMouse", DEFAULT_TRACK_MOUSE);
     
     private static final DoubleProperty timestampFontSize = PathPrefs.createPersistentPreference(
             "timestamp.fontSize", DEFAULT_OVERLAY_FONT_SIZE);
@@ -534,7 +536,7 @@ public class TimeStamp implements QuPathExtension {
         var enableMouseProperty = new PropertyItemBuilder<>(enableMouseTracking, Boolean.class)
                 .name("Enable mouse tracking")
                 .category(TIMESTAMP_CATEGORY)
-                .description("Record raw mouse movements (exported separately)")
+                .description("Record the mouse position on the image about 10 times per second while recording (saved in the cursor file)")
                 .build();
 
         var fontSizeProperty = new PropertyItemBuilder<>(timestampFontSize, Double.class)

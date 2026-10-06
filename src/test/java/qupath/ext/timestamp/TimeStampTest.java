@@ -880,6 +880,12 @@ class TimeStampTest {
     }
 
     @Test
+    void mouseTrajectoryIsRecordedByDefault() {
+        // The study's cursor-trajectory signal must not depend on a doctor finding a preference.
+        assertTrue(TimeStamp.DEFAULT_TRACK_MOUSE);
+    }
+
+    @Test
     void helperProcessesUseUtf8Io() {
         var environment = new java.util.HashMap<String, String>();
         TimeStamp.useUtf8PythonIo(environment);
