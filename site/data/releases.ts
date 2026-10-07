@@ -10,6 +10,29 @@ export type ReleaseNotice = {
 
 export const releaseNotices: ReleaseNotice[] = [
   {
+    version: "0.2.0-preview.20261005",
+    date: "October 5, 2026",
+    status: "Preview",
+    title: "Pilot-study recording and a safer Finish & review",
+    summary:
+      "A preview for the diagnostic-process pilot: it records the cursor path by default, hands off to the final transcript reliably, and keeps every transcript line on the recording clock.",
+    improvements: [
+      "Record the mouse path over the image by default for the pilot study; it can still be turned off in Preferences.",
+      "Finish & review saves the audio first, then builds the final transcript in the background, and saved sessions can be reopened.",
+      "Warn while recording if the microphone stops sending sound.",
+      "The installer's microphone test now gives a plain answer, such as OK, no sound, or too quiet.",
+      "Transcript times include the time zone offset, so they read the same on any computer.",
+      "The printable install guide opens with the pilot study and a short routine to follow for each case."
+    ],
+    fixes: [
+      "Fixed Finish & review and final transcript saving on Windows.",
+      "Fixed the final transcript failing on new installs.",
+      "Speech after a pause is no longer stamped earlier than when it was spoken.",
+      "The final transcript no longer drops or repeats words where the speaker paused for breath.",
+      "Microphone dropouts are saved as silence, so later speech stays aligned with image events."
+    ]
+  },
+  {
     version: "0.1.0-SNAPSHOT",
     date: "September 15, 2026",
     status: "Preview",

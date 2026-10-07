@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { latestRelease } from "@/data/releases";
 
 const SUPPORT_EMAIL = "haopham52d@gmail.com";
 
@@ -44,7 +45,7 @@ export function SupportTicketForm() {
   const [requestType, setRequestType] = useState(requestTypes[0].value);
   const [severity, setSeverity] = useState("Normal");
   const [qupathVersion, setQuPathVersion] = useState("0.6.0");
-  const [extensionVersion, setExtensionVersion] = useState("0.1.0-SNAPSHOT");
+  const [extensionVersion, setExtensionVersion] = useState(latestRelease.version);
   const [operatingSystem, setOperatingSystem] = useState("");
   const [summary, setSummary] = useState("");
   const [details, setDetails] = useState("");
